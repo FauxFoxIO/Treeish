@@ -12,17 +12,8 @@ let package = Package(
         .library(name: "Treeish", targets: ["Treeish"]),
     ],
     targets: [
-        .systemLibrary(
-            name: "CZlib",
-            pkgConfig: "zlib",
-            providers: [
-                .apt(["zlib1g-dev"]),
-                .brew(["zlib"]),
-            ]
-        ),
         .target(
             name: "TreeishCore",
-            dependencies: ["CZlib"],
             swiftSettings: strictConcurrency
         ),
         .target(

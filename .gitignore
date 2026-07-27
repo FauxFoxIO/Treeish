@@ -2,3 +2,8 @@
 .swiftpm/
 .DS_Store
 .codex/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+.idea/
+.vscode/

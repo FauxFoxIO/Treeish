@@ -5,14 +5,54 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    runs-on: macos-15
+  package:
+    name: Package
+    runs-on: macos-26
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Production boundary scan
-        run: sh Scripts/check-production-boundaries.sh
-      - name: macOS tests
+      - name: Validate package metadata and boundaries
+        run: Scripts/validate-package.sh
+      - name: Test
         run: swift test
-      - name: Generic iOS build
-        run: xcodebuild -scheme Treeish -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build
+      - name: Build release configuration
+        run: swift build --configuration release
+      - name: Build documentation
+        run: >-
+          xcodebuild docbuild
+          -scheme Treeish
+          -destination 'generic/platform=macOS'
+          -derivedDataPath "$RUNNER_TEMP/Treeish-Documentation"
+          CODE_SIGNING_ALLOWED=NO
+
+  ios:
+    name: ${{ matrix.name }}
+    runs-on: macos-26
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: iOS device
+            destination: generic/platform=iOS
+            derived_data: Treeish-iOS
+          - name: iOS Simulator
+            destination: generic/platform=iOS Simulator
+            derived_data: Treeish-iOS-Simulator
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: >-
+          xcodebuild build
+          -scheme Treeish
+          -destination '${{ matrix.destination }}'
+          -derivedDataPath "$RUNNER_TEMP/${{ matrix.derived_data }}"
+          CODE_SIGNING_ALLOWED=NO

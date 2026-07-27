@@ -20,10 +20,10 @@ sandboxed or portable Swift runtime.
 - Swift 6.2 or newer
 - iOS 17.4 or newer
 - macOS 14 or newer
-- zlib
 
 All public values conform to `Sendable`, and the package is compiled with Swift
-6 strict concurrency.
+6 strict concurrency. Git’s zlib streams are implemented in Swift over Apple’s
+system `Compression` framework; Treeish contains no C-family source targets.
 
 ## Installation
 
@@ -229,6 +229,7 @@ Testing coverage. See [CONTRIBUTING.md](CONTRIBUTING.md) for the project rules.
 Run the test suite with:
 
 ```sh
+Scripts/validate-package.sh
 swift test
 ```
 

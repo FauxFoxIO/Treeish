@@ -143,6 +143,29 @@ import Testing
 @Test func zlibRoundTrip() throws {
     let bytes = Array(repeating: Array("treeish".utf8), count: 1_000).flatMap { $0 }
     #expect(try Zlib.decompress(Zlib.compress(bytes)) == bytes)
+    #expect(try Zlib.decompress(Zlib.compress([])).isEmpty)
+}
+
+@Test func zlibReadsCanonicalStreamsAndStopsBeforeFollowingBytes() throws {
+    let canonical: [UInt8] = [
+        0x78, 0x9c,
+        0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00,
+        0x06, 0x2c, 0x02, 0x15,
+    ]
+    let decoded = try Zlib.decompressPrefix(
+        canonical + [0xaa, 0xbb, 0xcc]
+    )
+    #expect(decoded.bytes == Array("hello".utf8))
+    #expect(decoded.consumedInputBytes == canonical.count)
+
+    var corrupt = canonical
+    corrupt[corrupt.count - 1] ^= 0xff
+    #expect(throws: ZlibError.checksumMismatch) {
+        _ = try Zlib.decompress(corrupt)
+    }
+    #expect(throws: ZlibError.resourceLimitExceeded) {
+        _ = try Zlib.decompress(canonical, maximumOutputBytes: 4)
+    }
 }
 
 @Test func canonicalBlobBytes() {

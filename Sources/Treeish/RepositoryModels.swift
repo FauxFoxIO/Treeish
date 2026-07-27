@@ -1,0 +1,535 @@
+import Foundation
+import TreeishCore
+
+public struct RepositoryLocation: Sendable, Hashable, Codable {
+    public let worktreePath: GitPath?
+    public let gitDirectoryPath: GitPath
+    public let commonDirectoryPath: GitPath
+    public let objectDirectoryPath: GitPath
+    public let isBare: Bool
+
+    public init(
+        worktreePath: GitPath?,
+        gitDirectoryPath: GitPath,
+        commonDirectoryPath: GitPath,
+        objectDirectoryPath: GitPath,
+        isBare: Bool
+    ) {
+        self.worktreePath = worktreePath
+        self.gitDirectoryPath = gitDirectoryPath
+        self.commonDirectoryPath = commonDirectoryPath
+        self.objectDirectoryPath = objectDirectoryPath
+        self.isBare = isBare
+    }
+}
+
+public struct RepositoryOpenOptions: Sendable, Hashable, Codable {
+    public var resourceLimits: TreeishResourceLimits
+
+    public init(resourceLimits: TreeishResourceLimits = .init()) {
+        self.resourceLimits = resourceLimits
+    }
+}
+
+public struct RepositoryInitialization: Sendable, Hashable, Codable {
+    public var bare: Bool
+    public var initialBranch: String
+    public var objectFormat: ObjectHashAlgorithm
+
+    public init(
+        bare: Bool = false,
+        initialBranch: String = "main",
+        objectFormat: ObjectHashAlgorithm = .sha1
+    ) {
+        self.bare = bare
+        self.initialBranch = initialBranch
+        self.objectFormat = objectFormat
+    }
+}
+
+public struct RepositoryIdentity: Sendable, Hashable, Codable {
+    public let root: TreeishRootIdentity
+    public let location: RepositoryLocation
+
+    public init(root: TreeishRootIdentity, location: RepositoryLocation) {
+        self.root = root
+        self.location = location
+    }
+}
+
+public struct RepositorySnapshot: Sendable, Hashable, Codable {
+    public let headReference: RefName?
+    public let headObjectID: ObjectID?
+    public let capabilities: RepositoryCapabilities
+
+    public init(
+        headReference: RefName?,
+        headObjectID: ObjectID?,
+        capabilities: RepositoryCapabilities
+    ) {
+        self.headReference = headReference
+        self.headObjectID = headObjectID
+        self.capabilities = capabilities
+    }
+}
+
+public struct CommitRequest: Sendable, Hashable {
+    public let tree: ObjectID
+    public let parents: [ObjectID]
+    public let expectedHead: ObjectID?
+    public let author: Signature
+    public let committer: Signature
+    public let message: [UInt8]
+
+    public init(
+        tree: ObjectID,
+        parents: [ObjectID] = [],
+        expectedHead: ObjectID? = nil,
+        author: Signature,
+        committer: Signature,
+        message: [UInt8]
+    ) {
+        self.tree = tree
+        self.parents = parents
+        self.expectedHead = expectedHead
+        self.author = author
+        self.committer = committer
+        self.message = message
+    }
+}
+
+public struct Signature: Sendable, Hashable, Codable {
+    public let name: String
+    public let email: String
+    public let secondsSinceEpoch: Int64
+    public let timeZoneOffsetMinutes: Int
+
+    public init(
+        name: String,
+        email: String,
+        secondsSinceEpoch: Int64,
+        timeZoneOffsetMinutes: Int
+    ) {
+        self.name = name
+        self.email = email
+        self.secondsSinceEpoch = secondsSinceEpoch
+        self.timeZoneOffsetMinutes = timeZoneOffsetMinutes
+    }
+}
+
+public struct CommitResult: Sendable, Hashable, Codable {
+    public let objectID: ObjectID
+    public let updatedReference: RefName
+
+    public init(objectID: ObjectID, updatedReference: RefName) {
+        self.objectID = objectID
+        self.updatedReference = updatedReference
+    }
+}
+
+public struct RefUpdateResult: Sendable, Hashable, Codable {
+    public let name: RefName
+    public let previous: ObjectID?
+    public let current: ObjectID
+
+    public init(name: RefName, previous: ObjectID?, current: ObjectID) {
+        self.name = name
+        self.previous = previous
+        self.current = current
+    }
+}
+
+public struct ReferenceInfo: Sendable, Hashable, Codable {
+    public let name: RefName
+    public let objectID: ObjectID
+
+    public init(name: RefName, objectID: ObjectID) {
+        self.name = name
+        self.objectID = objectID
+    }
+}
+
+public struct TagRequest: Sendable, Hashable {
+    public let name: String
+    public let target: ObjectID
+    public let tagger: Signature?
+    public let message: [UInt8]?
+
+    public init(name: String, target: ObjectID, tagger: Signature? = nil, message: [UInt8]? = nil) {
+        self.name = name
+        self.target = target
+        self.tagger = tagger
+        self.message = message
+    }
+}
+
+public struct ReflogMetadata: Sendable, Hashable, Codable {
+    public let signature: Signature
+    public let message: String
+
+    public init(signature: Signature, message: String) {
+        self.signature = signature
+        self.message = message
+    }
+}
+
+public struct CheckoutRequest: Sendable, Hashable, Codable {
+    public let commit: ObjectID
+    public let reference: RefName?
+
+    public init(commit: ObjectID, reference: RefName? = nil) {
+        self.commit = commit
+        self.reference = reference
+    }
+}
+
+public struct CheckoutResult: Sendable, Hashable, Codable {
+    public let commit: ObjectID
+    public let reference: RefName?
+    public let pathsWritten: Int
+
+    public init(commit: ObjectID, reference: RefName?, pathsWritten: Int) {
+        self.commit = commit
+        self.reference = reference
+        self.pathsWritten = pathsWritten
+    }
+}
+
+public enum ResetMode: String, Sendable, Hashable, Codable {
+    case soft
+    case mixed
+    case hard
+}
+
+public struct ResetRequest: Sendable, Hashable, Codable {
+    public let commit: ObjectID
+    public let mode: ResetMode
+
+    public init(commit: ObjectID, mode: ResetMode = .mixed) {
+        self.commit = commit
+        self.mode = mode
+    }
+}
+
+public struct RestoreRequest: Sendable, Hashable, Codable {
+    public let pathspecs: [GitPathspec]
+    public let source: ObjectID?
+    public let restoreIndex: Bool
+    public let restoreWorktree: Bool
+
+    public init(
+        pathspecs: [GitPathspec],
+        source: ObjectID? = nil,
+        restoreIndex: Bool = false,
+        restoreWorktree: Bool = true
+    ) {
+        self.pathspecs = pathspecs
+        self.source = source
+        self.restoreIndex = restoreIndex
+        self.restoreWorktree = restoreWorktree
+    }
+}
+
+public struct ApplyPatchRequest: Sendable, Hashable, Codable {
+    public let patch: [UInt8]
+    public let updateIndex: Bool
+    public let updateWorktree: Bool
+    public let maximumOffsetSearch: Int
+
+    public init(
+        patch: [UInt8],
+        updateIndex: Bool = false,
+        updateWorktree: Bool = true,
+        maximumOffsetSearch: Int = 1_000
+    ) {
+        self.patch = patch
+        self.updateIndex = updateIndex
+        self.updateWorktree = updateWorktree
+        self.maximumOffsetSearch = maximumOffsetSearch
+    }
+}
+
+public struct ApplyPatchResult: Sendable, Hashable, Codable {
+    public let updated: [GitPath]
+    public let deleted: [GitPath]
+
+    public init(updated: [GitPath], deleted: [GitPath]) {
+        self.updated = updated
+        self.deleted = deleted
+    }
+}
+
+public struct BundleArchive: Sendable, Hashable, Codable {
+    public let bytes: [UInt8]
+    public let references: [RefName: ObjectID]
+
+    public init(bytes: [UInt8], references: [RefName: ObjectID]) {
+        self.bytes = bytes
+        self.references = references
+    }
+}
+
+public struct BundleImportResult: Sendable, Hashable, Codable {
+    public let receivedObjects: Int
+    public let references: [RefName: ObjectID]
+
+    public init(receivedObjects: Int, references: [RefName: ObjectID]) {
+        self.receivedObjects = receivedObjects
+        self.references = references
+    }
+}
+
+public struct MergeRequest: Sendable, Hashable {
+    public let other: ObjectID
+    public let author: Signature
+    public let committer: Signature
+    public let message: [UInt8]
+
+    public init(
+        other: ObjectID,
+        author: Signature,
+        committer: Signature,
+        message: [UInt8]
+    ) {
+        self.other = other
+        self.author = author
+        self.committer = committer
+        self.message = message
+    }
+}
+
+public enum MergeResult: Sendable, Hashable, Codable {
+    case alreadyUpToDate(ObjectID)
+    case fastForward(from: ObjectID, to: ObjectID)
+    case merged(ObjectID)
+    case conflicted([GitPath])
+}
+
+public struct MergeContinuationRequest: Sendable, Hashable {
+    public let author: Signature
+    public let committer: Signature
+    public let message: [UInt8]?
+
+    public init(author: Signature, committer: Signature, message: [UInt8]? = nil) {
+        self.author = author
+        self.committer = committer
+        self.message = message
+    }
+}
+
+public struct CherryPickRequest: Sendable, Hashable {
+    public let commit: ObjectID
+    public let author: Signature
+    public let committer: Signature
+    public let message: [UInt8]?
+
+    public init(
+        commit: ObjectID,
+        author: Signature,
+        committer: Signature,
+        message: [UInt8]? = nil
+    ) {
+        self.commit = commit
+        self.author = author
+        self.committer = committer
+        self.message = message
+    }
+}
+
+public enum CherryPickResult: Sendable, Hashable, Codable {
+    case committed(ObjectID)
+    case conflicted([GitPath])
+}
+
+public struct RebaseRequest: Sendable, Hashable {
+    public let onto: ObjectID
+    public let commits: [ObjectID]
+    public let author: Signature
+    public let committer: Signature
+
+    public init(onto: ObjectID, commits: [ObjectID], author: Signature, committer: Signature) {
+        self.onto = onto
+        self.commits = commits
+        self.author = author
+        self.committer = committer
+    }
+}
+
+public enum RebaseResult: Sendable, Hashable, Codable {
+    case completed(ObjectID)
+    case conflicted(commit: ObjectID, paths: [GitPath])
+}
+
+public struct WorkspaceStateBlob: Sendable, Hashable, Codable {
+    public let identifier: [UInt8]
+    public let bytes: [UInt8]
+
+    public init(identifier: [UInt8], bytes: [UInt8]) {
+        self.identifier = identifier
+        self.bytes = bytes
+    }
+}
+
+public struct WorkspaceStateEntry: Sendable, Hashable, Codable {
+    public let path: GitPath
+    public let mode: UInt32
+    public let contentIdentifier: [UInt8]
+
+    public init(path: GitPath, mode: UInt32, contentIdentifier: [UInt8]) {
+        self.path = path
+        self.mode = mode
+        self.contentIdentifier = contentIdentifier
+    }
+}
+
+public struct WorkspaceState: Sendable, Hashable, Codable {
+    public let headReference: RefName?
+    public let headObjectID: ObjectID?
+    public let indexBytes: [UInt8]
+    public let entries: [WorkspaceStateEntry]
+    public let blobs: [WorkspaceStateBlob]
+
+    public init(
+        headReference: RefName?,
+        headObjectID: ObjectID?,
+        indexBytes: [UInt8],
+        entries: [WorkspaceStateEntry],
+        blobs: [WorkspaceStateBlob]
+    ) {
+        self.headReference = headReference
+        self.headObjectID = headObjectID
+        self.indexBytes = indexBytes
+        self.entries = entries
+        self.blobs = blobs
+    }
+}
+
+public struct StageRequest: Sendable, Hashable, Codable {
+    public let pathspecs: [GitPathspec]
+    public let forceIgnored: Bool
+
+    public init(pathspecs: [GitPathspec], forceIgnored: Bool = false) {
+        self.pathspecs = pathspecs
+        self.forceIgnored = forceIgnored
+    }
+}
+
+public struct IndexUpdate: Sendable, Hashable, Codable {
+    public let addedOrUpdated: [GitPath]
+    public let removed: [GitPath]
+
+    public init(addedOrUpdated: [GitPath], removed: [GitPath]) {
+        self.addedOrUpdated = addedOrUpdated
+        self.removed = removed
+    }
+}
+
+public struct StatusOptions: Sendable, Hashable, Codable {
+    public var includeUntracked: Bool
+
+    public init(includeUntracked: Bool = true) {
+        self.includeUntracked = includeUntracked
+    }
+}
+
+public enum WorktreeStatusKind: String, Sendable, Hashable, Codable {
+    case modified
+    case deleted
+    case untracked
+    case conflicted
+}
+
+public struct WorktreeStatusEntry: Sendable, Hashable, Codable {
+    public let path: GitPath
+    public let kind: WorktreeStatusKind
+
+    public init(path: GitPath, kind: WorktreeStatusKind) {
+        self.path = path
+        self.kind = kind
+    }
+}
+
+public struct Status: Sendable, Hashable, Codable {
+    public let entries: [WorktreeStatusEntry]
+
+    public init(entries: [WorktreeStatusEntry]) {
+        self.entries = entries
+    }
+
+    public var isClean: Bool { entries.isEmpty }
+}
+
+public struct CommitInfo: Sendable, Hashable {
+    public let objectID: ObjectID
+    public let tree: ObjectID
+    public let parents: [ObjectID]
+    public let authorTime: Int64?
+    public let message: [UInt8]
+}
+
+public struct RevisionRange: Sendable, Hashable {
+    public enum Kind: String, Sendable, Hashable, Codable {
+        case exclusion
+        case symmetricDifference
+    }
+
+    public let left: ObjectID
+    public let right: ObjectID
+    public let kind: Kind
+
+    public init(left: ObjectID, right: ObjectID, kind: Kind) {
+        self.left = left
+        self.right = right
+        self.kind = kind
+    }
+}
+
+public enum BlobDiffLine: Sendable, Hashable {
+    case context([UInt8])
+    case deletion([UInt8])
+    case insertion([UInt8])
+}
+
+public enum BlobDiff: Sendable, Hashable {
+    case identical
+    case binary(oldBytes: Int, newBytes: Int)
+    case text([BlobDiffLine])
+}
+
+public struct WorktreeRequest: Sendable, Hashable {
+    public let destination: GitPath
+    public let start: ObjectID
+    public let branch: RefName?
+
+    public init(destination: GitPath, start: ObjectID, branch: RefName? = nil) {
+        self.destination = destination
+        self.start = start
+        self.branch = branch
+    }
+}
+
+public struct WorktreeResult: Sendable, Hashable, Codable {
+    public let identifier: String
+    public let path: GitPath
+    public let head: ObjectID
+
+    public init(identifier: String, path: GitPath, head: ObjectID) {
+        self.identifier = identifier
+        self.path = path
+        self.head = head
+    }
+}
+
+public struct LinkedWorktreeInfo: Sendable, Hashable, Codable {
+    public let identifier: String
+    public let path: GitPath
+    public let head: ObjectID
+    public let lockedReason: String?
+
+    public init(identifier: String, path: GitPath, head: ObjectID, lockedReason: String?) {
+        self.identifier = identifier
+        self.path = path
+        self.head = head
+        self.lockedReason = lockedReason
+    }
+}

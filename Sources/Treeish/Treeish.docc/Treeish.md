@@ -56,8 +56,14 @@ typed result.
 ### Remotes
 
 - ``RemoteURL``
+- ``GitRemoteTransport``
 - ``RepositoryServices``
 - ``GitCredentialProvider``
+- ``SSHGitTransport``
+- ``SSHGitSession``
+- ``SSHGitSessionRequest``
+- ``SSHRemoteEndpoint``
+- ``SSHGitService``
 - ``FetchRequest``
 - ``PushRequest``
 - ``CloneRequest``

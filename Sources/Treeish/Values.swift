@@ -14,6 +14,7 @@ public enum TreeishError: Error, Sendable, Equatable {
     case referenceChanged
     case symbolicReferenceLoop
     case malformedReference
+    case remoteTransportUnavailable(GitRemoteTransport)
     case recoveryRequired(String)
     case indeterminateRemoteResult(String)
     case worktreeCollision(GitPath)

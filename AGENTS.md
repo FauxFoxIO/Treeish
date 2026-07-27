@@ -55,7 +55,8 @@
 - Fuzz and truncate configs, objects, indexes, packs, deltas, refs, and protocol messages.
 - Test cancellation and crash recovery before, during, and after every atomic publication boundary.
 - Use quarantine for received objects and publish refs only after reachability and checksum validation.
-- Record supported read/write features in a machine-readable capability matrix.
+- Keep supported read/write behavior reflected in runtime capabilities, tests,
+  the README, and DocC.
 
 ## Codex-Specific Guidance
 

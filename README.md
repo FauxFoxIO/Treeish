@@ -3,9 +3,9 @@
 Native Git for Swift.
 
 Treeish is a Swift package for reading, creating, and modifying real Git
-repositories on iOS and macOS. It implements Git’s repository formats and smart
-HTTP protocol directly—without bundling libgit2 and without launching the `git`
-executable in production.
+repositories on iOS and macOS. It implements Git’s repository formats and
+network protocol directly—without bundling libgit2 and without launching the
+`git` executable in production.
 
 Treeish is useful when an app needs structured, cancellable Git operations in a
 sandboxed or portable Swift runtime.
@@ -113,11 +113,12 @@ progress.cancel()
 print("Updated:", update.addedOrUpdated.map(\.displayString))
 ```
 
-## Clone over HTTPS
+## Remote repositories
 
-Treeish implements Git smart HTTP directly. Remote URLs are HTTPS-only and
-credentials are requested through a host-provided `GitCredentialProvider`;
-credentials are not stored by Treeish.
+Treeish supports Git smart HTTPS and Git-over-SSH for clone, fetch, and push.
+Credentials and SSH trust decisions stay with the embedding application.
+
+Clone a public HTTPS repository:
 
 ```swift
 let parent = try await TreeishRoot.localDirectory(at: downloadsDirectory)
@@ -132,7 +133,9 @@ let request = try CloneRequest(
 let repository = try await Treeish.clone(request, in: parent)
 ```
 
-For authenticated remotes, provide scoped services:
+For a private GitHub HTTPS repository, return a GitHub token only for the
+expected host. GitHub Git authentication uses HTTP Basic authentication with the
+token as the password:
 
 ```swift
 struct Credentials: GitCredentialProvider {
@@ -144,16 +147,48 @@ struct Credentials: GitCredentialProvider {
         guard challenge.host == "github.com" else {
             return .reject
         }
-        return .use(.bearer(token))
+        return .use(.githubToken(token))
     }
 }
 
 let services = RepositoryServices(
     credentials: Credentials(token: token)
 )
+
+let repository = try await Treeish.clone(
+    request,
+    in: parent,
+    services: services
+)
 ```
 
 Never embed credentials in a `RemoteURL`.
+
+For SSH, use either an `ssh://` URL or the familiar SCP-style syntax and provide
+an `SSHGitTransport`:
+
+```swift
+let remote = try RemoteURL(
+    "git@github.com:FauxFoxIO/Treeish.git"
+)
+let request = try CloneRequest(
+    remote: remote,
+    destination: GitPath("Treeish")
+)
+let services = RepositoryServices(sshTransport: applicationSSHTransport)
+
+let repository = try await Treeish.clone(
+    request,
+    in: parent,
+    services: services
+)
+```
+
+Treeish owns the Git upload-pack and receive-pack protocol carried by the SSH
+session. The injected transport owns the encrypted connection, user/key
+authentication, and host-key verification. This keeps security policy and key
+storage in the host application while preserving a native, subprocess-free Git
+implementation.
 
 ## Supported Git features
 
@@ -167,29 +202,15 @@ Treeish currently supports:
 - branches, annotated and lightweight tags, and linked worktrees
 - merge, cherry-pick, typed rebase, unified patches, and bundles
 - smart HTTPS using Git protocol v2 with protocol v0 server fallback
+- Git-over-SSH through host-provided stateful SSH sessions
 - binary-safe workspace capture and restore
 
-SSH transport, SHA-256 object repositories, and mutation of repository format 1
-are not currently supported.
+SHA-256 object repositories and mutation of repository format 1 are not
+currently supported.
 
-### What is `compatibility.json`?
-
-[`compatibility.json`](compatibility.json) is the canonical, machine-readable
-capability matrix for the current Treeish revision. It records read and write
-support separately for object formats, repository formats, storage formats,
-transports, and higher-level Git operations.
-
-It is intended for:
-
-- CI checks that prevent unsupported capabilities from being advertised;
-- downstream packages that need to gate features without parsing this README;
-- release tooling that compares compatibility between revisions; and
-- maintainers updating implementation, tests, and documentation together.
-
-It is not consumed by Swift Package Manager and it does not alter a repository’s
-on-disk format. Runtime decisions for a particular repository come from
-`Repository.capabilities()`, because extensions or formats found in that
-repository may make it read-only even when Treeish generally supports mutation.
+Inspect a repository’s runtime capabilities before presenting mutating
+operations. Extensions or formats found in that repository may make it
+read-only even when Treeish generally supports mutation:
 
 ```swift
 let capabilities = await repository.capabilities()

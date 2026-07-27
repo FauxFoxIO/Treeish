@@ -568,61 +568,87 @@ public actor Repository {
             guard case .readWrite = access else {
                 throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
             }
-            let url = request.remote.url
-            let credential: GitCredential?
-            if let provider = services.credentials, let host = url.host {
-                switch try await provider.credential(
-                    for: GitAuthenticationChallenge(
-                        scheme: "https",
-                        host: host,
-                        port: url.port,
-                        path: url.path
-                    )
-                ) {
-                case .use(let value): credential = value
-                case .reject: credential = nil
-                case .cancel: throw CancellationError()
-                }
-            } else {
-                credential = nil
-            }
-            let client = SmartHTTPClient(
-                transport: services.httpTransport ?? URLSessionSmartHTTPTransport()
-            )
-            let advertisementResponse = try await client.advertisement(
-                remote: url,
-                authorization: credential?.authorizationHeader,
-                protocolVersion: 2
-            )
-            var decoder = PacketLineDecoder()
-            let packets = try decoder.append(advertisementResponse.body)
-            try decoder.finish()
-            let usesV2 = packets.contains {
-                if case .data(let bytes) = $0 {
-                    return bytes == Array("version 2\n".utf8) || bytes == Array("version 2".utf8)
-                }
-                return false
-            }
             let v2Capabilities: UploadPackV2Capabilities?
             let advertisement: UploadPackAdvertisement
-            if usesV2 {
-                let capabilities = try UploadPackV2.parseCapabilities(packets)
-                v2Capabilities = capabilities
-                var prefixes = request.refNames.map(\.bytes)
-                if prefixes.isEmpty { prefixes = [Array("HEAD".utf8), Array("refs/heads/".utf8)] }
-                let refsResponse = try await client.uploadPack(
-                    remote: url,
-                    body: try UploadPackV2.lsRefsRequest(
-                        prefixes: prefixes,
-                        capabilities: capabilities
-                    ),
-                    authorization: credential?.authorizationHeader
+            let credential: GitCredential?
+            let client: SmartHTTPClient?
+            let sshSession: (any SSHGitSession)?
+            switch request.remote.transport {
+            case .https:
+                let url = request.remote.url
+                credential = try await Repository.credential(
+                    for: url,
+                    services: services
                 )
-                var refsDecoder = PacketLineDecoder()
-                let refPackets = try refsDecoder.append(refsResponse.body)
-                try refsDecoder.finish()
-                advertisement = try UploadPackV2.parseLsRefs(refPackets)
-            } else {
+                let httpClient = SmartHTTPClient(
+                    transport: services.httpTransport
+                        ?? URLSessionSmartHTTPTransport()
+                )
+                client = httpClient
+                sshSession = nil
+                let advertisementResponse = try await httpClient.advertisement(
+                    remote: url,
+                    authorization: credential?.authorizationHeader,
+                    protocolVersion: 2
+                )
+                var decoder = PacketLineDecoder()
+                let packets = try decoder.append(advertisementResponse.body)
+                try decoder.finish()
+                let usesV2 = packets.contains {
+                    if case .data(let bytes) = $0 {
+                        return bytes == Array("version 2\n".utf8)
+                            || bytes == Array("version 2".utf8)
+                    }
+                    return false
+                }
+                if usesV2 {
+                    let capabilities = try UploadPackV2.parseCapabilities(
+                        packets
+                    )
+                    v2Capabilities = capabilities
+                    var prefixes = request.refNames.map(\.bytes)
+                    if prefixes.isEmpty {
+                        prefixes = [
+                            Array("HEAD".utf8),
+                            Array("refs/heads/".utf8),
+                        ]
+                    }
+                    let refsResponse = try await httpClient.uploadPack(
+                        remote: url,
+                        body: try UploadPackV2.lsRefsRequest(
+                            prefixes: prefixes,
+                            capabilities: capabilities
+                        ),
+                        authorization: credential?.authorizationHeader
+                    )
+                    var refsDecoder = PacketLineDecoder()
+                    let refPackets = try refsDecoder.append(refsResponse.body)
+                    try refsDecoder.finish()
+                    advertisement = try UploadPackV2.parseLsRefs(refPackets)
+                } else {
+                    v2Capabilities = nil
+                    advertisement = try UploadPackV0.parseAdvertisement(packets)
+                }
+            case .ssh:
+                guard let endpoint = request.remote.sshEndpoint,
+                      let transport = services.sshTransport
+                else {
+                    throw TreeishError.remoteTransportUnavailable(.ssh)
+                }
+                credential = nil
+                client = nil
+                let session = try await transport.open(
+                    SSHGitSessionRequest(
+                        endpoint: endpoint,
+                        service: .uploadPack
+                    )
+                )
+                sshSession = session
+                var decoder = PacketLineDecoder()
+                let packets = try decoder.append(
+                    try await session.advertisement()
+                )
+                try decoder.finish()
                 v2Capabilities = nil
                 advertisement = try UploadPackV0.parseAdvertisement(packets)
             }
@@ -642,19 +668,28 @@ public actor Repository {
                     capabilities: advertisement.capabilities
                 )
             }
-            let response = try await client.uploadPack(
-                remote: url,
-                body: body,
-                authorization: credential?.authorizationHeader
-            )
+            let responseBody: [UInt8]
+            if let sshSession {
+                responseBody = try await sshSession.exchange(body)
+            } else if let client {
+                responseBody = try await client.uploadPack(
+                    remote: request.remote.url,
+                    body: body,
+                    authorization: credential?.authorizationHeader
+                ).body
+            } else {
+                throw TreeishError.remoteTransportUnavailable(
+                    request.remote.transport
+                )
+            }
             let packBytes: [UInt8]
             if v2Capabilities != nil {
                 var fetchDecoder = PacketLineDecoder()
-                let fetchPackets = try fetchDecoder.append(response.body)
+                let fetchPackets = try fetchDecoder.append(responseBody)
                 try fetchDecoder.finish()
                 packBytes = try UploadPackV2.parseFetchResponse(fetchPackets)
             } else {
-                packBytes = try UploadPackV0.parseFetchResponse(response.body)
+                packBytes = try UploadPackV0.parseFetchResponse(responseBody)
             }
             let pack = try PackReader.read(
                 packBytes,
@@ -706,20 +741,47 @@ public actor Repository {
             guard case .readWrite = access else {
                 throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
             }
-            let url = request.remote.url
-            let credential = try await Repository.credential(
-                for: url,
-                services: services
-            )
-            let client = SmartHTTPClient(
-                transport: services.httpTransport ?? URLSessionSmartHTTPTransport()
-            )
-            let response = try await client.receiveAdvertisement(
-                remote: url,
-                authorization: credential?.authorizationHeader
-            )
+            let credential: GitCredential?
+            let client: SmartHTTPClient?
+            let sshSession: (any SSHGitSession)?
+            let advertisementBytes: [UInt8]
+            switch request.remote.transport {
+            case .https:
+                let url = request.remote.url
+                credential = try await Repository.credential(
+                    for: url,
+                    services: services
+                )
+                let httpClient = SmartHTTPClient(
+                    transport: services.httpTransport
+                        ?? URLSessionSmartHTTPTransport()
+                )
+                client = httpClient
+                sshSession = nil
+                advertisementBytes = try await httpClient
+                    .receiveAdvertisement(
+                        remote: url,
+                        authorization: credential?.authorizationHeader
+                    ).body
+            case .ssh:
+                guard let endpoint = request.remote.sshEndpoint,
+                      let transport = services.sshTransport
+                else {
+                    throw TreeishError.remoteTransportUnavailable(.ssh)
+                }
+                credential = nil
+                client = nil
+                let session = try await transport.open(
+                    SSHGitSessionRequest(
+                        endpoint: endpoint,
+                        service: .receivePack
+                    )
+                )
+                sshSession = session
+                advertisementBytes = try await session.advertisement()
+            }
             var decoder = PacketLineDecoder()
-            let packets = try decoder.append(response.body)
+            let packets = try decoder.append(advertisementBytes)
             try decoder.finish()
             let advertisement = try UploadPackV0.parseAdvertisement(packets)
             if request.requiresAtomic,
@@ -769,13 +831,21 @@ public actor Repository {
                 pack: archive.pack,
                 advertisedCapabilities: advertisement.capabilities
             )
-            let resultResponse: SmartHTTPResponse
+            let resultBody: [UInt8]
             do {
-                resultResponse = try await client.receivePack(
-                    remote: url,
-                    body: body,
-                    authorization: credential?.authorizationHeader
-                )
+                if let sshSession {
+                    resultBody = try await sshSession.exchange(body)
+                } else if let client {
+                    resultBody = try await client.receivePack(
+                        remote: request.remote.url,
+                        body: body,
+                        authorization: credential?.authorizationHeader
+                    ).body
+                } else {
+                    throw TreeishError.remoteTransportUnavailable(
+                        request.remote.transport
+                    )
+                }
             } catch {
                 let reconciliation = PushReconciliation(expectedReferences: desired)
                 let encoded = (try? JSONEncoder().encode(reconciliation))
@@ -786,7 +856,7 @@ public actor Repository {
             }
             let usesSideband = advertisement.capabilities.contains("side-band-64k")
             let result = try ReceivePackV0.parseResponse(
-                resultResponse.body,
+                resultBody,
                 sideband: usesSideband
             )
             var references: [PushRefResult] = []

@@ -20,6 +20,77 @@ private actor ScriptedSmartHTTPTransport: SmartHTTPTransport {
     }
 }
 
+private struct GitHubTokenCredentials: GitCredentialProvider {
+    let token: String
+
+    func credential(
+        for challenge: GitAuthenticationChallenge
+    ) async throws -> GitCredentialDisposition {
+        guard challenge.host == "example.test" else {
+            return .reject
+        }
+        return .use(.githubToken(token))
+    }
+}
+
+private actor ScriptedSSHGitSession: SSHGitSession {
+    private let advertised: [UInt8]
+    private let response: [UInt8]
+    private(set) var requests: [[UInt8]] = []
+
+    init(advertised: [UInt8], response: [UInt8]) {
+        self.advertised = advertised
+        self.response = response
+    }
+
+    func advertisement() async throws -> [UInt8] {
+        advertised
+    }
+
+    func exchange(_ request: [UInt8]) async throws -> [UInt8] {
+        requests.append(request)
+        return response
+    }
+}
+
+private actor ScriptedSSHGitTransport: SSHGitTransport {
+    private let session: ScriptedSSHGitSession
+    private(set) var requests: [SSHGitSessionRequest] = []
+
+    init(session: ScriptedSSHGitSession) {
+        self.session = session
+    }
+
+    func open(
+        _ request: SSHGitSessionRequest
+    ) async throws -> any SSHGitSession {
+        requests.append(request)
+        return session
+    }
+}
+
+@Test func remoteURLsAndGitHubTokensUseGitTransportConventions() throws {
+    let scp = try RemoteURL("git@github.com:FauxFoxIO/Treeish.git")
+    #expect(scp.transport == .ssh)
+    #expect(scp.sshEndpoint == SSHRemoteEndpoint(
+        host: "github.com",
+        port: 22,
+        username: "git",
+        repositoryPath: "FauxFoxIO/Treeish.git"
+    ))
+
+    let explicit = try RemoteURL(
+        URL(string: "ssh://source@example.com:2222/team/repository.git")!
+    )
+    #expect(explicit.sshEndpoint?.port == 2222)
+    #expect(explicit.sshEndpoint?.username == "source")
+
+    let credential = GitCredential.githubToken("secret")
+    let expected = Data("x-access-token:secret".utf8).base64EncodedString()
+    #expect(credential.authorizationHeader == "Basic \(expected)")
+    #expect(credential.description == "<redacted-git-credential>")
+}
+
 @Test func fetchUsesInjectedProtocolV2TransportAndPublishesValidatedPack() async throws {
     let blob = GitObject(type: .blob, payload: Array("network\n".utf8))
     let blobID = SHA1.hash(blob.canonicalBytes)
@@ -88,7 +159,10 @@ private actor ScriptedSmartHTTPTransport: SmartHTTPTransport {
     let repository = try await Treeish.initialize(in: root)
     let result = try await repository.fetch(
         try FetchRequest(remote: remote),
-        services: RepositoryServices(httpTransport: transport)
+        services: RepositoryServices(
+            credentials: GitHubTokenCredentials(token: "secret"),
+            httpTransport: transport
+        )
     ).value()
     #expect(result.receivedObjects == 3)
     #expect(result.updatedReferences.first?.current.description == commitHex)
@@ -97,9 +171,64 @@ private actor ScriptedSmartHTTPTransport: SmartHTTPTransport {
     ).value().type == .commit)
     let requests = await transport.requests
     #expect(requests.count == 3)
+    let authorization = Data("x-access-token:secret".utf8).base64EncodedString()
+    #expect(requests.allSatisfy {
+        $0.headers["Authorization"] == "Basic \(authorization)"
+    })
     #expect(requests[0].headers["Git-Protocol"] == "version=2")
     #expect(String(decoding: requests[1].body, as: UTF8.self).contains("command=ls-refs"))
     #expect(String(decoding: requests[2].body, as: UTF8.self).contains("command=fetch"))
+}
+
+@Test func fetchUsesStatefulSSHUploadPackSession() async throws {
+    let blob = GitObject(type: .blob, payload: Array("ssh\n".utf8))
+    let blobID = SHA1.hash(blob.canonicalBytes)
+    let archive = try PackWriter.write([
+        try PackObject(identifier: blobID, object: blob),
+    ])
+    let identifier = blobID.map { String(format: "%02x", $0) }.joined()
+    let advertisement = try PacketLineEncoder.encode(
+        .data(Array(
+            "\(identifier) HEAD\0side-band-64k ofs-delta symref=HEAD:refs/heads/main\n".utf8
+        ))
+    ) + PacketLineEncoder.encode(
+        .data(Array("\(identifier) refs/heads/main\n".utf8))
+    ) + PacketLineEncoder.encode(.flush)
+    let response = try PacketLineEncoder.encode(
+        .data(Array("NAK\n".utf8))
+    ) + PacketLineEncoder.encode(
+        .data([1] + archive.pack)
+    ) + PacketLineEncoder.encode(.flush)
+    let session = ScriptedSSHGitSession(
+        advertised: advertisement,
+        response: response
+    )
+    let transport = ScriptedSSHGitTransport(session: session)
+
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.initialize(in: root)
+    let result = try await repository.fetch(
+        try FetchRequest(
+            remote: RemoteURL("git@github.com:FauxFoxIO/Treeish.git")
+        ),
+        services: RepositoryServices(sshTransport: transport)
+    ).value()
+
+    #expect(result.receivedObjects == 1)
+    #expect(result.remoteHead?.description == "refs/remotes/origin/main")
+    #expect(try await repository.readObject(
+        ObjectID(algorithm: .sha1, bytes: blobID)
+    ).value().payload == blob.payload)
+    #expect(await transport.requests.first?.service == .uploadPack)
+    #expect(await transport.requests.first?.endpoint.host == "github.com")
+    #expect(await session.requests.count == 1)
 }
 
 @Test func pushCreatesRemoteReferenceWithCanonicalPackAndReportStatus() async throws {
@@ -190,6 +319,76 @@ private actor ScriptedSmartHTTPTransport: SmartHTTPTransport {
         "\(zero) \(commit.objectID.description) refs/heads/main"
     ))
     #expect(body.containsSubsequence(Array("PACK".utf8)))
+}
+
+@Test func pushUsesStatefulSSHReceivePackSession() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try Data("ssh push\n".utf8).write(
+        to: directory.appendingPathComponent("file.txt")
+    )
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.initialize(in: root)
+    _ = try await repository.stage(
+        StageRequest(pathspecs: [try GitPathspec("file.txt")])
+    ).value()
+    let tree = try await repository.writeIndexTree().value()
+    let signature = Signature(
+        name: "Treeish",
+        email: "treeish@example.com",
+        secondsSinceEpoch: 1_700_000_000,
+        timeZoneOffsetMinutes: 0
+    )
+    let commit = try await repository.commit(
+        CommitRequest(
+            tree: tree,
+            author: signature,
+            committer: signature,
+            message: Array("ssh push\n".utf8)
+        )
+    ).value()
+
+    let zero = String(repeating: "0", count: 40)
+    let advertisement = try PacketLineEncoder.encode(
+        .data(Array(
+            "\(zero) capabilities^{}\0report-status ofs-delta\n".utf8
+        ))
+    ) + PacketLineEncoder.encode(.flush)
+    let response = try PacketLineEncoder.encode(
+        .data(Array("unpack ok\n".utf8))
+    ) + PacketLineEncoder.encode(
+        .data(Array("ok refs/heads/main\n".utf8))
+    ) + PacketLineEncoder.encode(.flush)
+    let session = ScriptedSSHGitSession(
+        advertised: advertisement,
+        response: response
+    )
+    let transport = ScriptedSSHGitTransport(session: session)
+
+    let result = try await repository.push(
+        PushRequest(
+            remote: try RemoteURL(
+                "ssh://git@github.com/FauxFoxIO/Treeish.git"
+            ),
+            source: try RefName("refs/heads/main")
+        ),
+        services: RepositoryServices(sshTransport: transport)
+    ).value()
+
+    #expect(result.references.first?.current == commit.objectID)
+    #expect(result.references.first?.disposition == .accepted)
+    #expect(await transport.requests.first?.service == .receivePack)
+    #expect(await session.requests.count == 1)
+    let request = try #require(await session.requests.first)
+    #expect(String(decoding: request.prefix(200), as: UTF8.self).contains(
+        "\(zero) \(commit.objectID.description) refs/heads/main"
+    ))
+    #expect(request.containsSubsequence(Array("PACK".utf8)))
 }
 
 private extension Array where Element == UInt8 {

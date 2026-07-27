@@ -37,7 +37,7 @@ Do not run destructive tests against an existing developer repository.
 2. Add bidirectional system-Git coverage when a change affects repository
    formats, protocols, references, indexes, worktrees, or object storage.
 3. Keep untrusted-input parsing bounded by `TreeishResourceLimits`.
-4. Update `compatibility.json`, the README, and DocC when support changes.
+4. Update runtime capability checks, the README, and DocC when support changes.
 5. Run the validation script and complete test suite.
 
 Keep pull requests focused and explain the Git behavior or published format that

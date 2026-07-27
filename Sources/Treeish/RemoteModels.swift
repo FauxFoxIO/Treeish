@@ -1,15 +1,74 @@
 import Foundation
 import TreeishHTTP
 
+public enum GitRemoteTransport: String, Sendable, Hashable, Codable {
+    case https
+    case ssh
+}
+
+/// A validated HTTPS or SSH Git remote.
+///
+/// SSH remotes accept both `ssh://` URLs and SCP-style values such as
+/// `git@example.com:owner/repository.git`. Credentials must be supplied through
+/// ``RepositoryServices`` and are never accepted in the URL.
 public struct RemoteURL: Sendable, Hashable, Codable, CustomStringConvertible {
     public let url: URL
+    public let transport: GitRemoteTransport
 
     public init(_ url: URL) throws {
-        guard url.scheme?.lowercased() == "https", url.host != nil,
-              url.user == nil, url.password == nil else {
+        guard let scheme = url.scheme?.lowercased(),
+              let transport = GitRemoteTransport(rawValue: scheme),
+              url.host != nil,
+              url.password == nil,
+              transport == .ssh || url.user == nil,
+              transport == .https || !url.path.isEmpty
+        else {
             throw TreeishError.invalidPath
         }
         self.url = url
+        self.transport = transport
+    }
+
+    public init(_ value: String) throws {
+        if value.contains("://") {
+            guard let url = URL(string: value) else {
+                throw TreeishError.invalidPath
+            }
+            try self.init(url)
+            return
+        }
+
+        guard !value.contains("\0"),
+              !value.contains("\n"),
+              let separator = value.firstIndex(of: ":"),
+              separator != value.startIndex
+        else {
+            throw TreeishError.invalidPath
+        }
+        let authority = String(value[..<separator])
+        let path = String(value[value.index(after: separator)...])
+        guard !path.isEmpty, !authority.contains("[") else {
+            throw TreeishError.invalidPath
+        }
+        let pieces = authority.split(
+            separator: "@",
+            maxSplits: 1,
+            omittingEmptySubsequences: false
+        )
+        let username = pieces.count == 2 ? String(pieces[0]) : "git"
+        let host = String(pieces.last ?? "")
+        guard !username.isEmpty, !host.isEmpty else {
+            throw TreeishError.invalidPath
+        }
+        var components = URLComponents()
+        components.scheme = "ssh"
+        components.user = username
+        components.host = host
+        components.path = "/" + path
+        guard let url = components.url else {
+            throw TreeishError.invalidPath
+        }
+        try self.init(url)
     }
 
     public var description: String {
@@ -21,6 +80,18 @@ public struct RemoteURL: Sendable, Hashable, Codable, CustomStringConvertible {
         components.query = nil
         components.fragment = nil
         return components.string ?? "<remote>"
+    }
+
+    public var sshEndpoint: SSHRemoteEndpoint? {
+        guard transport == .ssh, let host = url.host else {
+            return nil
+        }
+        return SSHRemoteEndpoint(
+            host: host,
+            port: url.port ?? 22,
+            username: url.user ?? "git",
+            repositoryPath: String(url.path.drop(while: { $0 == "/" }))
+        )
     }
 }
 
@@ -51,6 +122,11 @@ public struct GitCredential: Sendable, CustomStringConvertible,
         return GitCredential(header: "Basic \(value)")
     }
 
+    /// Creates the HTTP Basic credential expected by GitHub for token-based Git access.
+    public static func githubToken(_ token: String) -> GitCredential {
+        basic(username: "x-access-token", password: token)
+    }
+
     private init(header: String) { self.header = header }
     internal var authorizationHeader: String { header }
     public var description: String { "<redacted-git-credential>" }
@@ -67,16 +143,75 @@ public protocol GitCredentialProvider: Sendable {
     func credential(for challenge: GitAuthenticationChallenge) async throws -> GitCredentialDisposition
 }
 
+/// The connection details derived from an SSH remote.
+///
+/// `repositoryPath` is passed to the selected Git service as an opaque path. An
+/// SSH transport must not interpret it as a local filesystem path.
+public struct SSHRemoteEndpoint: Sendable, Hashable, Codable {
+    public let host: String
+    public let port: Int
+    public let username: String
+    public let repositoryPath: String
+
+    public init(
+        host: String,
+        port: Int = 22,
+        username: String = "git",
+        repositoryPath: String
+    ) {
+        self.host = host
+        self.port = port
+        self.username = username
+        self.repositoryPath = repositoryPath
+    }
+}
+
+public enum SSHGitService: String, Sendable, Hashable, Codable {
+    case uploadPack = "git-upload-pack"
+    case receivePack = "git-receive-pack"
+}
+
+/// A request to open one Git service over an authenticated SSH connection.
+public struct SSHGitSessionRequest: Sendable, Hashable, Codable {
+    public let endpoint: SSHRemoteEndpoint
+    public let service: SSHGitService
+
+    public init(endpoint: SSHRemoteEndpoint, service: SSHGitService) {
+        self.endpoint = endpoint
+        self.service = service
+    }
+}
+
+/// A stateful Git service session carried over SSH.
+///
+/// The advertisement and request exchange occur on the same remote process.
+public protocol SSHGitSession: Sendable {
+    func advertisement() async throws -> [UInt8]
+    func exchange(_ request: [UInt8]) async throws -> [UInt8]
+}
+
+/// Opens authenticated and host-verified SSH sessions for Treeish.
+///
+/// Implementations own encryption, authentication, key storage, host-key
+/// verification, and execution of the requested Git service. Treeish owns the
+/// pkt-line and pack protocol exchanged through the returned session.
+public protocol SSHGitTransport: Sendable {
+    func open(_ request: SSHGitSessionRequest) async throws -> any SSHGitSession
+}
+
 public struct RepositoryServices: Sendable {
     public var credentials: (any GitCredentialProvider)?
     public var httpTransport: (any SmartHTTPTransport)?
+    public var sshTransport: (any SSHGitTransport)?
 
     public init(
         credentials: (any GitCredentialProvider)? = nil,
-        httpTransport: (any SmartHTTPTransport)? = nil
+        httpTransport: (any SmartHTTPTransport)? = nil,
+        sshTransport: (any SSHGitTransport)? = nil
     ) {
         self.credentials = credentials
         self.httpTransport = httpTransport
+        self.sshTransport = sshTransport
     }
 }
 

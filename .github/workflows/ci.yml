@@ -19,8 +19,19 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
-      - name: Validate package metadata and boundaries
-        run: Scripts/validate-package.sh
+      - name: Validate package manifest
+        run: swift package dump-package >/dev/null
+      - name: Require Swift-only production sources
+        run: |
+          unexpected_sources="$(
+            find Sources -type f \
+              ! -name '*.swift' \
+              ! -path '*/Treeish.docc/*'
+          )"
+          if [ -n "$unexpected_sources" ]; then
+            echo "$unexpected_sources"
+            exit 1
+          fi
       - name: Test
         run: swift test
       - name: Build release configuration

@@ -1,258 +1,334 @@
 # Treeish
 
-Native Git for Swift.
+### Put a real Git engine inside your Swift app.
 
-Treeish is a Swift package for reading, creating, and modifying real Git
-repositories on iOS and macOS. It implements Git’s repository formats and
-network protocol directly—without bundling libgit2 and without launching the
-`git` executable in production.
+Treeish lets an iPhone or Mac app clone repositories, inspect history, stage
+files, create commits, manage branches, merge, rebase, and push—without
+installing Git, launching a subprocess, or shipping a C library.
 
-Treeish is useful when an app needs structured, cancellable Git operations in a
-sandboxed or portable Swift runtime.
+It reads and writes the same repositories as command-line Git. Objects, packs,
+indexes, references, reflogs, worktrees, and network exchanges are implemented
+as native Swift code with structured concurrency.
+
+Treeish is built for products where Git is a feature, not an external tool:
+
+- coding agents and mobile IDEs;
+- visual Git clients and repository browsers;
+- document or project apps that use Git as a storage format;
+- sandboxed automation that cannot launch `/usr/bin/git`; and
+- apps that need typed progress, cancellation, and controlled filesystem access.
 
 > [!IMPORTANT]
-> Treeish is prerelease software. Its Swift API may change without compatibility
-> shims before the first stable release. Repositories written by Treeish remain
-> standard Git repositories.
+> Treeish is prerelease software. Its Swift API can make hard cutovers before
+> 1.0. Repositories created by Treeish remain standard Git repositories.
 
-## Requirements
+## Why Treeish?
 
-- Swift 6.2 or newer
-- iOS 17.4 or newer
-- macOS 14 or newer
+Most Swift Git integrations either invoke the Git executable or bridge a C
+library. Both are reasonable on a developer Mac, but awkward inside a sandboxed,
+portable application.
 
-All public values conform to `Sendable`, and the package is compiled with Swift
-6 strict concurrency. Git’s zlib streams are implemented in Swift over Apple’s
-system `Compression` framework; Treeish contains no C-family source targets.
+Treeish takes a different approach:
 
-## Installation
+| | Treeish |
+| --- | --- |
+| Runtime | Native Swift 6 with strict concurrency |
+| Repository format | Standard Git, interoperable with command-line Git |
+| Process model | No subprocesses in production |
+| Dependencies | No third-party packages and no C-family source targets |
+| Platforms | iOS 17.4+ and macOS 14+ |
+| Operations | Typed results, progress streams, and cancellation |
+| Filesystem access | Explicitly scoped through `TreeishRoot` |
+| Authentication | Credentials and SSH trust remain owned by your app |
 
-Add Treeish to your package dependencies:
+Treeish does not hide Git behind a simplified key-value API. It gives an
+application structured access to Git concepts while preserving the formats and
+behavior that make a repository portable.
+
+## Add Treeish to your package
+
+Treeish has not published a 1.0 release yet, so pin a revision for reproducible
+builds:
 
 ```swift
 dependencies: [
     .package(
         url: "https://github.com/FauxFoxIO/Treeish.git",
-        branch: "main"
+        revision: "<treeish-commit>"
     ),
 ]
 ```
 
-Then add the `Treeish` product to your target:
+Add its single public product to the target that owns repository operations:
 
 ```swift
 .target(
-    name: "MyApp",
+    name: "SourceControl",
     dependencies: [
         .product(name: "Treeish", package: "Treeish"),
     ]
 )
 ```
 
-Import the package with:
+Treeish requires Swift 6.2 or newer.
 
-```swift
-import Treeish
-```
+## Clone and inspect a repository
 
-Until Treeish publishes versioned releases, pin a commit revision when you need
-reproducible builds.
-
-## Quick start
-
-Open an existing repository by creating a filesystem root, discovering its Git
-directory, and opening the discovered location:
+A `TreeishRoot` grants access to a directory. Clone destinations and discovered
+repositories must remain inside that root.
 
 ```swift
 import Foundation
 import Treeish
 
-let root = try await TreeishRoot.localDirectory(at: workspaceURL)
-let location = try await Treeish.discover(in: root)
-let repository = try await Treeish.open(location, roots: [root])
-
-let snapshot = try await repository.snapshot()
-print(snapshot.headReference?.description ?? "detached HEAD")
-print(snapshot.headObjectID?.description ?? "unborn branch")
-```
-
-`Treeish.discover` supports normal repositories, bare repositories, `.git`
-gitfiles, and linked worktrees.
-
-## Create and inspect a repository
-
-```swift
-let root = try await TreeishRoot.localDirectory(at: projectDirectory)
-let repository = try await Treeish.initialize(
-    in: root,
-    options: RepositoryInitialization(initialBranch: "main")
+let downloads = try await TreeishRoot.localDirectory(at: downloadsURL)
+let request = try CloneRequest(
+    remote: RemoteURL("https://github.com/FauxFoxIO/Treeish.git"),
+    destination: GitPath("Treeish")
 )
 
+let repository = try await Treeish.clone(request, in: downloads)
+let snapshot = try await repository.snapshot()
 let status = try await repository.status().value()
-print(status.isClean)
+
+print(snapshot.headReference?.description ?? "detached HEAD")
+print(snapshot.headObjectID?.description ?? "unborn branch")
+print(status.isClean ? "clean" : "\(status.entries.count) changed paths")
 ```
 
-Repository methods that may perform substantial work return a
-`GitOperation<Result>`. Await `value()` for the result, observe `events` for
-typed progress, or call `cancel()`:
+Cloning produces a normal working repository. Command-line Git can open it, and
+Treeish can reopen a repository created by command-line Git.
+
+To discover an existing repository from any directory beneath its worktree:
 
 ```swift
-let operation = await repository.stage(
-    StageRequest(pathspecs: [try GitPathspec("Sources/**")])
+let workspace = try await TreeishRoot.localDirectory(at: workspaceURL)
+let location = try await Treeish.discover(in: workspace)
+let repository = try await Treeish.open(location, roots: [workspace])
+```
+
+Discovery understands normal repositories, bare repositories, `.git` files,
+and linked worktrees.
+
+## Make a commit
+
+Treeish keeps each publication step explicit. Your app writes the file, stages
+the path, writes the index tree, and creates a commit with compare-and-swap
+protection for `HEAD`.
+
+```swift
+let readmeURL = checkoutURL.appendingPathComponent("README.md")
+try Data("# My project\n".utf8).write(to: readmeURL)
+
+_ = try await repository.stage(
+    StageRequest(pathspecs: [
+        try GitPathspec("README.md"),
+    ])
+).value()
+
+let tree = try await repository.writeIndexTree().value()
+let before = try await repository.snapshot()
+let identity = Signature(
+    name: "A Developer",
+    email: "developer@example.com",
+    secondsSinceEpoch: Int64(Date().timeIntervalSince1970),
+    timeZoneOffsetMinutes: 0
+)
+
+let commit = try await repository.commit(
+    CommitRequest(
+        tree: tree,
+        parents: before.headObjectID.map { [$0] } ?? [],
+        expectedHead: before.headObjectID,
+        author: identity,
+        committer: identity,
+        message: Array("Add README\n".utf8)
+    )
+).value()
+
+print("Created \(commit.objectID)")
+```
+
+`expectedHead` prevents an operation from silently overwriting a reference that
+changed after the app took its snapshot.
+
+## Work with long-running operations
+
+Repository work that may touch many files or objects returns a
+`GitOperation<Result>`. The operation starts immediately. Await its typed result,
+observe progress, or cancel it from another task.
+
+```swift
+let operation = await repository.fetch(
+    try FetchRequest(
+        remote: RemoteURL("https://github.com/FauxFoxIO/Treeish.git")
+    )
 )
 
 let progress = Task {
     for await event in operation.events {
-        print(event.phase, event.completedUnits ?? 0)
+        print(event.phase, event.completedUnits ?? 0, event.totalUnits ?? 0)
     }
 }
 
-let update = try await operation.value()
-progress.cancel()
+let result = try await operation.value()
+await progress.value
 
-print("Updated:", update.addedOrUpdated.map(\.displayString))
+print("Received \(result.receivedObjects) objects")
 ```
 
-## Remote repositories
+`Repository` is an actor, while requests, results, snapshots, and progress
+events are `Sendable`. An application can keep repository ownership out of the
+main actor without inventing its own locking model.
 
-Treeish supports Git smart HTTPS and Git-over-SSH for clone, fetch, and push.
-Credentials and SSH trust decisions stay with the embedding application.
+## Authenticate with GitHub
 
-Clone a public HTTPS repository:
+Treeish asks for an HTTPS credential at the point of use. It does not read a
+credential helper, persist the token, or put secrets in a remote URL.
 
-```swift
-let parent = try await TreeishRoot.localDirectory(at: downloadsDirectory)
-let remote = try RemoteURL(
-    URL(string: "https://github.com/FauxFoxIO/Treeish.git")!
-)
-let request = try CloneRequest(
-    remote: remote,
-    destination: GitPath("Treeish")
-)
-
-let repository = try await Treeish.clone(request, in: parent)
-```
-
-For a private GitHub HTTPS repository, return a GitHub token only for the
-expected host. GitHub Git authentication uses HTTP Basic authentication with the
-token as the password:
+Store the token in your app’s secure storage and only return it for the host you
+intend to trust:
 
 ```swift
-struct Credentials: GitCredentialProvider {
+struct GitHubCredentials: GitCredentialProvider {
     let token: String
 
     func credential(
         for challenge: GitAuthenticationChallenge
     ) async throws -> GitCredentialDisposition {
-        guard challenge.host == "github.com" else {
+        guard challenge.scheme == "https",
+              challenge.host == "github.com"
+        else {
             return .reject
         }
+
         return .use(.githubToken(token))
     }
 }
 
 let services = RepositoryServices(
-    credentials: Credentials(token: token)
+    credentials: GitHubCredentials(token: tokenFromKeychain)
 )
 
 let repository = try await Treeish.clone(
-    request,
-    in: parent,
+    try CloneRequest(
+        remote: RemoteURL("https://github.com/owner/private-repository.git"),
+        destination: GitPath("private-repository")
+    ),
+    in: downloads,
     services: services
 )
 ```
 
-Never embed credentials in a `RemoteURL`.
+`GitCredential.githubToken` sends the token as the password in HTTP Basic
+authentication, which is the convention GitHub uses for Git over HTTPS.
+Credential descriptions are always redacted.
 
-For SSH, use either an `ssh://` URL or the familiar SCP-style syntax and provide
-an `SSHGitTransport`:
+The same `RepositoryServices` value can be passed to `fetch` and `push`.
+
+## Connect over SSH
+
+Treeish understands both common SSH remote forms:
 
 ```swift
-let remote = try RemoteURL(
-    "git@github.com:FauxFoxIO/Treeish.git"
+let scpStyle = try RemoteURL("git@github.com:owner/repository.git")
+let urlStyle = try RemoteURL(
+    "ssh://git@github.example.com:2222/owner/repository.git"
 )
-let request = try CloneRequest(
-    remote: remote,
-    destination: GitPath("Treeish")
+```
+
+SSH policy belongs to the embedding application. Supply an `SSHGitTransport`
+that opens an authenticated, host-verified session:
+
+```swift
+let services = RepositoryServices(
+    sshTransport: applicationSSHTransport
 )
-let services = RepositoryServices(sshTransport: applicationSSHTransport)
 
 let repository = try await Treeish.clone(
-    request,
-    in: parent,
+    try CloneRequest(
+        remote: RemoteURL("git@github.com:owner/repository.git"),
+        destination: GitPath("repository")
+    ),
+    in: downloads,
     services: services
 )
 ```
 
-Treeish owns the Git upload-pack and receive-pack protocol carried by the SSH
-session. The injected transport owns the encrypted connection, user/key
-authentication, and host-key verification. This keeps security policy and key
-storage in the host application while preserving a native, subprocess-free Git
-implementation.
+Treeish drives `git-upload-pack` and `git-receive-pack` over the returned
+stateful session. Your transport owns encryption, key storage, user
+authentication, host-key verification, and securely starting the requested Git
+service. Treeish intentionally does not make trust-on-first-use or keychain
+decisions for the host app.
 
-## Supported Git features
+## What works today
 
-Treeish currently supports:
+### Repository storage
 
-- SHA-1 loose objects and packfiles, including OFS and REF deltas
-- repository format 0, normal and bare repositories
-- loose, symbolic, and packed references with reflogs
-- index v2, staging, status, commits, checkout, restore, and reset
-- revision resolution, ancestry, reflog selectors, and revision ranges
-- branches, annotated and lightweight tags, and linked worktrees
-- merge, cherry-pick, typed rebase, unified patches, and bundles
-- smart HTTPS using Git protocol v2 with protocol v0 server fallback
-- Git-over-SSH through host-provided stateful SSH sessions
-- binary-safe workspace capture and restore
+- SHA-1 loose objects and packfiles;
+- OFS and REF deltas, thin-pack resolution, pack indexes, and zlib streams;
+- repository format 0, normal repositories, and bare repositories;
+- loose, symbolic, and packed references with reflogs; and
+- index v2, executable files, symbolic links, ignore rules, and attributes.
 
-SHA-256 object repositories and mutation of repository format 1 are not
-currently supported.
+### Everyday Git
 
-Inspect a repository’s runtime capabilities before presenting mutating
-operations. Extensions or formats found in that repository may make it
-read-only even when Treeish generally supports mutation:
+- initialize, discover, open, clone, fetch, and push;
+- status, stage, commit, checkout, restore, and reset;
+- branches, lightweight and annotated tags, and linked worktrees;
+- revision expressions, ancestry, ranges, logs, and merge bases;
+- merge, cherry-pick, rebase, continuation, conflict state, and abort;
+- unified patches, bundles, blob diffs, and binary-safe workspace snapshots.
 
-```swift
-let capabilities = await repository.capabilities()
+### Networking
 
-switch capabilities.access {
-case .readWrite:
-    // Mutation is available for this repository.
-case .readOnly(let reason):
-    print("Read-only:", reason)
-case .metadataOnly(let reason):
-    print("Metadata only:", reason)
-}
-```
+- Git smart HTTPS with protocol v2 and protocol v0 fallback;
+- Git-over-SSH through an application-provided stateful session;
+- GitHub token authentication and general Basic or Bearer credentials; and
+- validated pack publication before remote-tracking references move.
 
-Unknown required repository extensions disable mutation rather than risking
-repository corruption.
+Treeish does not currently mutate SHA-256 repositories or repository format 1.
+Inspect `repository.capabilities()` after opening an unfamiliar repository.
+Unknown required extensions make the repository read-only or metadata-only
+instead of risking corruption.
 
-## Design and safety
+## Safety model
 
-Treeish treats repository-controlled data as untrusted. Parsing and mutation are
-bounded by configurable `TreeishResourceLimits`, filesystem access is scoped to
-a `TreeishRoot`, and multi-file worktree changes use recoverable transactions.
-Received objects are validated before references are published.
+Repository contents are untrusted input. Treeish applies explicit resource
+limits while parsing configs, objects, packs, indexes, references, and network
+messages. Filesystem access is rooted, paths are byte-aware, received objects
+are quarantined until validation succeeds, and multi-file worktree changes use
+recoverable transactions.
 
-The package exposes one public library product, `Treeish`. Its focused internal
-modules cover objects, packs, indexes, graphs, diffs, protocols, HTTP, and
-root-scoped filesystem access.
+Remote effects are treated differently from local writes. A failed push can
+have an indeterminate outcome because the server may have accepted a reference
+before the connection disappeared. Treeish reports that state for
+reconciliation instead of pretending the operation definitely failed.
 
-System Git is used as an interoperability oracle in tests, never as a production
-backend.
+System Git is used as an interoperability oracle in the test suite. It is never
+used as a production backend.
+
+## Design boundaries
+
+Treeish ships one public library product. Internal targets isolate object,
+pack, index, graph, diff, protocol, HTTP, and filesystem concerns without
+forcing those implementation modules into an app’s dependency graph.
+
+The package contains Swift source only. Compression uses Apple’s system
+`Compression` framework, and production code never launches `git`.
 
 ## Contributing
 
-Contributions should preserve canonical Git interoperability and include Swift
-Testing coverage. See [CONTRIBUTING.md](CONTRIBUTING.md) for the project rules.
-
-Run the test suite with:
+Changes should preserve standard Git interoperability and include Swift Testing
+coverage for observable behavior. Start with:
 
 ```sh
-Scripts/validate-package.sh
 swift test
+swift build --configuration release
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for repository rules and the full
+platform-validation expectations.
 
 ## License
 

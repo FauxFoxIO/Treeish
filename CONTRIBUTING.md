@@ -13,8 +13,8 @@ Clone the repository and validate the package:
 ```sh
 git clone https://github.com/FauxFoxIO/Treeish.git
 cd Treeish
-Scripts/validate-package.sh
 swift test
+swift build --configuration release
 ```
 
 ## Project boundaries

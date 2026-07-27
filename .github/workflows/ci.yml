@@ -18,7 +18,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Validate package metadata and boundaries
         run: Scripts/validate-package.sh
       - name: Test
@@ -48,7 +48,7 @@ jobs:
             destination: generic/platform=iOS Simulator
             derived_data: Treeish-iOS-Simulator
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build
         run: >-
           xcodebuild build

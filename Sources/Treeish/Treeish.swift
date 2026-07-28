@@ -246,47 +246,93 @@ public enum Treeish {
             in: root,
             at: request.destination,
             options: RepositoryInitialization(
+                bare: request.mode != .normal,
                 initialBranch: requestedBranchName ?? "main"
             )
         )
+        let fetchRefspecs: [FetchRefspec]
+        let configuredFetch: String
+        switch request.mode {
+        case .normal:
+            fetchRefspecs = try request.branch.map { branch in
+                let tail = branch.description.dropFirst(
+                    "refs/heads/".count
+                )
+                return [
+                    try FetchRefspec(
+                        source: branch.description,
+                        destination:
+                            "refs/remotes/\(request.remoteName)/\(tail)",
+                        force: true
+                    ),
+                ]
+            } ?? []
+            configuredFetch =
+                "+refs/heads/*:refs/remotes/\(request.remoteName)/*"
+        case .bare:
+            fetchRefspecs = [
+                try FetchRefspec("+refs/heads/*:refs/heads/*"),
+                try FetchRefspec("+refs/tags/*:refs/tags/*"),
+            ]
+            configuredFetch = "+refs/heads/*:refs/heads/*"
+        case .mirror:
+            fetchRefspecs = [
+                try FetchRefspec("+refs/*:refs/*"),
+            ]
+            configuredFetch = "+refs/*:refs/*"
+        }
         let fetched = try await repository.fetch(
             try FetchRequest(
                 remote: request.remote,
                 remoteName: request.remoteName,
-                refspecs: try request.branch.map { branch in
-                    let tail = branch.description.dropFirst(
-                        "refs/heads/".count
-                    )
-                    return [
-                        try FetchRefspec(
-                            source: branch.description,
-                            destination:
-                                "refs/remotes/\(request.remoteName)/\(tail)",
-                            force: true
-                        ),
-                    ]
-                } ?? [],
+                refspecs: fetchRefspecs,
                 filter: request.filter,
                 shallow: request.shallow
             ),
             services: services
         ).value()
+        try await repository.setConfiguration(
+            GitConfigurationSetRequest(
+                key: try GitConfigurationKey(
+                    section: "remote",
+                    subsection: request.remoteName,
+                    name: "url"
+                ),
+                value: request.remote.description
+            )
+        ).value()
+        try await repository.setConfiguration(
+            GitConfigurationSetRequest(
+                key: try GitConfigurationKey(
+                    section: "remote",
+                    subsection: request.remoteName,
+                    name: "fetch"
+                ),
+                value: configuredFetch
+            )
+        ).value()
+        if request.mode == .mirror {
+            try await repository.setConfiguration(
+                GitConfigurationSetRequest(
+                    key: try GitConfigurationKey(
+                        section: "remote",
+                        subsection: request.remoteName,
+                        name: "mirror"
+                    ),
+                    value: "true"
+                )
+            ).value()
+        }
+        if request.mode != .normal {
+            if let remoteHead = fetched.remoteHead {
+                try root.directory.writeAtomically(
+                    Array("ref: \(remoteHead.description)\n".utf8),
+                    to: destinationComponents + ["HEAD"]
+                )
+            }
+            return repository
+        }
         if fetched.updatedReferences.isEmpty {
-            let configPath = destinationComponents + [".git", "config"]
-            let existing = try root.directory.read(
-                configPath,
-                limit: 16 * 1024 * 1024
-            )
-            let remoteConfiguration = """
-            [remote "\(request.remoteName)"]
-            \turl = \(request.remote.description)
-            \tfetch = +refs/heads/*:refs/remotes/\(request.remoteName)/*
-
-            """
-            try root.directory.writeAtomically(
-                existing + Array(remoteConfiguration.utf8),
-                to: configPath
-            )
             return repository
         }
         let selectedRemote: RefUpdateResult
@@ -320,21 +366,26 @@ public enum Treeish {
             ),
             services: services
         ).value()
-        let configPath = destinationComponents + [".git", "config"]
-        let existing = try root.directory.read(configPath, limit: 16 * 1024 * 1024)
-        let remoteConfiguration = """
-        [remote "\(request.remoteName)"]
-        \turl = \(request.remote.description)
-        \tfetch = +refs/heads/*:refs/remotes/\(request.remoteName)/*
-        [branch "\(branchName)"]
-        \tremote = \(request.remoteName)
-        \tmerge = refs/heads/\(branchName)
-
-        """
-        try root.directory.writeAtomically(
-            existing + Array(remoteConfiguration.utf8),
-            to: configPath
-        )
+        try await repository.setConfiguration(
+            GitConfigurationSetRequest(
+                key: try GitConfigurationKey(
+                    section: "branch",
+                    subsection: branchName,
+                    name: "remote"
+                ),
+                value: request.remoteName
+            )
+        ).value()
+        try await repository.setConfiguration(
+            GitConfigurationSetRequest(
+                key: try GitConfigurationKey(
+                    section: "branch",
+                    subsection: branchName,
+                    name: "merge"
+                ),
+                value: "refs/heads/\(branchName)"
+            )
+        ).value()
         return repository
     }
 

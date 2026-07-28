@@ -84,6 +84,10 @@ canonical empty pack when the remote already has every required object.
 leading `+` force and `^` negative forms. ``FetchRequest/prune`` removes only
 destinations covered by positive mappings and protects negative selections.
 Empty repositories clone without fabricating a commit or reference.
+Bare clone maps branch and tag references directly without creating a
+worktree. Mirror clone fetches `+refs/*:refs/*`, records `remote.*.mirror`,
+preserves the advertised symbolic `HEAD`, and can create detached exact-commit
+linked worktrees through ``Repository/createLinkedWorktree(_:)``.
 
 Checkout honors standard `$GIT_DIR/info/sparse-checkout` patterns when
 `core.sparseCheckout` is enabled in shared or worktree configuration. Excluded

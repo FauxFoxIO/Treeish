@@ -172,8 +172,207 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
         as: UTF8.self
     )
     #expect(configuration.contains("[remote \"origin\"]"))
-    #expect(configuration.contains("url = https://example.test/empty.git"))
+    #expect(
+        configuration.contains(
+            "url = \"https://example.test/empty.git\""
+        )
+    )
     #expect(await transport.requests.count == 2)
+}
+
+@Test func mirrorCloneCreatesExactLinkedWorktreeWithoutSystemGit() async throws {
+    let blob = GitObject(
+        type: .blob,
+        payload: Array("mirror\n".utf8)
+    )
+    let blobID = SHA1.hash(blob.canonicalBytes)
+    let tree = GitObjectEncoder.tree(entries: [
+        try GitTreeEntry(
+            mode: .regular,
+            name: Array("README.md".utf8),
+            objectID: blobID
+        ),
+    ])
+    let treeID = SHA1.hash(tree.canonicalBytes)
+    let signature = GitSignature(
+        name: "Treeish",
+        email: "treeish@example.com",
+        secondsSinceEpoch: 1_700_000_000,
+        timeZoneOffsetMinutes: 0
+    )
+    let commit = GitObjectEncoder.commit(
+        treeHex: treeID.map { String(format: "%02x", $0) }.joined(),
+        parentHexes: [],
+        author: signature,
+        committer: signature,
+        message: Array("mirror\n".utf8)
+    )
+    let commitID = SHA1.hash(commit.canonicalBytes)
+    let commitHex = commitID.map {
+        String(format: "%02x", $0)
+    }.joined()
+    let archive = try PackWriter.write([
+        try PackObject(identifier: blobID, object: blob),
+        try PackObject(identifier: treeID, object: tree),
+        try PackObject(identifier: commitID, object: commit),
+    ])
+    let advertisement =
+        try PacketLineEncoder.encode(.data(Array("version 2\n".utf8)))
+        + PacketLineEncoder.encode(.data(Array("ls-refs=unborn\n".utf8)))
+        + PacketLineEncoder.encode(
+            .data(Array("fetch=wait-for-done\n".utf8))
+        )
+        + PacketLineEncoder.encode(
+            .data(Array("object-format=sha1\n".utf8))
+        )
+        + PacketLineEncoder.encode(.flush)
+    let references = try PacketLineEncoder.encode(
+        .data(Array(
+            "\(commitHex) HEAD symref-target:refs/heads/main\n".utf8
+        ))
+    ) + PacketLineEncoder.encode(
+        .data(Array("\(commitHex) refs/heads/main\n".utf8))
+    ) + PacketLineEncoder.encode(
+        .data(Array("\(commitHex) refs/tags/v1\n".utf8))
+    ) + PacketLineEncoder.encode(.flush)
+    let fetch =
+        try PacketLineEncoder.encode(.data(Array("packfile\n".utf8)))
+        + PacketLineEncoder.encode(.data([1] + archive.pack))
+        + PacketLineEncoder.encode(.flush)
+    let remote = try RemoteURL(
+        URL(string: "https://example.test/mirror.git")!
+    )
+    let transport = ScriptedSmartHTTPTransport(responses: [
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type":
+                    "application/x-git-upload-pack-advertisement",
+            ],
+            body: advertisement,
+            finalURL: remote.url.appendingPathComponent("info/refs")
+        ),
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type": "application/x-git-upload-pack-result",
+            ],
+            body: references,
+            finalURL: remote.url.appendingPathComponent("git-upload-pack")
+        ),
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type": "application/x-git-upload-pack-result",
+            ],
+            body: fetch,
+            finalURL: remote.url.appendingPathComponent("git-upload-pack")
+        ),
+    ])
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.clone(
+        try CloneRequest(
+            remote: remote,
+            destination: try GitPath("Repositories/cache.git"),
+            mode: .mirror
+        ),
+        in: root,
+        services: RepositoryServices(httpTransport: transport)
+    )
+    #expect((try await repository.snapshot()).headObjectID == (try ObjectID(
+        hex: commitHex
+    )))
+    #expect(
+        try await repository.resolveReference(
+            try RefName("refs/tags/v1")
+        ) == (try ObjectID(hex: commitHex))
+    )
+    let fetchKey = try GitConfigurationKey(
+        section: "remote",
+        subsection: "origin",
+        name: "fetch"
+    )
+    #expect(
+        try await repository.configurationValues(for: fetchKey).value()
+            == ["+refs/*:refs/*"]
+    )
+    func git(_ arguments: [String]) throws -> (Int32, String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = arguments
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        return (
+            process.terminationStatus,
+            String(
+                decoding: output.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            )
+        )
+    }
+    let mirrorPath = directory.appendingPathComponent(
+        "Repositories/cache.git"
+    ).path
+    #expect(
+        try git([
+            "--git-dir", mirrorPath,
+            "rev-parse", "--is-bare-repository",
+        ]).1 == "true\n"
+    )
+    #expect(
+        try git(["--git-dir", mirrorPath, "symbolic-ref", "HEAD"]).1
+            == "refs/heads/main\n"
+    )
+    #expect(
+        try git(["--git-dir", mirrorPath, "rev-parse", "refs/tags/v1"]).1
+            == "\(commitHex)\n"
+    )
+    let worktree = try await repository.createLinkedWorktree(
+        WorktreeRequest(
+            destination: try GitPath("Work/job"),
+            start: try ObjectID(hex: commitHex)
+        )
+    ).value()
+    #expect(
+        try Data(
+            contentsOf: directory.appendingPathComponent(
+                "Work/job/README.md"
+            )
+        ) == Data("mirror\n".utf8)
+    )
+    #expect(
+        try git([
+            "-C", directory.appendingPathComponent("Work/job").path,
+            "rev-parse", "HEAD",
+        ]).1 == "\(commitHex)\n"
+    )
+    #expect(
+        try git([
+            "-C", directory.appendingPathComponent("Work/job").path,
+            "status", "--porcelain",
+        ]).1.isEmpty
+    )
+    #expect(
+        try await repository.removeLinkedWorktree(
+            identifier: worktree.identifier,
+            force: true
+        ).value() == (try GitPath("Work/job"))
+    )
+    #expect(
+        !FileManager.default.fileExists(
+            atPath: directory.appendingPathComponent("Work/job").path
+        )
+    )
 }
 
 @Test func submoduleUpdateInitializesExactGitlinkCommit() async throws {

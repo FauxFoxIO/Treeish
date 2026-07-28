@@ -86,6 +86,7 @@ typed result.
 - ``FetchRequest``
 - ``PushRequest``
 - ``CloneRequest``
+- ``CloneMode``
 
 ### Compatibility and safety
 

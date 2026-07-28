@@ -610,6 +610,12 @@ public struct FetchResult: Sendable, Hashable, Codable {
     }
 }
 
+public enum CloneMode: String, Sendable, Hashable, Codable {
+    case normal
+    case bare
+    case mirror
+}
+
 public struct CloneRequest: Sendable, Hashable {
     public let remote: RemoteURL
     public let destination: GitPath
@@ -617,6 +623,7 @@ public struct CloneRequest: Sendable, Hashable {
     public let remoteName: String
     public let filter: GitObjectFilter?
     public let shallow: GitShallowRequest?
+    public let mode: CloneMode
 
     public init(
         remote: RemoteURL,
@@ -624,9 +631,12 @@ public struct CloneRequest: Sendable, Hashable {
         branch: RefName? = nil,
         remoteName: String = "origin",
         filter: GitObjectFilter? = nil,
-        shallow: GitShallowRequest? = nil
+        shallow: GitShallowRequest? = nil,
+        mode: CloneMode = .normal
     ) throws {
         guard branch == nil || branch?.description.hasPrefix("refs/heads/") == true,
+              mode == .normal || branch == nil,
+              mode != .mirror || (filter == nil && shallow == nil),
               !remoteName.isEmpty,
               remoteName.allSatisfy({ $0.isLetter || $0.isNumber || "-_ .".contains($0) }),
               !remoteName.contains(" "),
@@ -638,6 +648,7 @@ public struct CloneRequest: Sendable, Hashable {
         self.remoteName = remoteName
         self.filter = filter
         self.shallow = shallow
+        self.mode = mode
     }
 }
 

@@ -292,7 +292,7 @@ decisions for the host app.
 
 ### Everyday Git
 
-- initialize, discover, open, clone, fetch, and push;
+- initialize, discover, open, normal/bare/mirror clone, fetch, and push;
 - staged and unstaged status, sparse-aware stage and reference-preserving
   checkout, commit, restore, and reset, with caller-supplied checkout/reset
   reflog identities;

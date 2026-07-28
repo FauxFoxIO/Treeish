@@ -41,13 +41,24 @@ public enum RepositoryOperationCapability: String, Sendable, Hashable, Codable {
     case writeObjects
     case readRefs
     case updateRefs
+    case resolveRevisions
+    case readReflogs
     case createCommit
     case status
+    case diff
+    case inspectConflicts
     case stage
+    case restore
     case checkout
+    case reset
+    case branchesAndTags
     case fetch
     case push
     case merge
+    case sequencer
+    case stash
+    case submodules
+    case bundles
     case linkedWorktrees
 }
 

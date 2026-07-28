@@ -293,9 +293,9 @@ decisions for the host app.
 ### Everyday Git
 
 - initialize, discover, open, normal/bare/mirror clone, fetch, and push;
-- staged and unstaged status, sparse-aware stage and reference-preserving
-  checkout, commit, restore, and reset, with caller-supplied checkout/reset
-  reflog identities;
+- staged and unstaged status, structured HEAD/index/worktree/tree-ish diff,
+  sparse-aware stage and reference-preserving checkout, commit, restore, and
+  reset, with caller-supplied checkout/reset reflog identities;
 - branches, lightweight and annotated tags, and linked worktrees;
 - host-backed OpenPGP, X.509, and SSH commit/tag signing with canonical Git
   payload extraction and verification challenges;
@@ -312,7 +312,10 @@ decisions for the host app.
 - effective repository configuration reads across bounded relative includes,
   plus compare-and-swap local set/add/unset operations that preserve unrelated
   text and refuse format-defining keys while a repository is open;
-- merge, cherry-pick, rebase, continuation, conflict state, and abort;
+- merge, cherry-pick, revert, rebase, continuation, exact conflict-stage
+  inspection, operation-state protection, and abort;
+- canonical tracked-change stash create/list/apply interoperable with system
+  Git; and
 - unified patches, bundles, blob diffs, and binary-safe workspace snapshots.
 
 ### Networking
@@ -328,6 +331,9 @@ It does not mutate repository-format-1 repositories containing unsupported
 required extensions. Inspect `repository.capabilities()` after opening an
 unfamiliar repository. Unknown required extensions make the repository
 read-only or metadata-only instead of risking corruption.
+
+See the [compatibility matrix](COMPATIBILITY.md) for the precise read, write,
+and safe-rejection envelope across formats and structured operations.
 
 ## Safety model
 

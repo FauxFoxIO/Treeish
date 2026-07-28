@@ -98,6 +98,69 @@ import TreeishFileSystem
     #expect(try GitPath("Sources/File.swift").displayString == "Sources/File.swift")
 }
 
+@Test func capabilitiesDistinguishReadAndMutationOperations() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let writableRoot = try await TreeishRoot.localDirectory(at: directory)
+    let writable = try await Treeish.initialize(in: writableRoot)
+    let writableOperations = await writable.capabilities().operations
+    #expect(writableOperations.isSuperset(of: [
+        .readObjects,
+        .checkIntegrity,
+        .listTrees,
+        .readConfiguration,
+        .readRefs,
+        .resolveRevisions,
+        .readReflogs,
+        .status,
+        .diff,
+        .inspectConflicts,
+        .writeConfiguration,
+        .writeObjects,
+        .updateRefs,
+        .createCommit,
+        .stage,
+        .restore,
+        .checkout,
+        .reset,
+        .branchesAndTags,
+        .fetch,
+        .push,
+        .merge,
+        .sequencer,
+        .stash,
+        .submodules,
+        .bundles,
+        .linkedWorktrees,
+    ]))
+
+    let readOnlyRoot = try await TreeishRoot.localDirectory(
+        at: directory,
+        policy: TreeishRootPolicy(readOnly: true)
+    )
+    let readOnly = try await Treeish.open(
+        try await Treeish.discover(in: readOnlyRoot),
+        roots: [readOnlyRoot]
+    )
+    let capabilities = await readOnly.capabilities()
+    guard case .readOnly(reason: .rootIsReadOnly) = capabilities.access else {
+        Issue.record("expected a read-only root restriction")
+        return
+    }
+    #expect(capabilities.operations.contains(.status))
+    #expect(capabilities.operations.contains(.diff))
+    #expect(capabilities.operations.contains(.inspectConflicts))
+    #expect(!capabilities.operations.contains(.stage))
+    #expect(!capabilities.operations.contains(.checkout))
+    #expect(!capabilities.operations.contains(.stash))
+}
+
 @Test func pathspecMagicSelectsIncludesAndExcludesDeterministically() throws {
     let paths = try [
         GitPath("Sources/App.swift"),

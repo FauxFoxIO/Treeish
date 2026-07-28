@@ -7923,13 +7923,17 @@ public actor Repository {
         } ?? .readWrite
         var operations: Set<RepositoryOperationCapability> = [
             .readObjects, .checkIntegrity, .listTrees, .readConfiguration,
-            .readRefs,
+            .readRefs, .resolveRevisions, .readReflogs,
         ]
+        if indexCapabilities.canRead {
+            operations.formUnion([.status, .diff, .inspectConflicts])
+        }
         if case .readWrite = access {
             operations.formUnion([
                 .writeConfiguration, .writeObjects, .updateRefs,
-                .createCommit, .status, .stage, .checkout, .fetch, .push,
-                .merge, .linkedWorktrees,
+                .createCommit, .stage, .restore, .checkout, .reset,
+                .branchesAndTags, .fetch, .push, .merge, .sequencer,
+                .stash, .submodules, .bundles, .linkedWorktrees,
             ])
         }
         return RepositoryCapabilities(

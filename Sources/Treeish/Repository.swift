@@ -564,6 +564,242 @@ public actor Repository {
         }
     }
 
+    public func updateSubmodules(
+        _ request: SubmoduleUpdateRequest = .init(),
+        services: RepositoryServices = .init()
+    ) -> GitOperation<[SubmoduleStatus]> {
+        let initial = submodules()
+        let root = root
+        let worktreePath = identity.location.worktreePath
+        let gitDirectory = gitDirectory
+        let commonDirectory = commonDirectory
+        let access = repositoryCapabilities.access
+        return GitOperation(phase: .updatingWorktree) {
+            guard case .readWrite = access,
+                  let worktreePath else {
+                throw TreeishError.mutationDisabled(
+                    access.reason ?? .rootIsReadOnly
+                )
+            }
+            guard request.maximumDepth > 0,
+                  request.maximumDepth <= 64 else {
+                throw TreeishError.submoduleRecursionLimitExceeded
+            }
+            let statuses = try await initial.value()
+            let repositoryConfiguration = try GitConfiguration.load(
+                from: commonDirectory
+            )
+            let requested = Set(request.paths.map(\.bytes))
+            if !requested.isEmpty {
+                let available = Set(statuses.map { $0.path.bytes })
+                guard requested.isSubset(of: available) else {
+                    throw TreeishError.invalidPath
+                }
+            }
+            var output: [SubmoduleStatus] = []
+            func updateNestedSubmodules(
+                _ nested: Repository
+            ) async throws {
+                guard request.recursive else {
+                    return
+                }
+                let childOperation = await nested.submodules()
+                let children = try await childOperation.value()
+                guard children.isEmpty || request.maximumDepth > 1 else {
+                    throw TreeishError.submoduleRecursionLimitExceeded
+                }
+                guard !children.isEmpty else {
+                    return
+                }
+                let update = await nested.updateSubmodules(
+                    SubmoduleUpdateRequest(
+                        initialize: request.initialize,
+                        fetch: request.fetch,
+                        force: request.force,
+                        recursive: true,
+                        maximumDepth: request.maximumDepth - 1
+                    ),
+                    services: services
+                )
+                _ = try await update.value()
+            }
+            for status in statuses {
+                try Task.checkCancellation()
+                guard requested.isEmpty ||
+                        requested.contains(status.path.bytes) else {
+                    output.append(status)
+                    continue
+                }
+                guard let configuration = status.configuration,
+                      let expected = status.expectedCommit else {
+                    if !requested.isEmpty {
+                        throw TreeishError.invalidPath
+                    }
+                    output.append(status)
+                    continue
+                }
+                let strategy = repositoryConfiguration.value(
+                    section: "submodule",
+                    subsection: configuration.name,
+                    key: "update"
+                ) ?? configuration.update
+                if strategy == "none" {
+                    output.append(status)
+                    continue
+                }
+                if let strategy,
+                   strategy != "checkout" {
+                    throw TreeishError.unsupportedSubmoduleUpdate(
+                        status.path,
+                        strategy
+                    )
+                }
+                if status.state == .clean {
+                    if request.recursive {
+                        let fullPath = try Repository.join(
+                            worktreePath,
+                            status.path
+                        )
+                        let location = try await Treeish.discover(
+                            in: root,
+                            from: fullPath
+                        )
+                        guard location.worktreePath == fullPath else {
+                            throw TreeishError.repositoryNotFound
+                        }
+                        let nested = try await Treeish.open(
+                            location,
+                            roots: [root]
+                        )
+                        try await updateNestedSubmodules(nested)
+                    }
+                    output.append(status)
+                    continue
+                }
+                if status.state == .modified, !request.force {
+                    throw TreeishError.recoveryRequired(
+                        "submodule \(status.path.displayString) has local changes"
+                    )
+                }
+                let fullPath = try Repository.join(
+                    worktreePath,
+                    status.path
+                )
+                if status.state == .uninitialized,
+                   !request.initialize {
+                    output.append(status)
+                    continue
+                }
+                let destinationExisted = try root.directory.exists(
+                    fullPath.components
+                )
+                var initializationStarted = false
+                do {
+                    let nested: Repository
+                    if status.state == .uninitialized {
+                        let remote = try Repository.submoduleRemote(
+                            configuration,
+                            gitDirectory: gitDirectory,
+                            commonDirectory: commonDirectory
+                        )
+                        try Repository.persistSubmoduleURL(
+                            configuration,
+                            remote: remote,
+                            commonDirectory: commonDirectory
+                        )
+                        if destinationExisted {
+                            let destination = try root.directory.url(
+                                for: fullPath.components,
+                                followFinalSymlink: false
+                            )
+                            guard try FileManager.default
+                                .contentsOfDirectory(
+                                    at: destination,
+                                    includingPropertiesForKeys: nil
+                                ).isEmpty else {
+                                throw TreeishError.worktreeCollision(
+                                    status.path
+                                )
+                            }
+                        }
+                        initializationStarted = true
+                        nested = try await Treeish.clone(
+                            try CloneRequest(
+                                remote: remote,
+                                destination: fullPath
+                            ),
+                            in: root,
+                            services: services
+                        )
+                    } else {
+                        let location = try await Treeish.discover(
+                            in: root,
+                            from: fullPath
+                        )
+                        guard location.worktreePath == fullPath else {
+                            throw TreeishError.repositoryNotFound
+                        }
+                        nested = try await Treeish.open(
+                            location,
+                            roots: [root]
+                        )
+                    }
+                    do {
+                        _ = try await nested.resolveRevision(
+                            expected.description
+                        )
+                    } catch {
+                        guard request.fetch else {
+                            throw TreeishError.referenceNotFound
+                        }
+                        let remote = try Repository.submoduleRemote(
+                            configuration,
+                            gitDirectory: gitDirectory,
+                            commonDirectory: commonDirectory
+                        )
+                        _ = try await nested.fetch(
+                            try FetchRequest(remote: remote),
+                            services: services
+                        ).value()
+                        _ = try await nested.resolveRevision(
+                            expected.description
+                        )
+                    }
+                    _ = try await nested.checkout(
+                        CheckoutRequest(
+                            commit: expected,
+                            force: request.force
+                        ),
+                        services: services
+                    ).value()
+                    try await updateNestedSubmodules(nested)
+                    let snapshot = try await nested.snapshot()
+                    let nestedStatus = await nested.status()
+                    let clean = try await nestedStatus.value().isClean
+                    output.append(SubmoduleStatus(
+                        configuration: configuration,
+                        path: status.path,
+                        expectedCommit: expected,
+                        checkedOutCommit: snapshot.headObjectID,
+                        state: snapshot.headObjectID == expected
+                            ? (clean ? .clean : .modified)
+                            : .differentCommit
+                    ))
+                } catch {
+                    if initializationStarted {
+                        try Repository.rollbackSubmoduleInitialization(
+                            fullPath,
+                            root: root,
+                            preserveDirectory: destinationExisted
+                        )
+                    }
+                    throw error
+                }
+            }
+            return output
+        }
+    }
+
     public func writeIndexTree() -> GitOperation<ObjectID> {
         let store = objectStore
         let indexStore = indexStore
@@ -1544,33 +1780,38 @@ public actor Repository {
             let currentIndex = try indexStore.read()
             let tracked = Set(currentIndex.entries.filter { $0.stage == 0 }.map(\.path))
             let targetPaths = Set(includedTarget.map(\.path))
-            for entry in target where !tracked.contains(entry.path) {
-                let path = try GitPath(bytes: entry.path)
-                if try worktree.exists(path.components) {
-                    throw TreeishError.worktreeCollision(path)
+            if !request.force {
+                for entry in target where !tracked.contains(entry.path) {
+                    let path = try GitPath(bytes: entry.path)
+                    if try worktree.exists(path.components) {
+                        throw TreeishError.worktreeCollision(path)
+                    }
                 }
-            }
-            for entry in currentIndex.entries where entry.stage == 0 {
-                let path = try GitPath(bytes: entry.path)
-                guard try worktree.exists(path.components) else {
-                    continue
-                }
-                let url = try worktree.url(for: path.components, followFinalSymlink: false)
-                let attributes = try FileManager.default.attributesOfItem(
-                    atPath: url.path
-                )
-                if entry.mode == 0o160000,
-                   attributes[.type] as? FileAttributeType == .typeDirectory {
-                    continue
-                }
-                let bytes = try Repository.worktreePayload(url: url)
-                let cleaned = entry.mode == 0o120000
-                    ? bytes
-                    : try workingTreeRules.clean(bytes, path: path)
-                let canonical =
-                    Array("blob \(cleaned.count)\0".utf8) + cleaned
-                guard store.objectFormat.hash(canonical) == entry.objectID else {
-                    throw TreeishError.worktreeCollision(path)
+                for entry in currentIndex.entries where entry.stage == 0 {
+                    let path = try GitPath(bytes: entry.path)
+                    guard try worktree.exists(path.components) else {
+                        continue
+                    }
+                    let url = try worktree.url(
+                        for: path.components,
+                        followFinalSymlink: false
+                    )
+                    let attributes = try FileManager.default.attributesOfItem(
+                        atPath: url.path
+                    )
+                    if entry.mode == 0o160000,
+                       attributes[.type] as? FileAttributeType == .typeDirectory {
+                        continue
+                    }
+                    let bytes = try Repository.worktreePayload(url: url)
+                    let cleaned = entry.mode == 0o120000
+                        ? bytes
+                        : try workingTreeRules.clean(bytes, path: path)
+                    let canonical =
+                        Array("blob \(cleaned.count)\0".utf8) + cleaned
+                    guard store.objectFormat.hash(canonical) == entry.objectID else {
+                        throw TreeishError.worktreeCollision(path)
+                    }
                 }
             }
             let affected = try Set(tracked.union(targetPaths).map(GitPath.init(bytes:)))
@@ -4596,6 +4837,93 @@ public actor Repository {
         }
     }
 
+    private static func submoduleRemote(
+        _ submodule: SubmoduleConfiguration,
+        gitDirectory: RootDirectory,
+        commonDirectory: RootDirectory
+    ) throws -> RemoteURL {
+        let repositoryConfiguration = try GitConfiguration.load(
+            from: commonDirectory
+        )
+        guard let raw = repositoryConfiguration.value(
+            section: "submodule",
+            subsection: submodule.name,
+            key: "url"
+        ) ?? submodule.url else {
+            throw TreeishError.remoteTransportUnavailable(.https)
+        }
+        if let direct = try? RemoteURL(raw) {
+            return direct
+        }
+        guard raw.hasPrefix("./") || raw.hasPrefix("../") else {
+            throw TreeishError.invalidPath
+        }
+        let branchRemote: String? = try {
+            let head = try readHead(
+                headDirectory: gitDirectory,
+                refsDirectory: commonDirectory
+            )
+            guard let reference = head.reference,
+                  reference.description.hasPrefix("refs/heads/") else {
+                return nil
+            }
+            return repositoryConfiguration.value(
+                section: "branch",
+                subsection: String(
+                    reference.description.dropFirst("refs/heads/".count)
+                ),
+                key: "remote"
+            )
+        }()
+        let baseRaw = branchRemote.flatMap {
+            repositoryConfiguration.value(
+                section: "remote",
+                subsection: $0,
+                key: "url"
+            )
+        } ?? repositoryConfiguration.value(
+            section: "remote",
+            subsection: "origin",
+            key: "url"
+        ) ?? repositoryConfiguration.entries.first {
+            $0.section.caseInsensitiveCompare("remote") == .orderedSame &&
+                $0.key.caseInsensitiveCompare("url") == .orderedSame
+        }?.value
+        guard let baseRaw,
+              let base = try? RemoteURL(baseRaw),
+              let resolved = URL(
+                string: raw,
+                relativeTo: base.url
+              )?.absoluteURL.standardized else {
+            throw TreeishError.invalidPath
+        }
+        return try RemoteURL(resolved)
+    }
+
+    private static func persistSubmoduleURL(
+        _ submodule: SubmoduleConfiguration,
+        remote: RemoteURL,
+        commonDirectory: RootDirectory
+    ) throws {
+        let configuration = try GitConfiguration.load(
+            from: commonDirectory
+        )
+        guard configuration.value(
+            section: "submodule",
+            subsection: submodule.name,
+            key: "url"
+        ) == nil else {
+            return
+        }
+        let bytes = try configuration.replacing(
+            section: "submodule",
+            subsection: submodule.name,
+            key: "url",
+            value: remote.url.absoluteString
+        )
+        try commonDirectory.writeAtomically(bytes, to: ["config"])
+    }
+
     private static func join(
         _ parent: GitPath,
         _ child: GitPath
@@ -4604,6 +4932,24 @@ public actor Repository {
             return child
         }
         return try GitPath(bytes: parent.bytes + [0x2f] + child.bytes)
+    }
+
+    private static func rollbackSubmoduleInitialization(
+        _ path: GitPath,
+        root: TreeishRoot,
+        preserveDirectory: Bool
+    ) throws {
+        let components = try path.components
+        let url = try root.directory.url(
+            for: components,
+            followFinalSymlink: false
+        )
+        if try root.directory.exists(components) {
+            try FileManager.default.removeItem(at: url)
+        }
+        if preserveDirectory {
+            try root.directory.createDirectory(components)
+        }
     }
 
     private static func worktreeStatus(

@@ -223,9 +223,21 @@ public enum Treeish {
         services: RepositoryServices = .init()
     ) async throws -> Repository {
         let destinationComponents = try request.destination.components
-        guard !destinationComponents.isEmpty,
-              !(try root.directory.exists(destinationComponents)) else {
+        guard !destinationComponents.isEmpty else {
             throw TreeishError.worktreeCollision(request.destination)
+        }
+        if try root.directory.exists(destinationComponents) {
+            let destination = try root.directory.url(
+                for: destinationComponents,
+                followFinalSymlink: false
+            )
+            let contents = try FileManager.default.contentsOfDirectory(
+                at: destination,
+                includingPropertiesForKeys: nil
+            )
+            guard contents.isEmpty else {
+                throw TreeishError.worktreeCollision(request.destination)
+            }
         }
         let requestedBranchName = request.branch.map {
             String($0.description.dropFirst("refs/heads/".count))

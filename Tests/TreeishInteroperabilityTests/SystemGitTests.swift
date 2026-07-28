@@ -2108,9 +2108,40 @@ func systemGitRecognizesTreeishLinkedWorktree(
     #expect(
         try await repository.status().value().entries.contains {
             $0.path == (try? GitPath("modules/child")) &&
-                $0.worktreeChange == .modified
+            $0.worktreeChange == .modified
         }
     )
+    statuses = try await repository.updateSubmodules(
+        SubmoduleUpdateRequest(fetch: false)
+    ).value()
+    #expect(statuses.first?.state == .clean)
+    #expect(statuses.first?.expectedCommit == statuses.first?.checkedOutCommit)
+
+    try Data("dirty again\n".utf8).write(
+        to: checkout.appendingPathComponent("child.txt")
+    )
+    await #expect(throws: TreeishError.recoveryRequired(
+        "submodule modules/child has local changes"
+    )) {
+        _ = try await repository.updateSubmodules(
+            SubmoduleUpdateRequest(fetch: false)
+        ).value()
+    }
+    statuses = try await repository.updateSubmodules(
+        SubmoduleUpdateRequest(
+            fetch: false,
+            force: true
+        )
+    ).value()
+    #expect(statuses.first?.state == .clean)
+    statuses = try await repository.updateSubmodules(
+        SubmoduleUpdateRequest(
+            fetch: false,
+            recursive: true,
+            maximumDepth: 1
+        )
+    ).value()
+    #expect(statuses.first?.state == .clean)
 
     try FileManager.default.removeItem(
         at: checkout.appendingPathComponent(".git")

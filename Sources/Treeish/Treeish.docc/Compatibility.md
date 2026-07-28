@@ -69,3 +69,13 @@ clean, dirty, different-commit, missing-gitlink, and unconfigured states.
 Superproject status treats gitlink directories atomically and reports nested
 changes without leaking their files as untracked paths. Repository discovery
 supports both linked-worktree and standard submodule `.git` indirection.
+
+``Repository/updateSubmodules(_:services:)`` initializes supported HTTPS or
+host-provided SSH submodules, resolves relative URLs against the superproject's
+branch remote, fetches missing objects, and checks out the exact gitlink commit.
+It refuses dirty submodules unless force is explicit, honors `update=none`,
+rejects unsupported update commands, bounds recursive updates, and removes a
+partially initialized checkout when initialization fails. Clone accepts an
+existing empty destination, matching the prerequisite used by submodule
+placeholders. ``CheckoutRequest/force`` is the explicit destructive-worktree
+opt-in used by forced updates.

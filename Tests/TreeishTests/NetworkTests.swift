@@ -150,6 +150,10 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
         withIntermediateDirectories: true
     )
     defer { try? FileManager.default.removeItem(at: directory) }
+    try FileManager.default.createDirectory(
+        at: directory.appendingPathComponent("empty"),
+        withIntermediateDirectories: true
+    )
     let root = try await TreeishRoot.localDirectory(at: directory)
     let repository = try await Treeish.clone(
         try CloneRequest(
@@ -170,6 +174,219 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
     #expect(configuration.contains("[remote \"origin\"]"))
     #expect(configuration.contains("url = https://example.test/empty.git"))
     #expect(await transport.requests.count == 2)
+}
+
+@Test func submoduleUpdateInitializesExactGitlinkCommit() async throws {
+    let blob = GitObject(
+        type: .blob,
+        payload: Array("submodule\n".utf8)
+    )
+    let blobID = SHA1.hash(blob.canonicalBytes)
+    let tree = GitObjectEncoder.tree(entries: [
+        try GitTreeEntry(
+            mode: .regular,
+            name: Array("file.txt".utf8),
+            objectID: blobID
+        ),
+    ])
+    let treeID = SHA1.hash(tree.canonicalBytes)
+    let signature = GitSignature(
+        name: "Treeish",
+        email: "treeish@example.com",
+        secondsSinceEpoch: 1_700_000_000,
+        timeZoneOffsetMinutes: 0
+    )
+    let commit = GitObjectEncoder.commit(
+        treeHex: treeID.map { String(format: "%02x", $0) }.joined(),
+        parentHexes: [],
+        author: signature,
+        committer: signature,
+        message: Array("submodule\n".utf8)
+    )
+    let commitID = SHA1.hash(commit.canonicalBytes)
+    let commitHex = commitID.map {
+        String(format: "%02x", $0)
+    }.joined()
+    let archive = try PackWriter.write([
+        try PackObject(identifier: blobID, object: blob),
+        try PackObject(identifier: treeID, object: tree),
+        try PackObject(identifier: commitID, object: commit),
+    ])
+    let advertisement =
+        try PacketLineEncoder.encode(.data(Array("version 2\n".utf8)))
+        + PacketLineEncoder.encode(.data(Array("ls-refs=unborn\n".utf8)))
+        + PacketLineEncoder.encode(
+            .data(Array("fetch=wait-for-done\n".utf8))
+        )
+        + PacketLineEncoder.encode(
+            .data(Array("object-format=sha1\n".utf8))
+        )
+        + PacketLineEncoder.encode(.flush)
+    let references = try PacketLineEncoder.encode(
+        .data(Array(
+            "\(commitHex) HEAD symref-target:refs/heads/main\n".utf8
+        ))
+    ) + PacketLineEncoder.encode(
+        .data(Array("\(commitHex) refs/heads/main\n".utf8))
+    ) + PacketLineEncoder.encode(.flush)
+    let fetch =
+        try PacketLineEncoder.encode(.data(Array("packfile\n".utf8)))
+        + PacketLineEncoder.encode(.data([1] + archive.pack))
+        + PacketLineEncoder.encode(.flush)
+    let remote = try RemoteURL(
+        URL(string: "https://example.test/submodule.git")!
+    )
+    let transport = ScriptedSmartHTTPTransport(responses: [
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type":
+                    "application/x-git-upload-pack-advertisement",
+            ],
+            body: advertisement,
+            finalURL: remote.url.appendingPathComponent("info/refs")
+        ),
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type": "application/x-git-upload-pack-result",
+            ],
+            body: references,
+            finalURL: remote.url.appendingPathComponent("git-upload-pack")
+        ),
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type": "application/x-git-upload-pack-result",
+            ],
+            body: fetch,
+            finalURL: remote.url.appendingPathComponent("git-upload-pack")
+        ),
+    ])
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    let superproject = directory.appendingPathComponent("superproject")
+    try FileManager.default.createDirectory(
+        at: superproject,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    func git(_ arguments: [String]) throws -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", superproject.path] + arguments
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "GIT_AUTHOR_NAME": "System Git",
+            "GIT_AUTHOR_EMAIL": "git@example.com",
+            "GIT_COMMITTER_NAME": "System Git",
+            "GIT_COMMITTER_EMAIL": "git@example.com",
+        ], uniquingKeysWith: { _, new in new })
+        try process.run()
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
+    #expect(try git(["init"]) == 0)
+    #expect(try git([
+        "remote", "add", "origin",
+        "https://example.test/org/superproject.git",
+    ]) == 0)
+    try Data("""
+    [submodule "child"]
+        path = modules/child
+        url = ../submodule.git
+
+    """.utf8).write(
+        to: superproject.appendingPathComponent(".gitmodules")
+    )
+    #expect(try git(["add", ".gitmodules"]) == 0)
+    #expect(try git([
+        "update-index", "--add", "--cacheinfo",
+        "160000,\(commitHex),modules/child",
+    ]) == 0)
+    #expect(try git(["commit", "-m", "gitlink"]) == 0)
+
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.open(
+        try await Treeish.discover(
+            in: root,
+            from: try GitPath("superproject")
+        ),
+        roots: [root]
+    )
+    let result = try await repository.updateSubmodules(
+        services: RepositoryServices(httpTransport: transport)
+    ).value()
+    #expect(result.first?.state == .clean)
+    #expect(result.first?.expectedCommit?.description == commitHex)
+    #expect(
+        try root.directory.read(
+            ["superproject", "modules", "child", "file.txt"],
+            limit: 1024
+        ) == blob.payload
+    )
+    let superprojectConfiguration = String(
+        decoding: try root.directory.read(
+            ["superproject", ".git", "config"],
+            limit: 1024 * 1024
+        ),
+        as: UTF8.self
+    )
+    #expect(superprojectConfiguration.contains("[submodule \"child\"]"))
+    #expect(superprojectConfiguration.contains(
+        "https://example.test/submodule.git"
+    ))
+    #expect(await transport.requests.count == 3)
+
+    try FileManager.default.removeItem(
+        at: superproject.appendingPathComponent("modules/child")
+    )
+    let missingCommit = String(repeating: "1", count: 40)
+    #expect(try git([
+        "update-index", "--cacheinfo",
+        "160000,\(missingCommit),modules/child",
+    ]) == 0)
+    #expect(try git(["commit", "-m", "missing gitlink"]) == 0)
+    let rollbackTransport = ScriptedSmartHTTPTransport(responses: [
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type":
+                    "application/x-git-upload-pack-advertisement",
+            ],
+            body: advertisement,
+            finalURL: remote.url.appendingPathComponent("info/refs")
+        ),
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type": "application/x-git-upload-pack-result",
+            ],
+            body: references,
+            finalURL: remote.url.appendingPathComponent("git-upload-pack")
+        ),
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type": "application/x-git-upload-pack-result",
+            ],
+            body: fetch,
+            finalURL: remote.url.appendingPathComponent("git-upload-pack")
+        ),
+    ])
+    await #expect(throws: TreeishError.referenceNotFound) {
+        _ = try await repository.updateSubmodules(
+            SubmoduleUpdateRequest(fetch: false),
+            services: RepositoryServices(
+                httpTransport: rollbackTransport
+            )
+        ).value()
+    }
+    #expect(
+        !FileManager.default.fileExists(
+            atPath: superproject
+                .appendingPathComponent("modules/child").path
+        )
+    )
 }
 
 @Test func fetchUsesInjectedProtocolV2TransportAndPublishesValidatedPack() async throws {

@@ -20,6 +20,8 @@ public enum TreeishError: Error, Sendable, Equatable {
     case worktreeCollision(GitPath)
     case ignoredPath(GitPath)
     case pathOutsideSparseCheckout(GitPath)
+    case unsupportedSubmoduleUpdate(GitPath, String)
+    case submoduleRecursionLimitExceeded
     case unsupportedContentConversion(GitPath, String)
 }
 

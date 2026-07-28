@@ -179,10 +179,16 @@ public struct ReflogMetadata: Sendable, Hashable, Codable {
 public struct CheckoutRequest: Sendable, Hashable, Codable {
     public let commit: ObjectID
     public let reference: RefName?
+    public let force: Bool
 
-    public init(commit: ObjectID, reference: RefName? = nil) {
+    public init(
+        commit: ObjectID,
+        reference: RefName? = nil,
+        force: Bool = false
+    ) {
         self.commit = commit
         self.reference = reference
+        self.force = force
     }
 }
 
@@ -499,6 +505,31 @@ public struct SubmoduleStatus: Sendable, Hashable, Codable {
         self.expectedCommit = expectedCommit
         self.checkedOutCommit = checkedOutCommit
         self.state = state
+    }
+}
+
+public struct SubmoduleUpdateRequest: Sendable, Hashable, Codable {
+    public let paths: [GitPath]
+    public let initialize: Bool
+    public let fetch: Bool
+    public let force: Bool
+    public let recursive: Bool
+    public let maximumDepth: Int
+
+    public init(
+        paths: [GitPath] = [],
+        initialize: Bool = true,
+        fetch: Bool = true,
+        force: Bool = false,
+        recursive: Bool = false,
+        maximumDepth: Int = 16
+    ) {
+        self.paths = paths
+        self.initialize = initialize
+        self.fetch = fetch
+        self.force = force
+        self.recursive = recursive
+        self.maximumDepth = maximumDepth
     }
 }
 

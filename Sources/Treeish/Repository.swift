@@ -2798,7 +2798,10 @@ public actor Repository {
                 pending.append(commit.tree)
                 pending.append(contentsOf: commit.parents)
             case .tree:
-                pending.append(contentsOf: try treeObjectIDs(object.payload))
+                pending.append(contentsOf: try treeObjectIDs(
+                    object.payload,
+                    objectFormat: store.objectFormat
+                ))
             case .tag:
                 if let target = try tagTarget(object.payload) { pending.append(target) }
             case .blob:
@@ -2808,17 +2811,23 @@ public actor Repository {
         return result
     }
 
-    private static func treeObjectIDs(_ payload: [UInt8]) throws -> [[UInt8]] {
+    private static func treeObjectIDs(
+        _ payload: [UInt8],
+        objectFormat: ObjectHashAlgorithm
+    ) throws -> [[UInt8]] {
         var result: [[UInt8]] = []
         var cursor = 0
         while cursor < payload.count {
             guard let space = payload[cursor...].firstIndex(of: 0x20),
-                  let nul = payload[space...].firstIndex(of: 0),
-                  nul + 21 <= payload.count else {
+                  let nul = payload[space...].firstIndex(of: 0) else {
                 throw GitObjectError.invalidHeader
             }
-            result.append(Array(payload[(nul + 1)..<(nul + 21)]))
-            cursor = nul + 21
+            let hashLength = objectFormat.byteCount
+            guard nul + 1 + hashLength <= payload.count else {
+                throw GitObjectError.invalidHeader
+            }
+            result.append(Array(payload[(nul + 1)..<(nul + 1 + hashLength)]))
+            cursor = nul + 1 + hashLength
         }
         return result
     }
@@ -2909,7 +2918,9 @@ public actor Repository {
             guard !name.isEmpty, !name.contains(0x2f), name != Array(".git".utf8),
                   let parsedMode = UInt32(String(decoding: modeBytes, as: UTF8.self), radix: 8)
             else { throw GitObjectError.invalidHeader }
-            let child = Array(try reader.read(count: 20))
+            let child = Array(try reader.read(
+                count: store.objectFormat.byteCount
+            ))
             let path = prefix.isEmpty ? name : prefix + [0x2f] + name
             if parsedMode == 0o40000 {
                 result += try flattenTree(identifier: child, prefix: path, store: store)
@@ -3630,7 +3641,9 @@ public actor Repository {
                   name.lowercased() != ".git", !name.contains("/") else {
                 throw TreeishError.pathEncodingUnsupported
             }
-            let objectID = Array(try reader.read(count: 20))
+            let objectID = Array(try reader.read(
+                count: store.objectFormat.byteCount
+            ))
             let mode = String(decoding: modeBytes, as: UTF8.self)
             let path = components + [name]
             if mode == "40000" || mode == "040000" {

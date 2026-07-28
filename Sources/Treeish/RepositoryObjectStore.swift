@@ -8,7 +8,7 @@ final class RepositoryObjectStore: @unchecked Sendable {
     private let loose: LooseObjectStore
     private let directory: RootDirectory
     private let limits: TreeishResourceLimits
-    private let objectFormat: GitHashAlgorithm
+    let objectFormat: GitHashAlgorithm
     private let lock = NSLock()
     private var cachedPacks: [String: PackFile] = [:]
     private var cachedIndexes: [String: PackIndexV2] = [:]

@@ -17,7 +17,8 @@ public struct CommitRecord: Sendable, Hashable {
     public let message: [UInt8]
 
     public init(identifier: [UInt8], object: GitObject) throws {
-        guard identifier.count == 20, object.type == .commit else {
+        guard (identifier.count == 20 || identifier.count == 32),
+              object.type == .commit else {
             throw CommitGraphError.expectedCommit
         }
         let separator = Array("\n\n".utf8)
@@ -30,9 +31,15 @@ public struct CommitRecord: Sendable, Hashable {
         var authorTime: Int64?
         for header in headers {
             if header.starts(with: Array("tree ".utf8)) {
-                tree = try Self.decodeHex(header.dropFirst(5))
+                tree = try Self.decodeHex(
+                    header.dropFirst(5),
+                    byteCount: identifier.count
+                )
             } else if header.starts(with: Array("parent ".utf8)) {
-                parents.append(try Self.decodeHex(header.dropFirst(7)))
+                parents.append(try Self.decodeHex(
+                    header.dropFirst(7),
+                    byteCount: identifier.count
+                ))
             } else if header.starts(with: Array("author ".utf8)),
                       let close = header.lastIndex(of: 0x3e) {
                 let suffix = header[header.index(after: close)...]
@@ -42,8 +49,8 @@ public struct CommitRecord: Sendable, Hashable {
                 }
             }
         }
-        guard let tree, tree.count == 20,
-              parents.allSatisfy({ $0.count == 20 }) else {
+        guard let tree, tree.count == identifier.count,
+              parents.allSatisfy({ $0.count == identifier.count }) else {
             throw CommitGraphError.malformedCommit
         }
         self.identifier = identifier
@@ -53,8 +60,13 @@ public struct CommitRecord: Sendable, Hashable {
         message = Array(object.payload[split.upperBound...])
     }
 
-    private static func decodeHex(_ bytes: ArraySlice<UInt8>) throws -> [UInt8] {
-        guard bytes.count == 40 else { throw CommitGraphError.malformedCommit }
+    private static func decodeHex(
+        _ bytes: ArraySlice<UInt8>,
+        byteCount: Int
+    ) throws -> [UInt8] {
+        guard bytes.count == byteCount * 2 else {
+            throw CommitGraphError.malformedCommit
+        }
         var output: [UInt8] = []
         var index = bytes.startIndex
         while index < bytes.endIndex {

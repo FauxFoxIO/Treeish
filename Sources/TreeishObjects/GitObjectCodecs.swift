@@ -91,7 +91,7 @@ public struct GitTreeEntry: Sendable, Hashable {
         guard !name.isEmpty,
               !name.contains(0),
               !name.contains(0x2f),
-              objectID.count == 20
+              (objectID.count == 20 || objectID.count == 32)
         else {
             throw GitObjectError.invalidHeader
         }

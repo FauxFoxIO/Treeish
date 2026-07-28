@@ -57,7 +57,7 @@ import Testing
     )
     let capabilities = await repository.capabilities()
     #expect(capabilities.refStorage == .reftable)
-    #expect(capabilities.access != .readWrite)
+    #expect(capabilities.access == .readWrite)
     let snapshot = try await repository.snapshot()
     #expect(snapshot.headReference == (try RefName("refs/heads/main")))
     #expect(snapshot.headObjectID == expectedHead)
@@ -68,6 +68,101 @@ import Testing
         "refs/tags/lightweight",
     ])
     #expect(references.allSatisfy { $0.objectID.algorithm == .sha1 })
+}
+
+@Test(arguments: ObjectHashAlgorithm.allCases)
+func systemGitReadsAndMutatesTreeishReftableRepository(
+    objectFormat: ObjectHashAlgorithm
+) async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let file = directory.appendingPathComponent("reftable.txt")
+    try Data("treeish\n".utf8).write(to: file)
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.initialize(
+        in: root,
+        options: RepositoryInitialization(
+            objectFormat: objectFormat,
+            refStorage: .reftable
+        )
+    )
+    #expect(await repository.capabilities().access == .readWrite)
+    _ = try await repository.stage(
+        StageRequest(pathspecs: [try GitPathspec("reftable.txt")])
+    ).value()
+    let tree = try await repository.writeIndexTree().value()
+    let signature = Signature(
+        name: "Treeish",
+        email: "treeish@example.com",
+        secondsSinceEpoch: 1_700_000_000,
+        timeZoneOffsetMinutes: 0
+    )
+    let commit = try await repository.commit(
+        CommitRequest(
+            tree: tree,
+            author: signature,
+            committer: signature,
+            message: Array("treeish reftable\n".utf8)
+        )
+    ).value().objectID
+    _ = try await repository.createBranch(
+        named: "temporary",
+        at: commit,
+        reflog: ReflogMetadata(
+            signature: signature,
+            message: "branch: Created from main"
+        )
+    ).value()
+    _ = try await repository.createTag(
+        TagRequest(name: "treeish-tag", target: commit)
+    ).value()
+    _ = try await repository.deleteReference(
+        try RefName("refs/heads/temporary"),
+        expected: commit
+    ).value()
+
+    func git(_ arguments: [String]) throws -> (Int32, String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory.path] + arguments
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "GIT_AUTHOR_NAME": "System Git",
+            "GIT_AUTHOR_EMAIL": "git@example.com",
+            "GIT_COMMITTER_NAME": "System Git",
+            "GIT_COMMITTER_EMAIL": "git@example.com",
+        ], uniquingKeysWith: { _, new in new })
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        return (
+            process.terminationStatus,
+            String(
+                decoding: output.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            )
+        )
+    }
+    #expect(try git(["fsck", "--strict"]).0 == 0)
+    #expect(try git(["rev-parse", "HEAD"]).1 == "\(commit)\n")
+    #expect(try git(["rev-parse", "treeish-tag"]).1 == "\(commit)\n")
+    #expect(try git(["show-ref", "--verify", "refs/heads/temporary"]).0 != 0)
+
+    try Data("system git\n".utf8).write(to: file)
+    #expect(try git(["add", "reftable.txt"]).0 == 0)
+    #expect(try git(["commit", "-m", "system mutation"]).0 == 0)
+    let reopened = try await Treeish.open(
+        try await Treeish.discover(in: root),
+        roots: [root]
+    )
+    #expect(try await reopened.status().value().isClean)
+    #expect(try await reopened.snapshot().headObjectID != commit)
 }
 
 @Test func systemGitReadsTreeishLooseObject() async throws {
@@ -319,7 +414,10 @@ import Testing
     #expect(process.terminationStatus == 0)
 }
 
-@Test func systemGitRecognizesTreeishLinkedWorktree() async throws {
+@Test(arguments: [RefStorageFormat.files, .reftable])
+func systemGitRecognizesTreeishLinkedWorktree(
+    refStorage: RefStorageFormat
+) async throws {
     let parent = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString)
     let main = parent.appendingPathComponent("main")
@@ -329,7 +427,8 @@ import Testing
     let root = try await TreeishRoot.localDirectory(at: parent)
     let repository = try await Treeish.initialize(
         in: root,
-        at: try GitPath("main")
+        at: try GitPath("main"),
+        options: RepositoryInitialization(refStorage: refStorage)
     )
     _ = try await repository.stage(
         StageRequest(pathspecs: [try GitPathspec("file.txt")])

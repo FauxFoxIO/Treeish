@@ -68,7 +68,7 @@ let package = Package(
         ),
         .testTarget(
             name: "TreeishTests",
-            dependencies: ["Treeish", "TreeishCore", "TreeishHTTP", "TreeishObjects", "TreeishPacks", "TreeishProtocol"],
+            dependencies: ["Treeish", "TreeishCore", "TreeishFileSystem", "TreeishHTTP", "TreeishObjects", "TreeishPacks", "TreeishProtocol"],
             swiftSettings: strictConcurrency
         ),
         .testTarget(

@@ -1,6 +1,80 @@
 import Foundation
 import Testing
 @testable import Treeish
+import TreeishFileSystem
+
+@Test func reftableWriterAppendsGitReadableReferenceAndReflog() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    func git(_ arguments: [String]) throws -> (Int32, String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory.path] + arguments
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "GIT_AUTHOR_NAME": "System Git",
+            "GIT_AUTHOR_EMAIL": "git@example.com",
+            "GIT_COMMITTER_NAME": "System Git",
+            "GIT_COMMITTER_EMAIL": "git@example.com",
+        ], uniquingKeysWith: { _, new in new })
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        return (
+            process.terminationStatus,
+            String(
+                decoding: output.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            )
+        )
+    }
+
+    #expect(try git(["init", "--ref-format=reftable"]).0 == 0)
+    try Data("value\n".utf8).write(
+        to: directory.appendingPathComponent("file.txt")
+    )
+    #expect(try git(["add", "file.txt"]).0 == 0)
+    #expect(try git(["commit", "-m", "initial"]).0 == 0)
+    let head = try ObjectID(
+        hex: git(["rev-parse", "HEAD"]).1
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    )
+    let gitDirectory = try RootDirectory(
+        url: directory.appendingPathComponent(".git")
+    )
+    let branch = try RefName("refs/heads/treeish")
+    try ReftableStack(
+        directory: gitDirectory,
+        objectFormat: .sha1
+    ).append([
+        ReftableUpdate(
+            name: branch,
+            value: .direct(head, peeled: nil),
+            expected: .missing,
+            reflog: ReflogMetadata(
+                signature: Signature(
+                    name: "Treeish",
+                    email: "treeish@example.com",
+                    secondsSinceEpoch: 1_700_000_000,
+                    timeZoneOffsetMinutes: -480
+                ),
+                message: "branch: Created from HEAD"
+            )
+        ),
+    ])
+
+    #expect(try git(["rev-parse", "refs/heads/treeish"]).1 == "\(head)\n")
+    let reflog = try git(["reflog", "show", "--format=%gs", "treeish"])
+    #expect(reflog.0 == 0)
+    #expect(reflog.1 == "branch: Created from HEAD\n")
+}
 
 @Test func pathsRejectTraversal() throws {
     #expect(throws: TreeishError.self) {

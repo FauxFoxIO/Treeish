@@ -36,7 +36,8 @@ public actor Repository {
         )
         let capabilities = try Repository.inspectCapabilities(
             root: root,
-            gitDirectory: gitDirectory
+            gitDirectory: gitDirectory,
+            commonDirectory: commonDirectory
         )
         repositoryCapabilities = capabilities
         objectStore = RepositoryObjectStore(
@@ -521,20 +522,70 @@ public actor Repository {
                 Array("\(gitFileURL.path)\n".utf8),
                 to: administration + ["gitdir"]
             )
-            if let branch = request.branch {
-                try common.writeAtomically(
-                    Array("\(request.start.description)\n".utf8),
-                    to: try branch.pathComponents
+            let storage = try Repository.referenceStorage(directory: common)
+            if storage.format == .reftable {
+                let adminDirectory = try common.childDirectory(administration)
+                try adminDirectory.createDirectory(["reftable"])
+                try adminDirectory.createDirectory(["refs"])
+                try adminDirectory.writeAtomically(
+                    Array("ref: refs/heads/.invalid\n".utf8),
+                    to: ["HEAD"]
                 )
-                try common.writeAtomically(
-                    Array("ref: \(branch.description)\n".utf8),
-                    to: administration + ["HEAD"]
+                try adminDirectory.writeAtomically(
+                    Array("this repository uses the reftable format\n".utf8),
+                    to: ["refs", "heads"]
                 )
+                var updates = [
+                    ReftableUpdate(
+                        name: try RefName("ORIG_HEAD"),
+                        value: .direct(request.start, peeled: nil),
+                        expected: .missing,
+                        reflog: nil
+                    ),
+                ]
+                if let branch = request.branch {
+                    try Repository.publishReference(
+                        directory: common,
+                        name: branch,
+                        value: request.start,
+                        expected: nil,
+                        requireMissing: true,
+                        reflog: nil
+                    )
+                    updates.append(ReftableUpdate(
+                        name: try RefName("HEAD"),
+                        value: .symbolic(branch),
+                        expected: .missing,
+                        reflog: nil
+                    ))
+                } else {
+                    updates.append(ReftableUpdate(
+                        name: try RefName("HEAD"),
+                        value: .direct(request.start, peeled: nil),
+                        expected: .missing,
+                        reflog: nil
+                    ))
+                }
+                try ReftableStack(
+                    directory: adminDirectory,
+                    objectFormat: storage.objectFormat
+                ).append(updates)
             } else {
-                try common.writeAtomically(
-                    Array("\(request.start.description)\n".utf8),
-                    to: administration + ["HEAD"]
-                )
+                if let branch = request.branch {
+                    try common.writeAtomically(
+                        Array("\(request.start.description)\n".utf8),
+                        to: try branch.pathComponents
+                    )
+                    try common.writeAtomically(
+                        Array("ref: \(branch.description)\n".utf8),
+                        to: administration + ["HEAD"]
+                    )
+                } else {
+                    try common.writeAtomically(
+                        Array("\(request.start.description)\n".utf8),
+                        to: administration + ["HEAD"]
+                    )
+                }
             }
             let commit = try store.read(identifier: request.start.bytes)
             let record = try CommitRecord(identifier: request.start.bytes, object: commit)
@@ -814,13 +865,17 @@ public actor Repository {
                     continue
                 }
                 let current = try ObjectID(bytes: value.objectID)
-                let prior = try? Repository.readDirectReference(
+                let prior = try? Repository.readReference(
                     directory: common,
-                    components: target.pathComponents
+                    name: target
                 )
-                try common.writeAtomically(
-                    Array("\(current.description)\n".utf8),
-                    to: target.pathComponents
+                try Repository.publishReference(
+                    directory: common,
+                    name: target,
+                    value: current,
+                    expected: nil,
+                    requireMissing: false,
+                    reflog: nil
                 )
                 updates.append(RefUpdateResult(name: target, previous: prior, current: current))
                 fetchHead += Array(
@@ -1020,6 +1075,7 @@ public actor Repository {
         let refsDirectory = commonDirectory
         let limits = resourceLimits
         let access = repositoryCapabilities.access
+        let refStorage = repositoryCapabilities.refStorage
         return GitOperation(phase: .updatingWorktree) {
             guard case .readWrite = access else {
                 throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
@@ -1064,7 +1120,10 @@ public actor Repository {
                 publication: WorktreeTransaction.Publication(
                     directory: request.reference == nil ? .git : .common,
                     path: request.reference?.pathComponents ?? ["HEAD"],
-                    expected: expectedPublication
+                    expected: expectedPublication,
+                    kind: refStorage == .reftable
+                        ? .reference
+                        : .file
                 )
             )
             do {
@@ -1094,18 +1153,17 @@ public actor Repository {
                 }
                 try indexStore.write(GitIndex(entries: entries))
                 if let reference = request.reference {
-                    try headDirectory.writeAtomically(
-                        Array("ref: \(reference.description)\n".utf8),
-                        to: ["HEAD"]
-                    )
-                    try refsDirectory.writeAtomically(
-                        Array(expectedPublication),
-                        to: reference.pathComponents
+                    try Repository.publishCheckoutReferences(
+                        headDirectory: headDirectory,
+                        refsDirectory: refsDirectory,
+                        reference: reference,
+                        value: request.commit
                     )
                 } else {
-                    try headDirectory.writeAtomically(
-                        Array(expectedPublication),
-                        to: ["HEAD"]
+                    try Repository.publishDetachedHead(
+                        headDirectory: headDirectory,
+                        refsDirectory: refsDirectory,
+                        value: request.commit
                     )
                 }
                 try transaction.commit()
@@ -1131,6 +1189,7 @@ public actor Repository {
         let refsDirectory = commonDirectory
         let limits = resourceLimits
         let access = repositoryCapabilities.access
+        let refStorage = repositoryCapabilities.refStorage
         return GitOperation(phase: .reconciling) {
             guard case .readWrite = access,
                   request.commit.algorithm == store.objectFormat else {
@@ -1144,23 +1203,21 @@ public actor Repository {
                 refsDirectory: refsDirectory
             )
             func publishReference() throws {
-                let value = Array("\(request.commit.description)\n".utf8)
                 if let reference = head.reference {
-                    let loose = try refsDirectory.exists(reference.pathComponents)
-                    guard try refsDirectory.compareAndSwap(
-                        value,
-                        to: reference.pathComponents,
-                        expected: loose
-                            ? head.objectID.map {
-                                Array("\($0.description)\n".utf8)
-                            }
-                            : nil,
-                        requireMissing: head.objectID != nil && !loose
-                    ) else {
-                        throw TreeishError.referenceChanged
-                    }
+                    try Repository.publishReference(
+                        directory: refsDirectory,
+                        name: reference,
+                        value: request.commit,
+                        expected: head.objectID,
+                        requireMissing: head.objectID == nil,
+                        reflog: nil
+                    )
                 } else {
-                    try headDirectory.writeAtomically(value, to: ["HEAD"])
+                    try Repository.publishDetachedHead(
+                        headDirectory: headDirectory,
+                        refsDirectory: refsDirectory,
+                        value: request.commit
+                    )
                 }
             }
             if request.mode == .mixed {
@@ -1182,7 +1239,8 @@ public actor Repository {
                     publication: WorktreeTransaction.Publication(
                         directory: head.reference == nil ? .git : .common,
                         path: head.reference?.pathComponents ?? ["HEAD"],
-                        expected: expected
+                        expected: expected,
+                        kind: refStorage == .reftable ? .reference : .file
                     )
                 )
                 do {
@@ -1568,9 +1626,13 @@ public actor Repository {
                     worktree: worktree,
                     store: store
                 )
-                try refsDirectory.writeAtomically(
-                    Array("\(request.other.description)\n".utf8),
-                    to: headReference.pathComponents
+                try Repository.publishReference(
+                    directory: refsDirectory,
+                    name: headReference,
+                    value: request.other,
+                    expected: ours,
+                    requireMissing: false,
+                    reflog: nil
                 )
                 return .fastForward(from: ours, to: request.other)
             }
@@ -1632,9 +1694,13 @@ public actor Repository {
             )
             let commitBytes = try store.write(commitObject)
             let commitID = try ObjectID(bytes: commitBytes)
-            try refsDirectory.writeAtomically(
-                Array("\(commitID.description)\n".utf8),
-                to: headReference.pathComponents
+            try Repository.publishReference(
+                directory: refsDirectory,
+                name: headReference,
+                value: commitID,
+                expected: ours,
+                requireMissing: false,
+                reflog: nil
             )
             try Repository.clearMergeState(in: headDirectory)
             return .merged(commitID)
@@ -1682,9 +1748,16 @@ public actor Repository {
                 message: request.message ?? storedMessage
             )
             let identifier = try ObjectID(bytes: store.write(commit))
-            try refsDirectory.writeAtomically(
-                Array("\(identifier.description)\n".utf8),
-                to: reference.pathComponents
+            try Repository.publishReference(
+                directory: refsDirectory,
+                name: reference,
+                value: identifier,
+                expected: ours,
+                requireMissing: false,
+                reflog: ReflogMetadata(
+                    signature: request.committer,
+                    message: "commit (merge): merge"
+                )
             )
             try Repository.clearMergeState(in: headDirectory)
             return CommitResult(objectID: identifier, updatedReference: reference)
@@ -1721,9 +1794,13 @@ public actor Repository {
                 worktree: worktree,
                 store: store
             )
-            try refsDirectory.writeAtomically(
-                Array("\(original.description)\n".utf8),
-                to: reference.pathComponents
+            try Repository.publishReference(
+                directory: refsDirectory,
+                name: reference,
+                value: original,
+                expected: head.objectID,
+                requireMissing: false,
+                reflog: nil
             )
             try Repository.clearMergeState(in: headDirectory)
             return original
@@ -1876,9 +1953,13 @@ public actor Repository {
                 worktree: worktree,
                 store: store
             )
-            try refsDirectory.writeAtomically(
-                Array("\(original.description)\n".utf8),
-                to: reference.pathComponents
+            try Repository.publishReference(
+                directory: refsDirectory,
+                name: reference,
+                value: original,
+                expected: head.objectID,
+                requireMissing: false,
+                reflog: nil
             )
             try Repository.clearCherryPickState(in: headDirectory)
             return original
@@ -1920,13 +2001,14 @@ public actor Repository {
                 worktree: worktree,
                 store: store
             )
-            let loose = try refsDirectory.exists(reference.pathComponents)
-            guard try refsDirectory.compareAndSwap(
-                Array("\(request.onto.description)\n".utf8),
-                to: reference.pathComponents,
-                expected: loose ? Array("\(original.description)\n".utf8) : nil,
-                requireMissing: !loose
-            ) else { throw TreeishError.referenceChanged }
+            try Repository.publishReference(
+                directory: refsDirectory,
+                name: reference,
+                value: request.onto,
+                expected: original,
+                requireMissing: false,
+                reflog: nil
+            )
             var state = RebaseState(
                 original: original,
                 currentHead: request.onto,
@@ -2014,9 +2096,13 @@ public actor Repository {
                 worktree: worktree,
                 store: store
             )
-            try refsDirectory.writeAtomically(
-                Array("\(state.original.description)\n".utf8),
-                to: state.reference.pathComponents
+            try Repository.publishReference(
+                directory: refsDirectory,
+                name: state.reference,
+                value: state.original,
+                expected: state.currentHead,
+                requireMissing: false,
+                reflog: nil
             )
             try Repository.clearRebaseState(in: headDirectory)
             return state.original
@@ -2125,18 +2211,17 @@ public actor Repository {
             }
             try indexStore.write(try GitIndex.decode(state.indexBytes))
             if let reference = state.headReference, let identifier = state.headObjectID {
-                try refsDirectory.writeAtomically(
-                    Array("\(identifier.description)\n".utf8),
-                    to: reference.pathComponents
-                )
-                try headDirectory.writeAtomically(
-                    Array("ref: \(reference.description)\n".utf8),
-                    to: ["HEAD"]
+                try Repository.publishCheckoutReferences(
+                    headDirectory: headDirectory,
+                    refsDirectory: refsDirectory,
+                    reference: reference,
+                    value: identifier
                 )
             } else if let identifier = state.headObjectID {
-                try headDirectory.writeAtomically(
-                    Array("\(identifier.description)\n".utf8),
-                    to: ["HEAD"]
+                try Repository.publishDetachedHead(
+                    headDirectory: headDirectory,
+                    refsDirectory: refsDirectory,
+                    value: identifier
                 )
             }
             return state
@@ -2325,13 +2410,20 @@ public actor Repository {
     }
 
     private func peelTag(_ identifier: ObjectID) throws -> ObjectID {
+        try Repository.peelTag(identifier, store: objectStore)
+    }
+
+    private static func peelTag(
+        _ identifier: ObjectID,
+        store: RepositoryObjectStore
+    ) throws -> ObjectID {
         var current = identifier
         var visited: Set<ObjectID> = []
         while true {
             guard visited.count < 16, visited.insert(current).inserted else {
                 throw TreeishError.recoveryRequired("tag peel cycle")
             }
-            let object = try objectStore.read(identifier: current.bytes)
+            let object = try store.read(identifier: current.bytes)
             guard object.type == .tag else { return current }
             guard let target = try Repository.tagTarget(object.payload) else {
                 throw TreeishError.invalidObjectID
@@ -2366,7 +2458,6 @@ public actor Repository {
             guard newValue.algorithm == objectFormat else {
                 throw TreeishError.invalidObjectID
             }
-            let components = try name.pathComponents
             let prior = try? Repository.readReference(
                 directory: directory,
                 name: name
@@ -2374,23 +2465,14 @@ public actor Repository {
             if let expected, prior != expected {
                 throw TreeishError.referenceChanged
             }
-            let looseExists = try directory.exists(components)
-            let expectedBytes = expected.map { Array("\($0.description)\n".utf8) }
-            guard try directory.compareAndSwap(
-                Array("\(newValue.description)\n".utf8),
-                to: components,
-                expected: looseExists ? expectedBytes : nil,
-                requireMissing: expected != nil && !looseExists
-            ) else { throw TreeishError.referenceChanged }
-            if let reflog {
-                try Repository.appendReflog(
-                    directory: directory,
-                    name: name,
-                    previous: prior,
-                    current: newValue,
-                    metadata: reflog
-                )
-            }
+            try Repository.publishReference(
+                directory: directory,
+                name: name,
+                value: newValue,
+                expected: expected,
+                requireMissing: false,
+                reflog: reflog
+            )
             return RefUpdateResult(name: name, previous: prior, current: newValue)
         }
     }
@@ -2414,6 +2496,7 @@ public actor Repository {
             }
             let reference = try RefName("refs/tags/\(request.name)")
             let finalTarget: ObjectID
+            let peeledTarget: ObjectID?
             if let tagger = request.tagger, let message = request.message {
                 let targetObject = try store.read(identifier: request.target.bytes)
                 let tag = GitObjectEncoder.tag(
@@ -2424,15 +2507,23 @@ public actor Repository {
                     message: message
                 )
                 finalTarget = try ObjectID(bytes: store.write(tag))
+                peeledTarget = try Repository.peelTag(
+                    request.target,
+                    store: store
+                )
             } else {
                 finalTarget = request.target
+                peeledTarget = nil
             }
-            guard try directory.compareAndSwap(
-                Array("\(finalTarget.description)\n".utf8),
-                to: reference.pathComponents,
+            try Repository.publishReference(
+                directory: directory,
+                name: reference,
+                value: finalTarget,
                 expected: nil,
-                requireMissing: true
-            ) else { throw TreeishError.referenceChanged }
+                requireMissing: true,
+                reflog: nil,
+                peeled: peeledTarget
+            )
             return RefUpdateResult(name: reference, previous: nil, current: finalTarget)
         }
     }
@@ -2449,14 +2540,11 @@ public actor Repository {
             }
             let current = try Repository.readReference(directory: directory, name: name)
             guard current == expected else { throw TreeishError.referenceChanged }
-            let components = try name.pathComponents
-            if try directory.exists(components) {
-                guard try directory.removeAtomically(
-                    components,
-                    expected: Array("\(expected.description)\n".utf8)
-                ) else { throw TreeishError.referenceChanged }
-            }
-            try Repository.removePackedReference(directory: directory, name: name, expected: expected)
+            try Repository.removeReference(
+                directory: directory,
+                name: name,
+                expected: expected
+            )
             return current
         }
     }
@@ -2488,22 +2576,18 @@ public actor Repository {
             }
             _ = try store.read(identifier: target.bytes)
             let reference = try RefName("\(namespace)/\(name)")
-            guard (try? Repository.readReference(directory: directory, name: reference)) == nil,
-                  try directory.compareAndSwap(
-                    Array("\(target.description)\n".utf8),
-                    to: reference.pathComponents,
-                    expected: nil,
-                    requireMissing: true
-                  ) else { throw TreeishError.referenceChanged }
-            if let reflog {
-                try Repository.appendReflog(
-                    directory: directory,
-                    name: reference,
-                    previous: nil,
-                    current: target,
-                    metadata: reflog
-                )
-            }
+            guard (try? Repository.readReference(
+                directory: directory,
+                name: reference
+            )) == nil else { throw TreeishError.referenceChanged }
+            try Repository.publishReference(
+                directory: directory,
+                name: reference,
+                value: target,
+                expected: nil,
+                requireMissing: true,
+                reflog: reflog
+            )
             return RefUpdateResult(name: reference, previous: nil, current: target)
         }
     }
@@ -2538,21 +2622,13 @@ public actor Repository {
             )
             let bytes = try store.write(object)
             let identifier = try ObjectID(bytes: bytes)
-            let components = try reference.pathComponents
-            let looseExists = try refsDirectory.exists(components)
-            let expectedBytes = head.objectID.map { Array("\($0.description)\n".utf8) }
-            guard try refsDirectory.compareAndSwap(
-                Array("\(identifier.description)\n".utf8),
-                to: components,
-                expected: looseExists ? expectedBytes : nil,
-                requireMissing: head.objectID != nil && !looseExists
-            ) else { throw TreeishError.referenceChanged }
-            try Repository.appendReflog(
+            try Repository.publishReference(
                 directory: refsDirectory,
                 name: reference,
-                previous: head.objectID,
-                current: identifier,
-                metadata: ReflogMetadata(
+                value: identifier,
+                expected: head.objectID,
+                requireMissing: head.objectID == nil,
+                reflog: ReflogMetadata(
                     signature: request.committer,
                     message: "commit: \(String(decoding: request.message, as: UTF8.self).split(separator: "\n").first.map(String.init) ?? "")"
                 )
@@ -2575,27 +2651,11 @@ public actor Repository {
         _ name: RefName,
         visited: Set<RefName>
     ) throws -> ObjectID {
-        guard !visited.contains(name), visited.count < 16 else {
-            throw TreeishError.symbolicReferenceLoop
-        }
-        let bytes: [UInt8]
-        do {
-            bytes = try commonDirectory.read(try name.pathComponents, limit: 4096)
-        } catch RootDirectoryError.notFound {
-            return try Repository.readPackedReference(directory: commonDirectory, name: name)
-        }
-        guard let text = String(bytes: bytes, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        else {
-            throw TreeishError.malformedReference
-        }
-        if text.hasPrefix("ref: ") {
-            let target = try RefName(String(text.dropFirst(5)))
-            var next = visited
-            next.insert(name)
-            return try resolveReference(target, visited: next)
-        }
-        return try ObjectID(hex: text)
+        _ = visited
+        return try Repository.readReference(
+            directory: commonDirectory,
+            name: name
+        )
     }
 
     private static func readHead(
@@ -2604,7 +2664,10 @@ public actor Repository {
     ) throws -> (reference: RefName?, objectID: ObjectID?) {
         if try referenceStorage(directory: refsDirectory).format == .reftable {
             let head = try RefName("HEAD")
-            let value = try readReferenceValue(directory: refsDirectory, name: head)
+            let value = try ReftableStack(
+                directory: headDirectory,
+                objectFormat: referenceStorage(directory: refsDirectory).objectFormat
+            ).reference(head)
             switch value {
             case .symbolic(let reference):
                 return (
@@ -2867,6 +2930,174 @@ public actor Repository {
         )
     }
 
+    private static func publishReference(
+        directory: RootDirectory,
+        name: RefName,
+        value: ObjectID,
+        expected: ObjectID?,
+        requireMissing: Bool,
+        reflog: ReflogMetadata?,
+        peeled: ObjectID? = nil
+    ) throws {
+        let storage = try referenceStorage(directory: directory)
+        if storage.format == .reftable {
+            let expectation: ReftableExpectedValue = if requireMissing {
+                .missing
+            } else if let expected {
+                .direct(expected)
+            } else {
+                .any
+            }
+            try ReftableStack(
+                directory: directory,
+                objectFormat: storage.objectFormat
+            ).append([
+                ReftableUpdate(
+                    name: name,
+                    value: .direct(value, peeled: peeled),
+                    expected: expectation,
+                    reflog: reflog
+                ),
+            ])
+            return
+        }
+        let components = try name.pathComponents
+        let looseExists = try directory.exists(components)
+        let expectedBytes = expected.map {
+            Array("\($0.description)\n".utf8)
+        }
+        guard try directory.compareAndSwap(
+            Array("\(value.description)\n".utf8),
+            to: components,
+            expected: looseExists ? expectedBytes : nil,
+            requireMissing: requireMissing || (expected != nil && !looseExists)
+        ) else { throw TreeishError.referenceChanged }
+        if let reflog {
+            try appendReflog(
+                directory: directory,
+                name: name,
+                previous: expected,
+                current: value,
+                metadata: reflog
+            )
+        }
+    }
+
+    private static func removeReference(
+        directory: RootDirectory,
+        name: RefName,
+        expected: ObjectID
+    ) throws {
+        let storage = try referenceStorage(directory: directory)
+        if storage.format == .reftable {
+            try ReftableStack(
+                directory: directory,
+                objectFormat: storage.objectFormat
+            ).append([
+                ReftableUpdate(
+                    name: name,
+                    value: .deletion,
+                    expected: .direct(expected),
+                    reflog: nil
+                ),
+            ])
+            return
+        }
+        let components = try name.pathComponents
+        if try directory.exists(components) {
+            guard try directory.removeAtomically(
+                components,
+                expected: Array("\(expected.description)\n".utf8)
+            ) else { throw TreeishError.referenceChanged }
+        }
+        try removePackedReference(
+            directory: directory,
+            name: name,
+            expected: expected
+        )
+    }
+
+    private static func publishCheckoutReferences(
+        headDirectory: RootDirectory,
+        refsDirectory: RootDirectory,
+        reference: RefName,
+        value: ObjectID
+    ) throws {
+        let storage = try referenceStorage(directory: refsDirectory)
+        if storage.format == .reftable {
+            let prior = try? readReference(
+                directory: refsDirectory,
+                name: reference
+            )
+            let branchUpdate = ReftableUpdate(
+                    name: reference,
+                    value: .direct(value, peeled: nil),
+                    expected: prior.map(ReftableExpectedValue.direct) ?? .missing,
+                    reflog: nil
+                )
+            let headUpdate = ReftableUpdate(
+                name: try RefName("HEAD"),
+                value: .symbolic(reference),
+                expected: .any,
+                reflog: nil
+            )
+            if headDirectory.identity == refsDirectory.identity {
+                try ReftableStack(
+                    directory: refsDirectory,
+                    objectFormat: storage.objectFormat
+                ).append([headUpdate, branchUpdate])
+            } else {
+                try ReftableStack(
+                    directory: refsDirectory,
+                    objectFormat: storage.objectFormat
+                ).append([branchUpdate])
+                try ReftableStack(
+                    directory: headDirectory,
+                    objectFormat: storage.objectFormat
+                ).append([headUpdate])
+            }
+            return
+        }
+        try headDirectory.writeAtomically(
+            Array("ref: \(reference.description)\n".utf8),
+            to: ["HEAD"]
+        )
+        try publishReference(
+            directory: refsDirectory,
+            name: reference,
+            value: value,
+            expected: nil,
+            requireMissing: false,
+            reflog: nil
+        )
+    }
+
+    private static func publishDetachedHead(
+        headDirectory: RootDirectory,
+        refsDirectory: RootDirectory,
+        value: ObjectID
+    ) throws {
+        let storage = try referenceStorage(directory: refsDirectory)
+        if storage.format == .reftable {
+            try ReftableStack(
+                directory: headDirectory,
+                objectFormat: storage.objectFormat
+            ).append([
+                ReftableUpdate(
+                    name: try RefName("HEAD"),
+                    value: .direct(value, peeled: nil),
+                    expected: .any,
+                    reflog: nil
+                ),
+            ])
+            return
+        }
+        try headDirectory.writeAtomically(
+            Array("\(value.description)\n".utf8),
+            to: ["HEAD"]
+        )
+    }
+
     private static func credential(
         for url: URL,
         services: RepositoryServices
@@ -3004,14 +3235,13 @@ public actor Repository {
             ).trimmingCharacters(in: .whitespacesAndNewlines)
             let destination = URL(fileURLWithPath: gitFile).deletingLastPathComponent()
             let path = try GitPath(root.directory.relativeComponents(for: destination).joined(separator: "/"))
-            let headText = String(
-                decoding: try common.read(administration + ["HEAD"], limit: 4096),
-                as: UTF8.self
-            ).trimmingCharacters(in: .whitespacesAndNewlines)
-            let head: ObjectID
-            if headText.hasPrefix("ref: ") {
-                head = try readReference(directory: common, name: RefName(String(headText.dropFirst(5))))
-            } else { head = try ObjectID(hex: headText) }
+            let adminDirectory = try common.childDirectory(administration)
+            guard let head = try readHead(
+                headDirectory: adminDirectory,
+                refsDirectory: common
+            ).objectID else {
+                throw TreeishError.referenceNotFound
+            }
             let lockedReason: String?
             if let bytes = try? common.read(administration + ["locked"], limit: 4096) {
                 lockedReason = String(decoding: bytes, as: UTF8.self)
@@ -3543,14 +3773,17 @@ public actor Repository {
             message: message
         )
         let identifier = try ObjectID(bytes: store.write(object))
-        let components = try reference.pathComponents
-        let loose = try refsDirectory.exists(components)
-        guard try refsDirectory.compareAndSwap(
-            Array("\(identifier.description)\n".utf8),
-            to: components,
-            expected: loose ? Array("\(parent.description)\n".utf8) : nil,
-            requireMissing: !loose
-        ) else { throw TreeishError.referenceChanged }
+        try publishReference(
+            directory: refsDirectory,
+            name: reference,
+            value: identifier,
+            expected: parent,
+            requireMissing: false,
+            reflog: ReflogMetadata(
+                signature: committer,
+                message: "commit: \(String(decoding: message, as: UTF8.self).split(separator: "\n").first.map(String.init) ?? "")"
+            )
+        )
         return identifier
     }
 
@@ -3563,9 +3796,10 @@ public actor Repository {
 
     private static func inspectCapabilities(
         root: TreeishRoot,
-        gitDirectory: RootDirectory
+        gitDirectory: RootDirectory,
+        commonDirectory: RootDirectory
     ) throws -> RepositoryCapabilities {
-        let configuration = try GitConfiguration.load(from: gitDirectory)
+        let configuration = try GitConfiguration.load(from: commonDirectory)
         let format = configuration.integer(
             section: "core",
             key: "repositoryformatversion"
@@ -3611,11 +3845,6 @@ public actor Repository {
                     RepositoryRestriction(reason: .requiredExtension(name))
                 )
             }
-        }
-        if refStorage != .files {
-            restrictions.append(
-                RepositoryRestriction(reason: .refStorage(refStorage.rawValue))
-            )
         }
         let indexCapabilities: IndexCapabilities
         if try gitDirectory.exists(["index"]) {

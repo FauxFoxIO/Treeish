@@ -35,15 +35,18 @@ public struct RepositoryInitialization: Sendable, Hashable, Codable {
     public var bare: Bool
     public var initialBranch: String
     public var objectFormat: ObjectHashAlgorithm
+    public var refStorage: RefStorageFormat
 
     public init(
         bare: Bool = false,
         initialBranch: String = "main",
-        objectFormat: ObjectHashAlgorithm = .sha1
+        objectFormat: ObjectHashAlgorithm = .sha1,
+        refStorage: RefStorageFormat = .files
     ) {
         self.bare = bare
         self.initialBranch = initialBranch
         self.objectFormat = objectFormat
+        self.refStorage = refStorage
     }
 }
 

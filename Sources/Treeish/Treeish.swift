@@ -94,7 +94,7 @@ public enum Treeish {
         let base = try path.components
         try root.directory.createDirectory(base)
         let git = options.bare ? base : base + [".git"]
-        for directory in [
+        var directories = [
             git,
             git + ["branches"],
             git + ["hooks"],
@@ -103,19 +103,30 @@ public enum Treeish {
             git + ["objects", "info"],
             git + ["objects", "pack"],
             git + ["refs"],
-            git + ["refs", "heads"],
-            git + ["refs", "tags"],
-        ] {
+        ]
+        if options.refStorage == .files {
+            directories += [
+                git + ["refs", "heads"],
+                git + ["refs", "tags"],
+            ]
+        } else {
+            directories.append(git + ["reftable"])
+        }
+        for directory in directories {
             try root.directory.createDirectory(directory)
         }
         try root.directory.writeAtomically(
-            Array("ref: refs/heads/\(options.initialBranch)\n".utf8),
+            Array(
+                options.refStorage == .reftable
+                    ? "ref: refs/heads/.invalid\n".utf8
+                    : "ref: refs/heads/\(options.initialBranch)\n".utf8
+            ),
             to: git + ["HEAD"]
         )
         let bareValue = options.bare ? "true" : "false"
         let formatConfiguration: String
-        switch options.objectFormat {
-        case .sha1:
+        switch (options.objectFormat, options.refStorage) {
+        case (.sha1, .files):
             formatConfiguration = """
             [core]
             \trepositoryformatversion = 0
@@ -124,7 +135,7 @@ public enum Treeish {
             \tlogallrefupdates = true
 
             """
-        case .sha256:
+        case (.sha256, .files):
             formatConfiguration = """
             [core]
             \trepositoryformatversion = 1
@@ -135,11 +146,54 @@ public enum Treeish {
             \tobjectformat = sha256
 
             """
+        case (.sha1, .reftable):
+            formatConfiguration = """
+            [core]
+            \trepositoryformatversion = 1
+            \tfilemode = true
+            \tbare = \(bareValue)
+            \tlogallrefupdates = true
+            [extensions]
+            \trefstorage = reftable
+
+            """
+        case (.sha256, .reftable):
+            formatConfiguration = """
+            [core]
+            \trepositoryformatversion = 1
+            \tfilemode = true
+            \tbare = \(bareValue)
+            \tlogallrefupdates = true
+            [extensions]
+            \tobjectformat = sha256
+            \trefstorage = reftable
+
+            """
         }
         try root.directory.writeAtomically(
             Array(formatConfiguration.utf8),
             to: git + ["config"]
         )
+        if options.refStorage == .reftable {
+            try root.directory.writeAtomically(
+                Array("this repository uses the reftable format\n".utf8),
+                to: git + ["refs", "heads"]
+            )
+            let gitDirectory = try root.directory.childDirectory(git)
+            try ReftableStack(
+                directory: gitDirectory,
+                objectFormat: options.objectFormat
+            ).append([
+                ReftableUpdate(
+                    name: try RefName("HEAD"),
+                    value: .symbolic(
+                        try RefName("refs/heads/\(options.initialBranch)")
+                    ),
+                    expected: .missing,
+                    reflog: nil
+                ),
+            ])
+        }
         try root.directory.writeAtomically(
             Array("Unnamed repository; edit this file 'description' to name the repository.\n".utf8),
             to: git + ["description"]

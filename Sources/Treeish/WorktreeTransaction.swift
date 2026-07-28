@@ -16,9 +16,27 @@ struct WorktreeTransaction {
             case common
         }
 
+        enum Kind: String, Codable {
+            case file
+            case reference
+        }
+
         let directory: Directory
         let path: [String]
         let expected: Data
+        let kind: Kind
+
+        init(
+            directory: Directory,
+            path: [String],
+            expected: Data,
+            kind: Kind = .file
+        ) {
+            self.directory = directory
+            self.path = path
+            self.expected = expected
+            self.kind = kind
+        }
     }
 
     private enum State: String, Codable {
@@ -67,20 +85,18 @@ struct WorktreeTransaction {
                 "Treeish worktree transaction journal is corrupt"
             )
         }
-        guard journal.format == 1 else {
+        guard journal.format == 2 else {
             throw TreeishError.recoveryRequired(
                 "Treeish worktree transaction journal format is unsupported"
             )
         }
         let wasPublished: Bool
         if let publication = journal.publication {
-            let directory = publication.directory == .git
-                ? gitDirectory
-                : commonDirectory
-            wasPublished = (try? directory.read(
-                publication.path,
-                limit: publication.expected.count + 1
-            )) == Array(publication.expected)
+            wasPublished = isPublished(
+                publication,
+                gitDirectory: gitDirectory,
+                commonDirectory: commonDirectory
+            )
         } else {
             wasPublished = false
         }
@@ -171,7 +187,7 @@ struct WorktreeTransaction {
             index = nil
         }
         let journal = Journal(
-            format: 1,
+            format: 2,
             state: .prepared,
             entries: entries,
             index: index,
@@ -246,18 +262,61 @@ struct WorktreeTransaction {
         commonDirectory: RootDirectory
     ) throws {
         if let publication = journal.publication {
-            let directory = publication.directory == .git
-                ? gitDirectory
-                : commonDirectory
-            if (try? directory.read(
-                publication.path,
-                limit: publication.expected.count + 1
-            )) == Array(publication.expected) {
+            if Self.isPublished(
+                publication,
+                gitDirectory: gitDirectory,
+                commonDirectory: commonDirectory
+            ) {
                 _ = try gitDirectory.removeAtomically(Self.path)
                 return
             }
         }
         try rollback()
+    }
+
+    private static func isPublished(
+        _ publication: Publication,
+        gitDirectory: RootDirectory,
+        commonDirectory: RootDirectory
+    ) -> Bool {
+        let directory = publication.directory == .git
+            ? gitDirectory
+            : commonDirectory
+        if publication.kind == .file {
+            return (try? directory.read(
+                publication.path,
+                limit: publication.expected.count + 1
+            )) == Array(publication.expected)
+        }
+        guard let name = try? RefName(
+            publication.path.joined(separator: "/")
+        ),
+              let expectedText = String(
+                data: publication.expected,
+                encoding: .utf8
+              )?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let expected = try? ObjectID(hex: expectedText),
+              let configuration = try? GitConfiguration.load(
+                from: commonDirectory
+              ),
+              configuration.value(
+                section: "extensions",
+                key: "refstorage"
+              )?.lowercased() == RefStorageFormat.reftable.rawValue
+        else { return false }
+        let objectFormat = configuration.value(
+            section: "extensions",
+            key: "objectformat"
+        ).flatMap {
+            ObjectHashAlgorithm(rawValue: $0.lowercased())
+        } ?? .sha1
+        guard let value = try? ReftableStack(
+            directory: directory,
+            objectFormat: objectFormat
+        ).reference(name),
+              case .direct(let actual, _) = value
+        else { return false }
+        return actual == expected
     }
 
     private static func restore(

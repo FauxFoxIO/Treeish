@@ -270,7 +270,7 @@ decisions for the host app.
 - repository formats 0 and 1 when all required extensions are understood,
   normal repositories, and bare repositories;
 - loose, symbolic, and packed references with reflogs, plus bounded reftable
-  v1/v2 stack reading; and
+  v1/v2 stacks, atomic updates, tombstones, and reflogs; and
 - index versions 2–4, extended entry flags, optional index extensions,
   executable files, symbolic links, ignore rules, and attributes.
 
@@ -290,12 +290,12 @@ decisions for the host app.
 - GitHub token authentication and general Basic or Bearer credentials; and
 - validated pack publication before remote-tracking references move.
 
-Treeish reads reftable references, including symbolic references, peeled tags,
-and deletion records. It does not currently mutate reftable repositories or
-repository-format-1 repositories containing unsupported required extensions.
-Inspect `repository.capabilities()` after opening an unfamiliar repository.
-Unknown required extensions make the repository read-only or metadata-only
-instead of risking corruption.
+Treeish reads and mutates reftable repositories, including symbolic references,
+peeled tags, deletion records, and append-only reference/reflog transactions.
+It does not mutate repository-format-1 repositories containing unsupported
+required extensions. Inspect `repository.capabilities()` after opening an
+unfamiliar repository. Unknown required extensions make the repository
+read-only or metadata-only instead of risking corruption.
 
 ## Safety model
 

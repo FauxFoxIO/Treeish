@@ -15,6 +15,6 @@ Object IDs, loose objects, trees, commits, indexes, packs, pack indexes,
 references, reflogs, bundles, and smart-protocol requests use the repository's
 declared object format.
 
-Reftable v1 and v2 stacks are readable, including symbolic references, peeled
-values, and deletion records. Reftable mutation remains disabled until the
-complete append, lock, reflog, and recovery transaction is available.
+Reftable v1 and v2 stacks support symbolic references, peeled values, deletion
+records, and append-only reference/reflog transactions. Stack publication uses
+the standard `tables.list.lock` compare-and-swap boundary.

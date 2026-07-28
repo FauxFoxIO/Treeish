@@ -22,6 +22,19 @@ struct ReftableReferenceRecord: Sendable, Hashable {
     let value: ReftableReferenceValue
 }
 
+enum ReftableExpectedValue: Sendable, Hashable {
+    case any
+    case missing
+    case direct(ObjectID)
+}
+
+struct ReftableUpdate: Sendable, Hashable {
+    let name: RefName
+    let value: ReftableReferenceValue
+    let expected: ReftableExpectedValue
+    let reflog: ReflogMetadata?
+}
+
 struct ReftableStack: Sendable {
     private static let maximumTableBytes = 256 * 1024 * 1024
     private static let maximumTables = 65_536
@@ -68,11 +81,101 @@ struct ReftableStack: Sendable {
         throw TreeishError.referenceNotFound
     }
 
+    func append(_ updates: [ReftableUpdate]) throws {
+        guard !updates.isEmpty,
+              Set(updates.map(\.name)).count == updates.count
+        else { throw ReftableError.invalidTable }
+        let originalList: [UInt8]
+        do {
+            originalList = try directory.read(
+                ["reftable", "tables.list"],
+                limit: 16 * 1024 * 1024
+            )
+        } catch RootDirectoryError.notFound {
+            originalList = []
+        }
+        let names = try tableNames(from: originalList)
+        let current = try references(in: names)
+        for update in updates {
+            let existing = current[update.name]
+            switch update.expected {
+            case .any:
+                break
+            case .missing:
+                guard existing == nil || existing == .deletion else {
+                    throw TreeishError.referenceChanged
+                }
+            case .direct(let identifier):
+                guard case .direct(let actual, _) = existing,
+                      actual == identifier else {
+                    throw TreeishError.referenceChanged
+                }
+            }
+        }
+        let prepared = updates.map { update in
+            guard update.reflog != nil,
+                  update.expected == .any,
+                  case .direct(let prior, _) = current[update.name]
+            else { return update }
+            return ReftableUpdate(
+                name: update.name,
+                value: update.value,
+                expected: .direct(prior),
+                reflog: update.reflog
+            )
+        }
+        let updateIndex = try nextUpdateIndex(in: names)
+        let table = try ReftableWriter(
+            objectFormat: objectFormat,
+            updateIndex: updateIndex
+        ).write(prepared)
+        let filename = String(
+            format: "0x%012llx-0x%012llx-%@.ref",
+            updateIndex,
+            updateIndex,
+            String(UUID().uuidString.prefix(8)).lowercased()
+        )
+        try directory.writeAtomically(
+            table,
+            to: ["reftable", filename]
+        )
+        var replacement = originalList
+        if !replacement.isEmpty, replacement.last != 0x0a {
+            replacement.append(0x0a)
+        }
+        replacement.append(contentsOf: filename.utf8)
+        replacement.append(0x0a)
+        do {
+            guard try directory.compareAndSwap(
+                replacement,
+                to: ["reftable", "tables.list"],
+                expected: originalList.isEmpty ? nil : originalList,
+                requireMissing: originalList.isEmpty
+            ) else {
+                _ = try? directory.removeAtomically(
+                    ["reftable", filename],
+                    expected: table
+                )
+                throw TreeishError.referenceChanged
+            }
+        } catch {
+            _ = try? directory.removeAtomically(
+                ["reftable", filename],
+                expected: table
+            )
+            throw error
+        }
+    }
+
     private func tableNames() throws -> [String] {
         let bytes = try directory.read(
             ["reftable", "tables.list"],
             limit: 16 * 1024 * 1024
         )
+        return try tableNames(from: bytes)
+    }
+
+    private func tableNames(from bytes: [UInt8]) throws -> [String] {
         guard let text = String(bytes: bytes, encoding: .utf8) else {
             throw ReftableError.invalidStack
         }
@@ -82,6 +185,49 @@ struct ReftableStack: Sendable {
               names.allSatisfy(Self.isValidTableName)
         else { throw ReftableError.invalidStack }
         return names
+    }
+
+    private func references(
+        in tables: [String]
+    ) throws -> [RefName: ReftableReferenceValue] {
+        var result: [RefName: ReftableReferenceValue] = [:]
+        var seen: Set<RefName> = []
+        for table in tables.reversed() {
+            let bytes = try directory.read(
+                ["reftable", table],
+                limit: Self.maximumTableBytes
+            )
+            for record in try ReftableReader(
+                bytes: bytes,
+                expectedObjectFormat: objectFormat,
+                maximumRecords: Self.maximumRecordsPerTable
+            ).referenceRecords() where seen.insert(record.name).inserted {
+                result[record.name] = record.value
+            }
+        }
+        return result
+    }
+
+    private func nextUpdateIndex(in tables: [String]) throws -> UInt64 {
+        var maximum: UInt64 = 0
+        for table in tables {
+            let bytes = try directory.read(
+                ["reftable", table],
+                limit: Self.maximumTableBytes
+            )
+            maximum = max(
+                maximum,
+                try ReftableReader(
+                    bytes: bytes,
+                    expectedObjectFormat: objectFormat,
+                    maximumRecords: Self.maximumRecordsPerTable
+                ).updateRange().maximum
+            )
+        }
+        guard maximum < UInt64.max else {
+            throw ReftableError.resourceLimitExceeded
+        }
+        return maximum + 1
     }
 
     private static func isValidTableName(_ name: String) -> Bool {
@@ -101,6 +247,14 @@ private struct ReftableReader {
     let bytes: [UInt8]
     let expectedObjectFormat: ObjectHashAlgorithm
     let maximumRecords: Int
+
+    func updateRange() throws -> (minimum: UInt64, maximum: UInt64) {
+        let header = try parseHeader(at: 0)
+        guard header.objectFormat == expectedObjectFormat else {
+            throw ReftableError.hashMismatch
+        }
+        return (header.minimumUpdateIndex, header.maximumUpdateIndex)
+    }
 
     func referenceRecords() throws -> [ReftableReferenceRecord] {
         let header = try parseHeader(at: 0)
@@ -390,6 +544,219 @@ private struct ReftableReader {
         let objectIndexPosition: UInt64
         let logPosition: UInt64
         let logIndexPosition: UInt64
+    }
+}
+
+private struct ReftableWriter {
+    let objectFormat: ObjectHashAlgorithm
+    let updateIndex: UInt64
+
+    func write(_ updates: [ReftableUpdate]) throws -> [UInt8] {
+        let version: UInt8 = objectFormat == .sha1 ? 1 : 2
+        let header = makeHeader(version: version)
+        let sorted = updates.sorted {
+            $0.name.bytes.lexicographicallyPrecedes($1.name.bytes)
+        }
+        var refBody: [UInt8] = []
+        var refRestarts: [Int] = []
+        var prior: [UInt8] = []
+        for (index, update) in sorted.enumerated() {
+            let restart = index.isMultiple(of: 16)
+            let prefix = restart ? 0 : commonPrefix(prior, update.name.bytes)
+            if restart { refRestarts.append(header.count + 4 + refBody.count) }
+            appendVarint(UInt64(prefix), to: &refBody)
+            let type: UInt64
+            switch update.value {
+            case .deletion: type = 0
+            case .direct(_, nil): type = 1
+            case .direct(_, .some): type = 2
+            case .symbolic: type = 3
+            }
+            let suffix = update.name.bytes.dropFirst(prefix)
+            appendVarint((UInt64(suffix.count) << 3) | type, to: &refBody)
+            refBody.append(contentsOf: suffix)
+            appendVarint(0, to: &refBody)
+            switch update.value {
+            case .deletion:
+                break
+            case .direct(let identifier, let peeled):
+                guard identifier.algorithm == objectFormat,
+                      peeled?.algorithm == nil || peeled?.algorithm == objectFormat
+                else { throw ReftableError.hashMismatch }
+                refBody.append(contentsOf: identifier.bytes)
+                if let peeled { refBody.append(contentsOf: peeled.bytes) }
+            case .symbolic(let target):
+                appendVarint(UInt64(target.bytes.count), to: &refBody)
+                refBody.append(contentsOf: target.bytes)
+            }
+            prior = update.name.bytes
+        }
+        guard !refRestarts.isEmpty else { throw ReftableError.invalidTable }
+        var refBlock = [UInt8(0x72), 0, 0, 0] + refBody
+        for offset in refRestarts {
+            try appendUInt24(offset, to: &refBlock)
+        }
+        appendUInt16(UInt16(refRestarts.count), to: &refBlock)
+        let refLength = header.count + refBlock.count
+        guard refLength <= 0x00ff_ffff else {
+            throw ReftableError.resourceLimitExceeded
+        }
+        setUInt24(refLength, in: &refBlock, at: 1)
+        var output = header + refBlock
+
+        let logged = sorted.filter { $0.reflog != nil }
+        let logPosition: UInt64
+        if logged.isEmpty {
+            logPosition = 0
+        } else {
+            logPosition = UInt64(output.count)
+            output.append(contentsOf: try makeLogBlock(logged))
+        }
+        var footer = header
+        appendUInt64(0, to: &footer)
+        appendUInt64(0, to: &footer)
+        appendUInt64(0, to: &footer)
+        appendUInt64(logPosition, to: &footer)
+        appendUInt64(0, to: &footer)
+        appendUInt32(CRC32.hash(footer[...]), to: &footer)
+        output.append(contentsOf: footer)
+        return output
+    }
+
+    private func makeHeader(version: UInt8) -> [UInt8] {
+        var bytes = Array("REFT".utf8)
+        bytes.append(version)
+        bytes.append(contentsOf: [0, 0, 0])
+        appendUInt64(updateIndex, to: &bytes)
+        appendUInt64(updateIndex, to: &bytes)
+        if version == 2 {
+            bytes.append(contentsOf: objectFormat == .sha1
+                ? Array("sha1".utf8)
+                : Array("s256".utf8))
+        }
+        return bytes
+    }
+
+    private func makeLogBlock(_ updates: [ReftableUpdate]) throws -> [UInt8] {
+        var body: [UInt8] = []
+        var restarts: [Int] = []
+        var prior: [UInt8] = []
+        for (index, update) in updates.enumerated() {
+            guard let metadata = update.reflog else { continue }
+            var key = update.name.bytes + [0]
+            appendUInt64(UInt64.max - updateIndex, to: &key)
+            let restart = index.isMultiple(of: 16)
+            let prefix = restart ? 0 : commonPrefix(prior, key)
+            if restart { restarts.append(4 + body.count) }
+            appendVarint(UInt64(prefix), to: &body)
+            let suffix = key.dropFirst(prefix)
+            appendVarint((UInt64(suffix.count) << 3) | 1, to: &body)
+            body.append(contentsOf: suffix)
+            let zero = [UInt8](repeating: 0, count: objectFormat.byteCount)
+            let old: [UInt8]
+            let new: [UInt8]
+            switch (update.expected, update.value) {
+            case (.direct(let identifier), _):
+                old = identifier.bytes
+            default:
+                old = zero
+            }
+            switch update.value {
+            case .direct(let identifier, _):
+                new = identifier.bytes
+            case .deletion, .symbolic:
+                new = zero
+            }
+            body.append(contentsOf: old)
+            body.append(contentsOf: new)
+            let name = Array(metadata.signature.name.utf8)
+            let email = Array(metadata.signature.email.utf8)
+            let message = Array(
+                (metadata.message.replacingOccurrences(of: "\n", with: " ") + "\n").utf8
+            )
+            appendVarint(UInt64(name.count), to: &body)
+            body.append(contentsOf: name)
+            appendVarint(UInt64(email.count), to: &body)
+            body.append(contentsOf: email)
+            guard metadata.signature.secondsSinceEpoch >= 0,
+                  metadata.signature.timeZoneOffsetMinutes >= Int(Int16.min),
+                  metadata.signature.timeZoneOffsetMinutes <= Int(Int16.max)
+            else { throw ReftableError.invalidTable }
+            appendVarint(
+                UInt64(metadata.signature.secondsSinceEpoch),
+                to: &body
+            )
+            appendUInt16(
+                UInt16(bitPattern: Int16(metadata.signature.timeZoneOffsetMinutes)),
+                to: &body
+            )
+            appendVarint(UInt64(message.count), to: &body)
+            body.append(contentsOf: message)
+            prior = key
+        }
+        for offset in restarts {
+            try appendUInt24(offset, to: &body)
+        }
+        appendUInt16(UInt16(restarts.count), to: &body)
+        let inflatedLength = 4 + body.count
+        guard inflatedLength <= 0x00ff_ffff else {
+            throw ReftableError.resourceLimitExceeded
+        }
+        var block: [UInt8] = [0x67, 0, 0, 0]
+        setUInt24(inflatedLength, in: &block, at: 1)
+        block.append(contentsOf: try Zlib.compress(body))
+        return block
+    }
+
+    private func commonPrefix(_ lhs: [UInt8], _ rhs: [UInt8]) -> Int {
+        var count = 0
+        while count < lhs.count, count < rhs.count, lhs[count] == rhs[count] {
+            count += 1
+        }
+        return count
+    }
+
+    private func appendVarint(_ value: UInt64, to bytes: inout [UInt8]) {
+        var value = value
+        var encoded = [UInt8(value & 0x7f)]
+        while value > 0x7f {
+            value = (value >> 7) - 1
+            encoded.append(UInt8(value & 0x7f) | 0x80)
+        }
+        bytes.append(contentsOf: encoded.reversed())
+    }
+
+    private func appendUInt16(_ value: UInt16, to bytes: inout [UInt8]) {
+        bytes.append(UInt8(value >> 8))
+        bytes.append(UInt8(truncatingIfNeeded: value))
+    }
+
+    private func appendUInt24(_ value: Int, to bytes: inout [UInt8]) throws {
+        guard value >= 0, value <= 0x00ff_ffff else {
+            throw ReftableError.resourceLimitExceeded
+        }
+        bytes.append(UInt8((value >> 16) & 0xff))
+        bytes.append(UInt8((value >> 8) & 0xff))
+        bytes.append(UInt8(value & 0xff))
+    }
+
+    private func setUInt24(_ value: Int, in bytes: inout [UInt8], at offset: Int) {
+        bytes[offset] = UInt8((value >> 16) & 0xff)
+        bytes[offset + 1] = UInt8((value >> 8) & 0xff)
+        bytes[offset + 2] = UInt8(value & 0xff)
+    }
+
+    private func appendUInt32(_ value: UInt32, to bytes: inout [UInt8]) {
+        bytes.append(UInt8(truncatingIfNeeded: value >> 24))
+        bytes.append(UInt8(truncatingIfNeeded: value >> 16))
+        bytes.append(UInt8(truncatingIfNeeded: value >> 8))
+        bytes.append(UInt8(truncatingIfNeeded: value))
+    }
+
+    private func appendUInt64(_ value: UInt64, to bytes: inout [UInt8]) {
+        for shift in stride(from: 56, through: 0, by: -8) {
+            bytes.append(UInt8(truncatingIfNeeded: value >> UInt64(shift)))
+        }
     }
 }
 

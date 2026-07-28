@@ -72,7 +72,34 @@ public actor Repository {
     }
 
     public func capabilities() -> RepositoryCapabilities {
-        repositoryCapabilities
+        let capabilities = repositoryCapabilities
+        let promisorRemotes = (try? GitConfiguration.load(
+            from: commonDirectory
+        )).map(Repository.promisorRemoteNames)
+            ?? capabilities.promisorRemotes
+        return RepositoryCapabilities(
+            access: capabilities.access,
+            objectFormat: capabilities.objectFormat,
+            refStorage: capabilities.refStorage,
+            isShallow: (try? commonDirectory.exists(["shallow"]))
+                ?? capabilities.isShallow,
+            usesAlternates: (try? commonDirectory.exists([
+                "objects", "info", "alternates",
+            ])) ?? capabilities.usesAlternates,
+            hasMultiPackIndex: (
+                try? commonDirectory.exists([
+                    "objects", "pack", "multi-pack-index",
+                ]) || commonDirectory.exists([
+                    "objects", "pack", "multi-pack-index.d",
+                    "multi-pack-index-chain",
+                ])
+            ) ?? capabilities.hasMultiPackIndex,
+            promisorRemotes: promisorRemotes,
+            index: capabilities.index,
+            repositoryExtensions: capabilities.repositoryExtensions,
+            operations: capabilities.operations,
+            restrictions: capabilities.restrictions
+        )
     }
 
     public func snapshot() async throws -> RepositorySnapshot {
@@ -80,7 +107,7 @@ public actor Repository {
         return RepositorySnapshot(
             headReference: head.reference,
             headObjectID: head.objectID,
-            capabilities: repositoryCapabilities
+            capabilities: capabilities()
         )
     }
 
@@ -815,10 +842,16 @@ public actor Repository {
             let wants = Array(Set(selected.map(\.objectID)))
             let localReferences = try Repository.allReferences(directory: common)
             let haves = Array(Set(localReferences.values.map(\.bytes)))
+            let existingShallow = try Repository.shallowIdentifiers(
+                directory: common,
+                objectFormat: store.objectFormat
+            )
             let body = if let v2Capabilities {
                 try UploadPackV2.fetchRequest(
                     wants: wants,
                     haves: haves,
+                    shallow: Array(existingShallow),
+                    depth: request.depth,
                     filter: request.filter?.rawValue,
                     objectFormat: store.objectFormat,
                     capabilities: v2Capabilities
@@ -827,6 +860,8 @@ public actor Repository {
                 try UploadPackV0.fetchRequest(
                     wants: wants,
                     haves: haves,
+                    shallow: Array(existingShallow),
+                    depth: request.depth,
                     filter: request.filter?.rawValue,
                     objectFormat: store.objectFormat,
                     capabilities: advertisement.capabilities
@@ -846,17 +881,21 @@ public actor Repository {
                     request.remote.transport
                 )
             }
-            let packBytes: [UInt8]
+            let fetchResponse: UploadPackFetchResponse
             if v2Capabilities != nil {
                 var fetchDecoder = PacketLineDecoder()
                 let fetchPackets = try fetchDecoder.append(responseBody)
                 try fetchDecoder.finish()
-                packBytes = try UploadPackV2.parseFetchResponse(fetchPackets)
+                fetchResponse = try UploadPackV2.parseFetchResponse(
+                    fetchPackets
+                )
             } else {
-                packBytes = try UploadPackV0.parseFetchResponse(responseBody)
+                fetchResponse = try UploadPackV0.parseFetchResponse(
+                    responseBody
+                )
             }
             let pack = try PackReader.read(
-                packBytes,
+                fetchResponse.pack,
                 objectFormat: store.objectFormat,
                 externalBase: { identifier in
                     try? store.read(identifier: identifier)
@@ -868,6 +907,15 @@ public actor Repository {
                 in: common,
                 promisor: request.filter != nil
             )
+            var shallow = existingShallow
+            shallow.formUnion(fetchResponse.shallow)
+            shallow.subtract(fetchResponse.unshallow)
+            try Repository.publishShallowIdentifiers(
+                shallow,
+                directory: common,
+                objectFormat: store.objectFormat
+            )
+            store.setShallowIdentifiers(shallow)
             var updates: [RefUpdateResult] = []
             var fetchHead: [UInt8] = []
             for value in selected {
@@ -921,7 +969,15 @@ public actor Repository {
             return FetchResult(
                 receivedObjects: pack.objects.count,
                 updatedReferences: updates,
-                remoteHead: remoteHead
+                remoteHead: remoteHead,
+                shallowBoundaries: try shallow.sorted {
+                    $0.lexicographicallyPrecedes($1)
+                }.map {
+                    try ObjectID(
+                        algorithm: store.objectFormat,
+                        bytes: $0
+                    )
+                }
             )
         }
     }
@@ -3321,17 +3377,17 @@ public actor Repository {
             responseBody = try await session.exchange(requestBody)
             usesV2 = false
         }
-        let packBytes: [UInt8]
+        let fetchResponse: UploadPackFetchResponse
         if usesV2 {
             var decoder = PacketLineDecoder()
             let packets = try decoder.append(responseBody)
             try decoder.finish()
-            packBytes = try UploadPackV2.parseFetchResponse(packets)
+            fetchResponse = try UploadPackV2.parseFetchResponse(packets)
         } else {
-            packBytes = try UploadPackV0.parseFetchResponse(responseBody)
+            fetchResponse = try UploadPackV0.parseFetchResponse(responseBody)
         }
         let pack = try PackReader.read(
-            packBytes,
+            fetchResponse.pack,
             objectFormat: store.objectFormat,
             externalBase: { value in
                 try? store.read(identifier: value)
@@ -3516,6 +3572,63 @@ public actor Repository {
             }
             throw error
         }
+    }
+
+    private static func shallowIdentifiers(
+        directory: RootDirectory,
+        objectFormat: ObjectHashAlgorithm
+    ) throws -> Set<[UInt8]> {
+        let bytes: [UInt8]
+        do {
+            bytes = try directory.read(
+                ["shallow"],
+                limit: 16 * 1024 * 1024
+            )
+        } catch RootDirectoryError.notFound {
+            return []
+        }
+        var result: Set<[UInt8]> = []
+        for line in bytes.split(separator: 0x0a) {
+            guard result.count < 1_000_000 else {
+                throw TreeishError.recoveryRequired(
+                    "shallow boundary limit exceeded"
+                )
+            }
+            let identifier = try ObjectID(
+                hex: String(decoding: line, as: UTF8.self),
+                algorithm: objectFormat
+            )
+            result.insert(identifier.bytes)
+        }
+        return result
+    }
+
+    private static func publishShallowIdentifiers(
+        _ identifiers: Set<[UInt8]>,
+        directory: RootDirectory,
+        objectFormat: ObjectHashAlgorithm
+    ) throws {
+        if identifiers.isEmpty {
+            let url = try directory.url(
+                for: ["shallow"],
+                followFinalSymlink: false
+            )
+            if FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
+            return
+        }
+        var bytes: [UInt8] = []
+        for identifier in identifiers.sorted(by: {
+            $0.lexicographicallyPrecedes($1)
+        }) {
+            let object = try ObjectID(
+                algorithm: objectFormat,
+                bytes: identifier
+            )
+            bytes += Array("\(object.description)\n".utf8)
+        }
+        try directory.writeAtomically(bytes, to: ["shallow"])
     }
 
     private static func reachablePackObjects(

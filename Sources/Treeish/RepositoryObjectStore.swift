@@ -10,7 +10,7 @@ final class RepositoryObjectStore: @unchecked Sendable {
     private let directory: RootDirectory
     private let objectDirectories: [RootDirectory]
     private let limits: TreeishResourceLimits
-    private let shallowIdentifiers: Set<[UInt8]>
+    private var shallowIdentifiers: Set<[UInt8]>
     private var replacementObjects: [[UInt8]: [UInt8]]
     private let useMultiPackIndex: Bool
     let objectFormat: GitHashAlgorithm
@@ -113,7 +113,9 @@ final class RepositoryObjectStore: @unchecked Sendable {
 
     func commitGraphObject(identifier: [UInt8]) throws -> GitObject {
         let object = try read(identifier: identifier)
-        guard shallowIdentifiers.contains(identifier),
+        guard lock.withLock({
+            shallowIdentifiers.contains(identifier)
+        }),
               object.type == .commit else {
             return object
         }
@@ -128,6 +130,12 @@ final class RepositoryObjectStore: @unchecked Sendable {
         payload.append(contentsOf: separator)
         payload.append(contentsOf: object.payload[range.upperBound...])
         return GitObject(type: .commit, payload: payload)
+    }
+
+    func setShallowIdentifiers(_ identifiers: Set<[UInt8]>) {
+        lock.withLock {
+            shallowIdentifiers = identifiers
+        }
     }
 
     func resolvePrefix(_ hexadecimal: String) throws -> [UInt8]? {

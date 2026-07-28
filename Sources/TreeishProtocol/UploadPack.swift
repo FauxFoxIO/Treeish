@@ -20,6 +20,22 @@ public enum UploadPackError: Error, Sendable, Equatable {
     case missingPack
 }
 
+public struct UploadPackFetchResponse: Sendable, Hashable {
+    public let pack: [UInt8]
+    public let shallow: [[UInt8]]
+    public let unshallow: [[UInt8]]
+
+    public init(
+        pack: [UInt8],
+        shallow: [[UInt8]] = [],
+        unshallow: [[UInt8]] = []
+    ) {
+        self.pack = pack
+        self.shallow = shallow
+        self.unshallow = unshallow
+    }
+}
+
 public enum UploadPackV0 {
     public static func parseAdvertisement(
         _ packets: [PacketLine]
@@ -77,6 +93,8 @@ public enum UploadPackV0 {
     public static func fetchRequest(
         wants: [[UInt8]],
         haves: [[UInt8]] = [],
+        shallow: [[UInt8]] = [],
+        depth: UInt32? = nil,
         filter: String? = nil,
         objectFormat: GitHashAlgorithm = .sha1,
         capabilities advertised: Set<String>
@@ -97,6 +115,12 @@ public enum UploadPackV0 {
             }
             supported.append("filter")
         }
+        if !shallow.isEmpty || depth != nil {
+            guard advertised.contains("shallow") else {
+                throw UploadPackError.malformedAdvertisement
+            }
+            supported.append("shallow")
+        }
         let selected = supported.filter(advertised.contains)
         var output: [UInt8] = []
         for (index, identifier) in wants.enumerated() {
@@ -108,6 +132,22 @@ public enum UploadPackV0 {
                 : ""
             output += try PacketLineEncoder.encode(
                 .data(Array("want \(hex(identifier))\(suffix)\n".utf8))
+            )
+        }
+        for identifier in shallow {
+            guard identifier.count == objectFormat.byteCount else {
+                throw UploadPackError.invalidObjectID
+            }
+            output += try PacketLineEncoder.encode(
+                .data(Array("shallow \(hex(identifier))\n".utf8))
+            )
+        }
+        if let depth {
+            guard depth > 0 else {
+                throw UploadPackError.malformedAdvertisement
+            }
+            output += try PacketLineEncoder.encode(
+                .data(Array("deepen \(depth)\n".utf8))
             )
         }
         if let filter {
@@ -131,13 +171,47 @@ public enum UploadPackV0 {
         return output
     }
 
-    public static func parseFetchResponse(_ bytes: [UInt8]) throws -> [UInt8] {
-        var decoder = PacketLineDecoder()
-        let packets = try decoder.append(bytes)
-        try decoder.finish()
+    public static func parseFetchResponse(
+        _ bytes: [UInt8]
+    ) throws -> UploadPackFetchResponse {
+        var offset = 0
         var pack: [UInt8] = []
-        for packet in packets {
-            guard case .data(let payload) = packet else { continue }
+        var shallow: [[UInt8]] = []
+        var unshallow: [[UInt8]] = []
+        while offset < bytes.count {
+            if bytes[offset...].starts(with: Array("PACK".utf8)) {
+                pack += bytes[offset...]
+                break
+            }
+            guard offset + 4 <= bytes.count,
+                  let length = Int(
+                      String(decoding: bytes[offset..<(offset + 4)], as: UTF8.self),
+                      radix: 16
+                  ) else {
+                throw UploadPackError.malformedAdvertisement
+            }
+            offset += 4
+            if length == 0 || length == 1 || length == 2 {
+                continue
+            }
+            guard length >= 4,
+                  offset + length - 4 <= bytes.count else {
+                throw UploadPackError.malformedAdvertisement
+            }
+            let payload = Array(bytes[offset..<(offset + length - 4)])
+            offset += length - 4
+            if payload.starts(with: Array("shallow ".utf8)) {
+                shallow.append(
+                    try decodeHex(linePayload(payload.dropFirst(8))[...])
+                )
+                continue
+            }
+            if payload.starts(with: Array("unshallow ".utf8)) {
+                unshallow.append(
+                    try decodeHex(linePayload(payload.dropFirst(10))[...])
+                )
+                continue
+            }
             if payload == Array("NAK\n".utf8) || payload.starts(with: Array("ACK ".utf8)) {
                 continue
             }
@@ -152,7 +226,11 @@ public enum UploadPackV0 {
         guard pack.starts(with: Array("PACK".utf8)) else {
             throw UploadPackError.missingPack
         }
-        return pack
+        return UploadPackFetchResponse(
+            pack: pack,
+            shallow: shallow,
+            unshallow: unshallow
+        )
     }
 
     private static func decodeHex(_ bytes: ArraySlice<UInt8>) throws -> [UInt8] {
@@ -280,6 +358,8 @@ public enum UploadPackV2 {
     public static func fetchRequest(
         wants: [[UInt8]],
         haves: [[UInt8]] = [],
+        shallow: [[UInt8]] = [],
+        depth: UInt32? = nil,
         filter: String? = nil,
         objectFormat: GitHashAlgorithm = .sha1,
         capabilities: UploadPackV2Capabilities
@@ -308,6 +388,27 @@ public enum UploadPackV2 {
                 .data(Array("filter \(filter)\n".utf8))
             )
         }
+        if !shallow.isEmpty || depth != nil {
+            guard capabilities.feature("fetch", includes: "shallow") else {
+                throw UploadPackError.malformedAdvertisement
+            }
+            for identifier in shallow {
+                guard identifier.count == objectFormat.byteCount else {
+                    throw UploadPackError.invalidObjectID
+                }
+                output += try PacketLineEncoder.encode(
+                    .data(Array("shallow \(hexV2(identifier))\n".utf8))
+                )
+            }
+            if let depth {
+                guard depth > 0 else {
+                    throw UploadPackError.malformedAdvertisement
+                }
+                output += try PacketLineEncoder.encode(
+                    .data(Array("deepen \(depth)\n".utf8))
+                )
+            }
+        }
         for identifier in wants {
             guard identifier.count == objectFormat.byteCount else {
                 throw UploadPackError.invalidObjectID
@@ -325,14 +426,35 @@ public enum UploadPackV2 {
         return output
     }
 
-    public static func parseFetchResponse(_ packets: [PacketLine]) throws -> [UInt8] {
+    public static func parseFetchResponse(
+        _ packets: [PacketLine]
+    ) throws -> UploadPackFetchResponse {
         var inPackfile = false
         var pack: [UInt8] = []
+        var shallow: [[UInt8]] = []
+        var unshallow: [[UInt8]] = []
         for packet in packets {
             switch packet {
             case .data(let payload):
                 if payload == Array("packfile\n".utf8) { inPackfile = true; continue }
-                guard inPackfile else { continue }
+                if !inPackfile {
+                    if payload.starts(with: Array("shallow ".utf8)) {
+                        shallow.append(
+                            try decodeHexV2(
+                                linePayload(payload.dropFirst(8))
+                            )
+                        )
+                    } else if payload.starts(
+                        with: Array("unshallow ".utf8)
+                    ) {
+                        unshallow.append(
+                            try decodeHexV2(
+                                linePayload(payload.dropFirst(10))
+                            )
+                        )
+                    }
+                    continue
+                }
                 switch try SidebandDecoder.decode(payload) {
                 case .data(let bytes): pack += bytes
                 case .progress: continue
@@ -344,7 +466,11 @@ public enum UploadPackV2 {
             }
         }
         guard pack.starts(with: Array("PACK".utf8)) else { throw UploadPackError.missingPack }
-        return pack
+        return UploadPackFetchResponse(
+            pack: pack,
+            shallow: shallow,
+            unshallow: unshallow
+        )
     }
 }
 
@@ -371,4 +497,14 @@ private func validFilter(_ value: String) -> Bool {
     !value.isEmpty
         && value.utf8.count <= 4_096
         && value.utf8.allSatisfy { (0x21...0x7e).contains($0) }
+}
+
+private func linePayload<C: Collection>(
+    _ bytes: C
+) -> [UInt8] where C.Element == UInt8 {
+    var result = Array(bytes)
+    if result.last == 0x0a {
+        result.removeLast()
+    }
+    return result
 }

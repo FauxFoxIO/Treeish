@@ -121,7 +121,7 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
     let advertisement = try PacketLineEncoder.encode(.data(Array("version 2\n".utf8)))
         + PacketLineEncoder.encode(.data(Array("ls-refs=unborn\n".utf8)))
         + PacketLineEncoder.encode(
-            .data(Array("fetch=wait-for-done filter\n".utf8))
+            .data(Array("fetch=wait-for-done filter shallow\n".utf8))
         )
         + PacketLineEncoder.encode(.data(Array("object-format=sha1\n".utf8)))
         + PacketLineEncoder.encode(.flush)
@@ -130,7 +130,13 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
     ) + PacketLineEncoder.encode(
         .data(Array("\(commitHex) refs/heads/main\n".utf8))
     ) + PacketLineEncoder.encode(.flush)
-    let fetch = try PacketLineEncoder.encode(.data(Array("packfile\n".utf8)))
+    let fetch =
+        try PacketLineEncoder.encode(.data(Array("shallow-info\n".utf8)))
+        + PacketLineEncoder.encode(
+            .data(Array("shallow \(commitHex)\n".utf8))
+        )
+        + PacketLineEncoder.encode(.delimiter)
+        + PacketLineEncoder.encode(.data(Array("packfile\n".utf8)))
         + PacketLineEncoder.encode(.data([1] + archive.pack))
         + PacketLineEncoder.encode(.flush)
     let remote = try RemoteURL(URL(string: "https://example.test/repository.git")!)
@@ -160,7 +166,7 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
     let root = try await TreeishRoot.localDirectory(at: directory)
     let repository = try await Treeish.initialize(in: root)
     let result = try await repository.fetch(
-        try FetchRequest(remote: remote, filter: .blobNone),
+        try FetchRequest(remote: remote, filter: .blobNone, depth: 2),
         services: RepositoryServices(
             credentials: GitHubTokenCredentials(token: "secret"),
             httpTransport: transport
@@ -168,6 +174,8 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
     ).value()
     #expect(result.receivedObjects == 3)
     #expect(result.updatedReferences.first?.current.description == commitHex)
+    #expect(result.shallowBoundaries.map(\.description) == [commitHex])
+    #expect(await repository.capabilities().isShallow)
     let fetchHead = String(
         decoding: try root.directory.read(
             [".git", "FETCH_HEAD"],
@@ -193,6 +201,10 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
         String(decoding: requests[2].body, as: UTF8.self)
             .contains("filter blob:none")
     )
+    #expect(
+        String(decoding: requests[2].body, as: UTF8.self)
+            .contains("deepen 2")
+    )
     let configuration = String(
         decoding: try root.directory.read(
             [".git", "config"],
@@ -207,6 +219,67 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
         atPath: directory.appendingPathComponent(".git/objects/pack").path
     )
     #expect(packFiles.contains { $0.hasSuffix(".promisor") })
+    #expect(
+        String(
+            decoding: try root.directory.read(
+                [".git", "shallow"],
+                limit: 1024
+            ),
+            as: UTF8.self
+        ) == "\(commitHex)\n"
+    )
+
+    let commitOnly = try PackWriter.write([
+        try PackObject(identifier: commitID, object: commit),
+    ])
+    let unshallowResponse =
+        try PacketLineEncoder.encode(.data(Array("shallow-info\n".utf8)))
+        + PacketLineEncoder.encode(
+            .data(Array("unshallow \(commitHex)\n".utf8))
+        )
+        + PacketLineEncoder.encode(.delimiter)
+        + PacketLineEncoder.encode(.data(Array("packfile\n".utf8)))
+        + PacketLineEncoder.encode(.data([1] + commitOnly.pack))
+        + PacketLineEncoder.encode(.flush)
+    let unshallowTransport = ScriptedSmartHTTPTransport(responses: [
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type":
+                    "application/x-git-upload-pack-advertisement",
+            ],
+            body: advertisement,
+            finalURL: remote.url.appendingPathComponent("info/refs")
+        ),
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type": "application/x-git-upload-pack-result",
+            ],
+            body: refs,
+            finalURL: remote.url.appendingPathComponent("git-upload-pack")
+        ),
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type": "application/x-git-upload-pack-result",
+            ],
+            body: unshallowResponse,
+            finalURL: remote.url.appendingPathComponent("git-upload-pack")
+        ),
+    ])
+    let unshallowed = try await repository.fetch(
+        try FetchRequest(remote: remote),
+        services: RepositoryServices(httpTransport: unshallowTransport)
+    ).value()
+    #expect(unshallowed.shallowBoundaries.isEmpty)
+    #expect(!(try root.directory.exists([".git", "shallow"])))
+    #expect(!(await repository.capabilities().isShallow))
+    let unshallowRequests = await unshallowTransport.requests
+    #expect(
+        String(decoding: unshallowRequests[2].body, as: UTF8.self)
+            .contains("shallow \(commitHex)")
+    )
 }
 
 @Test func readObjectMaterializesMissingPromisorObject() async throws {

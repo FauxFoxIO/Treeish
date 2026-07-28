@@ -242,7 +242,8 @@ public enum Treeish {
                 remote: request.remote,
                 remoteName: request.remoteName,
                 refNames: request.branch.map { [$0] } ?? [],
-                filter: request.filter
+                filter: request.filter,
+                depth: request.depth
             ),
             services: services
         ).value()

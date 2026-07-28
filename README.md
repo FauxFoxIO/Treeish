@@ -273,6 +273,8 @@ decisions for the host app.
 - protocol v0/v2 partial fetch and clone filters, promisor pack markers,
   multiple promisor remotes, and checkout-time materialization of omitted
   trees and blobs;
+- protocol v0/v2 shallow clone and fetch depth negotiation, including
+  canonical `shallow`/`unshallow` boundary publication;
 - repository formats 0 and 1 when all required extensions are understood,
   normal repositories, and bare repositories;
 - loose, symbolic, and packed references with reflogs, plus bounded reftable

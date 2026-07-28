@@ -31,3 +31,7 @@ specifications only when the server advertises the v0 or v2 `filter`
 capability. Filtered and demand-fetched packs carry standard `.promisor`
 markers. Checkout materializes omitted tree and blob objects before beginning
 its recoverable worktree transaction.
+
+``FetchRequest/depth`` and ``CloneRequest/depth`` negotiate commit depth over
+protocol v0 or v2. Server `shallow` and `unshallow` responses update the
+standard shallow-boundary file before fetched references are published.

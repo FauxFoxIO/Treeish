@@ -252,20 +252,26 @@ public struct FetchRequest: Sendable, Hashable {
     public let remoteName: String
     public let refNames: [RefName]
     public let filter: GitObjectFilter?
+    public let depth: UInt32?
 
     public init(
         remote: RemoteURL,
         remoteName: String = "origin",
         refNames: [RefName] = [],
-        filter: GitObjectFilter? = nil
+        filter: GitObjectFilter? = nil,
+        depth: UInt32? = nil
     ) throws {
         guard !remoteName.isEmpty,
-              remoteName.allSatisfy({ $0.isLetter || $0.isNumber || "-_.".contains($0) })
+              remoteName.allSatisfy({
+                  $0.isLetter || $0.isNumber || "-_.".contains($0)
+              }),
+              depth.map({ $0 > 0 }) ?? true
         else { throw TreeishError.invalidRefName }
         self.remote = remote
         self.remoteName = remoteName
         self.refNames = refNames
         self.filter = filter
+        self.depth = depth
     }
 }
 
@@ -273,15 +279,18 @@ public struct FetchResult: Sendable, Hashable, Codable {
     public let receivedObjects: Int
     public let updatedReferences: [RefUpdateResult]
     public let remoteHead: RefName?
+    public let shallowBoundaries: [ObjectID]
 
     public init(
         receivedObjects: Int,
         updatedReferences: [RefUpdateResult],
-        remoteHead: RefName?
+        remoteHead: RefName?,
+        shallowBoundaries: [ObjectID] = []
     ) {
         self.receivedObjects = receivedObjects
         self.updatedReferences = updatedReferences
         self.remoteHead = remoteHead
+        self.shallowBoundaries = shallowBoundaries
     }
 }
 
@@ -291,24 +300,28 @@ public struct CloneRequest: Sendable, Hashable {
     public let branch: RefName?
     public let remoteName: String
     public let filter: GitObjectFilter?
+    public let depth: UInt32?
 
     public init(
         remote: RemoteURL,
         destination: GitPath,
         branch: RefName? = nil,
         remoteName: String = "origin",
-        filter: GitObjectFilter? = nil
+        filter: GitObjectFilter? = nil,
+        depth: UInt32? = nil
     ) throws {
         guard branch == nil || branch?.description.hasPrefix("refs/heads/") == true,
               !remoteName.isEmpty,
               remoteName.allSatisfy({ $0.isLetter || $0.isNumber || "-_ .".contains($0) }),
-              !remoteName.contains(" ")
+              !remoteName.contains(" "),
+              depth.map({ $0 > 0 }) ?? true
         else { throw TreeishError.invalidRefName }
         self.remote = remote
         self.destination = destination
         self.branch = branch
         self.remoteName = remoteName
         self.filter = filter
+        self.depth = depth
     }
 }
 

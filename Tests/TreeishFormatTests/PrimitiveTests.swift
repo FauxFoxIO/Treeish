@@ -377,31 +377,52 @@ import Testing
     #expect(refs.references.count == 2)
     let fetch = try UploadPackV2.fetchRequest(
         wants: [object],
+        shallow: [object],
+        depth: 2,
         filter: "blob:none",
         capabilities: capabilities
     )
     #expect(String(decoding: fetch, as: UTF8.self).contains("command=fetch"))
     #expect(String(decoding: fetch, as: UTF8.self).contains("filter blob:none"))
+    #expect(String(decoding: fetch, as: UTF8.self).contains("deepen 2"))
     let pack = Array("PACKpayload".utf8)
-    #expect(try UploadPackV2.parseFetchResponse([
+    let response = try UploadPackV2.parseFetchResponse([
         .data(Array("acknowledgments\n".utf8)),
+        .delimiter,
+        .data(Array("shallow-info\n".utf8)),
+        .data(Array("shallow \(hex)\n".utf8)),
         .delimiter,
         .data(Array("packfile\n".utf8)),
         .data([1] + pack),
         .flush,
-    ]) == pack)
+    ])
+    #expect(response.pack == pack)
+    #expect(response.shallow == [object])
 }
 
 @Test func uploadPackV0NegotiatesPartialCloneFilter() throws {
     let object = [UInt8](repeating: 0x34, count: 20)
     let request = try UploadPackV0.fetchRequest(
         wants: [object],
+        shallow: [object],
+        depth: 3,
         filter: "blob:limit=1024",
-        capabilities: ["filter", "side-band-64k"]
+        capabilities: ["filter", "shallow", "side-band-64k"]
     )
     let text = String(decoding: request, as: UTF8.self)
     #expect(text.contains(" filter"))
     #expect(text.contains("filter blob:limit=1024"))
+    #expect(text.contains("deepen 3"))
+    let hex = object.map { String(format: "%02x", $0) }.joined()
+    let pack = Array("PACKraw".utf8)
+    let response =
+        try PacketLineEncoder.encode(.data(Array("shallow \(hex)\n".utf8)))
+        + PacketLineEncoder.encode(.flush)
+        + PacketLineEncoder.encode(.data(Array("NAK\n".utf8)))
+        + pack
+    let parsed = try UploadPackV0.parseFetchResponse(response)
+    #expect(parsed.pack == pack)
+    #expect(parsed.shallow == [object])
 }
 
 @Test func receivePackEncodesMultipleUpdatesAndDeletionAtomically() throws {

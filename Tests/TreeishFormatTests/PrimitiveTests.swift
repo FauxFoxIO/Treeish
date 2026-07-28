@@ -186,6 +186,35 @@ import Testing
     #expect(try GitIndex.decode(index.encode()) == index)
 }
 
+@Test func indexV3AndV4RoundTripExtendedFlagsAndCompressedPaths() throws {
+    let entries = try [
+        GitIndexEntry(
+            path: Array("Sources/Treeish/File.swift".utf8),
+            objectID: [UInt8](repeating: 0x11, count: 20),
+            mode: 0o100644,
+            size: 12,
+            modificationSeconds: 1,
+            modificationNanoseconds: 2,
+            assumeValid: true,
+            skipWorktree: true
+        ),
+        GitIndexEntry(
+            path: Array("Sources/Treeish/Folder.swift".utf8),
+            objectID: [UInt8](repeating: 0x22, count: 20),
+            mode: 0o100755,
+            size: 34,
+            modificationSeconds: 3,
+            modificationNanoseconds: 4,
+            intentToAdd: true
+        ),
+    ]
+    for version: UInt32 in [3, 4] {
+        let index = GitIndex(version: version, entries: entries)
+        let decoded = try GitIndex.decode(index.encode())
+        #expect(decoded == index)
+    }
+}
+
 @Test func receivePackRequestCarriesCompareAndSwapAndPack() throws {
     let old = [UInt8](repeating: 0x11, count: 20)
     let new = [UInt8](repeating: 0x22, count: 20)

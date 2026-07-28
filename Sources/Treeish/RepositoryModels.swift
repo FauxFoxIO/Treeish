@@ -426,33 +426,47 @@ public struct IndexUpdate: Sendable, Hashable, Codable {
 
 public struct StatusOptions: Sendable, Hashable, Codable {
     public var includeUntracked: Bool
+    public var includeIgnored: Bool
 
-    public init(includeUntracked: Bool = true) {
+    public init(
+        includeUntracked: Bool = true,
+        includeIgnored: Bool = false
+    ) {
         self.includeUntracked = includeUntracked
+        self.includeIgnored = includeIgnored
     }
 }
 
-public enum WorktreeStatusKind: String, Sendable, Hashable, Codable {
+public enum StatusChangeKind: String, Sendable, Hashable, Codable {
+    case added
     case modified
     case deleted
+    case typeChanged
     case untracked
-    case conflicted
+    case ignored
+    case unmerged
 }
 
-public struct WorktreeStatusEntry: Sendable, Hashable, Codable {
+public struct StatusEntry: Sendable, Hashable, Codable {
     public let path: GitPath
-    public let kind: WorktreeStatusKind
+    public let indexChange: StatusChangeKind?
+    public let worktreeChange: StatusChangeKind?
 
-    public init(path: GitPath, kind: WorktreeStatusKind) {
+    public init(
+        path: GitPath,
+        indexChange: StatusChangeKind? = nil,
+        worktreeChange: StatusChangeKind? = nil
+    ) {
         self.path = path
-        self.kind = kind
+        self.indexChange = indexChange
+        self.worktreeChange = worktreeChange
     }
 }
 
 public struct Status: Sendable, Hashable, Codable {
-    public let entries: [WorktreeStatusEntry]
+    public let entries: [StatusEntry]
 
-    public init(entries: [WorktreeStatusEntry]) {
+    public init(entries: [StatusEntry]) {
         self.entries = entries
     }
 

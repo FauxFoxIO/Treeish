@@ -166,6 +166,15 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
     ).value()
     #expect(result.receivedObjects == 3)
     #expect(result.updatedReferences.first?.current.description == commitHex)
+    let fetchHead = String(
+        decoding: try root.directory.read(
+            [".git", "FETCH_HEAD"],
+            limit: 1024 * 1024
+        ),
+        as: UTF8.self
+    )
+    #expect(fetchHead.contains(commitHex))
+    #expect(fetchHead.contains("branch 'main' of https://example.test/repository.git"))
     #expect(try await repository.readObject(
         ObjectID(algorithm: .sha1, bytes: commitID)
     ).value().type == .commit)

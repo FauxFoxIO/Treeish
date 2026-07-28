@@ -267,14 +267,16 @@ decisions for the host app.
 
 - SHA-1 loose objects and packfiles;
 - OFS and REF deltas, thin-pack resolution, pack indexes, and zlib streams;
-- repository format 0, normal repositories, and bare repositories;
+- repository formats 0 and 1 when all required extensions are understood,
+  normal repositories, and bare repositories;
 - loose, symbolic, and packed references with reflogs; and
-- index v2, executable files, symbolic links, ignore rules, and attributes.
+- index versions 2–4, extended entry flags, optional index extensions,
+  executable files, symbolic links, ignore rules, and attributes.
 
 ### Everyday Git
 
 - initialize, discover, open, clone, fetch, and push;
-- status, stage, commit, checkout, restore, and reset;
+- staged and unstaged status, stage, commit, checkout, restore, and reset;
 - branches, lightweight and annotated tags, and linked worktrees;
 - revision expressions, ancestry, ranges, logs, and merge bases;
 - merge, cherry-pick, rebase, continuation, conflict state, and abort;
@@ -287,7 +289,9 @@ decisions for the host app.
 - GitHub token authentication and general Basic or Bearer credentials; and
 - validated pack publication before remote-tracking references move.
 
-Treeish does not currently mutate SHA-256 repositories or repository format 1.
+Treeish does not currently mutate SHA-256 repositories, reftable repositories,
+or repository-format-1 repositories containing unsupported required
+extensions.
 Inspect `repository.capabilities()` after opening an unfamiliar repository.
 Unknown required extensions make the repository read-only or metadata-only
 instead of risking corruption.

@@ -36,6 +36,8 @@ typed result.
 - ``RepositoryAccess``
 - ``RepositoryOperationCapability``
 - ``Status``
+- ``StatusEntry``
+- ``StatusChangeKind``
 - ``StatusOptions``
 
 ### Operations

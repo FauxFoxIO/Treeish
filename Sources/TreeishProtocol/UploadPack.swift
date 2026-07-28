@@ -76,6 +76,7 @@ public enum UploadPackV0 {
 
     public static func fetchRequest(
         wants: [[UInt8]],
+        haves: [[UInt8]] = [],
         capabilities advertised: Set<String>
     ) throws -> [UInt8] {
         guard !wants.isEmpty else { throw UploadPackError.invalidObjectID }
@@ -92,6 +93,14 @@ public enum UploadPackV0 {
             )
         }
         output += try PacketLineEncoder.encode(.flush)
+        for identifier in haves {
+            guard identifier.count == 20 else {
+                throw UploadPackError.invalidObjectID
+            }
+            output += try PacketLineEncoder.encode(
+                .data(Array("have \(hex(identifier))\n".utf8))
+            )
+        }
         output += try PacketLineEncoder.encode(.data(Array("done\n".utf8)))
         return output
     }

@@ -189,7 +189,7 @@ public actor Repository {
                 index.entries.append(entry)
                 updated.append(path)
             }
-            index = GitIndex(entries: index.entries)
+            index = GitIndex(version: index.version, entries: index.entries)
             try indexStore.write(index)
             return IndexUpdate(addedOrUpdated: updated, removed: removed)
         }
@@ -200,69 +200,129 @@ public actor Repository {
     ) -> GitOperation<Status> {
         let indexStore = indexStore
         let worktree = worktree
+        let headDirectory = gitDirectory
+        let refsDirectory = commonDirectory
+        let store = objectStore
         return GitOperation(phase: .indexing) {
             guard let worktree else {
                 return Status(entries: [])
             }
             let index = try indexStore.read()
             let rules = try WorkingTreeRules(worktree: worktree)
-            let stageZero = Dictionary(
-                uniqueKeysWithValues: index.entries
-                    .filter { $0.stage == 0 }
-                    .map { ($0.path, $0) }
+            let stageZero = Dictionary(uniqueKeysWithValues: index.entries
+                .filter { $0.stage == 0 }
+                .map { ($0.path, $0) })
+            let conflicted = Set(index.entries.filter { $0.stage != 0 }.map(\.path))
+
+            let head = try Repository.readHead(
+                headDirectory: headDirectory,
+                refsDirectory: refsDirectory
             )
-            var statuses: [WorktreeStatusEntry] = []
-            for entry in index.entries where entry.stage != 0 {
-                statuses.append(
-                    WorktreeStatusEntry(
-                        path: try GitPath(bytes: entry.path),
-                        kind: .conflicted
-                    )
+            let headEntries: [[UInt8]: FlatTreeEntry]
+            if let identifier = head.objectID {
+                let commit = try store.read(identifier: identifier.bytes)
+                let record = try CommitRecord(
+                    identifier: identifier.bytes,
+                    object: commit
                 )
+                headEntries = Dictionary(uniqueKeysWithValues:
+                    try Repository.flattenTree(
+                        identifier: record.tree,
+                        prefix: [],
+                        store: store
+                    ).map { ($0.path, $0) }
+                )
+            } else {
+                headEntries = [:]
             }
-            for (bytes, entry) in stageZero {
-                let path = try GitPath(bytes: bytes)
+
+            var changes: [[UInt8]: (
+                index: StatusChangeKind?,
+                worktree: StatusChangeKind?
+            )] = [:]
+            for bytes in Set(headEntries.keys).union(stageZero.keys) {
+                if conflicted.contains(bytes) {
+                    changes[bytes] = (.unmerged, .unmerged)
+                    continue
+                }
+                switch (headEntries[bytes], stageZero[bytes]) {
+                case (nil, .some):
+                    changes[bytes, default: (nil, nil)].index = .added
+                case (.some, nil):
+                    changes[bytes, default: (nil, nil)].index = .deleted
+                case (.some(let headEntry), .some(let indexEntry)):
+                    if headEntry.mode != indexEntry.mode {
+                        changes[bytes, default: (nil, nil)].index = .typeChanged
+                    } else if headEntry.objectID != indexEntry.objectID {
+                        changes[bytes, default: (nil, nil)].index = .modified
+                    }
+                case (nil, nil):
+                    break
+                }
+            }
+            for bytes in conflicted {
+                changes[bytes] = (.unmerged, .unmerged)
+            }
+
+            for (bytes, entry) in stageZero where !conflicted.contains(bytes) {
                 let url = try worktree.url(
-                    for: path.components,
+                    for: try GitPath(bytes: bytes).components,
                     followFinalSymlink: false
                 )
-                guard try worktree.exists(path.components) else {
-                    statuses.append(
-                        WorktreeStatusEntry(path: path, kind: .deleted)
-                    )
+                guard try worktree.exists(try GitPath(bytes: bytes).components) else {
+                    changes[bytes, default: (nil, nil)].worktree = .deleted
                     continue
                 }
                 let attributes = try FileManager.default.attributesOfItem(
                     atPath: url.path
                 )
-                let isSymbolicLink =
-                    attributes[.type] as? FileAttributeType == .typeSymbolicLink
+                let fileType = attributes[.type] as? FileAttributeType
+                if entry.mode == 0o160000, fileType == .typeDirectory {
+                    continue
+                }
+                let isSymbolicLink = fileType == .typeSymbolicLink
+                if fileType == .typeDirectory {
+                    changes[bytes, default: (nil, nil)].worktree = .typeChanged
+                    continue
+                }
                 let payload = try Repository.worktreePayload(url: url)
                 let data = isSymbolicLink
                     ? payload
-                    : try rules.clean(payload, path: path)
+                    : try rules.clean(payload, path: try GitPath(bytes: bytes))
                 let canonical = Array("blob \(data.count)\0".utf8) + data
                 let permissions = (attributes[.posixPermissions] as? NSNumber)?
                     .uint16Value ?? 0o644
                 let mode: UInt32 = isSymbolicLink
                     ? 0o120000
                     : (permissions & 0o111 == 0 ? 0o100644 : 0o100755)
-                if SHA1.hash(canonical) != entry.objectID || mode != entry.mode {
-                    statuses.append(
-                        WorktreeStatusEntry(path: path, kind: .modified)
-                    )
+                if mode != entry.mode {
+                    changes[bytes, default: (nil, nil)].worktree = .typeChanged
+                } else if SHA1.hash(canonical) != entry.objectID {
+                    changes[bytes, default: (nil, nil)].worktree = .modified
                 }
             }
-            if options.includeUntracked {
+            if options.includeUntracked || options.includeIgnored {
                 let all = try Repository.enumerateFiles(in: worktree)
-                for path in all where stageZero[path.bytes] == nil && !rules.isIgnored(path) {
-                    statuses.append(
-                        WorktreeStatusEntry(path: path, kind: .untracked)
-                    )
+                for path in all where stageZero[path.bytes] == nil {
+                    let ignored = rules.isIgnored(path)
+                    if ignored, options.includeIgnored {
+                        changes[path.bytes, default: (nil, nil)].worktree = .ignored
+                    } else if !ignored, options.includeUntracked {
+                        changes[path.bytes, default: (nil, nil)].worktree = .untracked
+                    }
                 }
             }
             return Status(
-                entries: statuses.sorted {
+                entries: try changes.compactMap { bytes, value in
+                    guard value.index != nil || value.worktree != nil else {
+                        return nil
+                    }
+                    return StatusEntry(
+                        path: try GitPath(bytes: bytes),
+                        indexChange: value.index,
+                        worktreeChange: value.worktree
+                    )
+                }.sorted {
                     $0.path.bytes.lexicographicallyPrecedes($1.path.bytes)
                 }
             )
@@ -562,6 +622,7 @@ public actor Repository {
         services: RepositoryServices = .init()
     ) -> GitOperation<FetchResult> {
         let common = commonDirectory
+        let headDirectory = gitDirectory
         let store = objectStore
         let access = repositoryCapabilities.access
         return GitOperation(phase: .negotiation) {
@@ -654,17 +715,30 @@ public actor Repository {
             }
             let selected = advertisement.references.filter { value in
                 if request.refNames.isEmpty {
-                    return value.name.starts(with: Array("refs/heads/".utf8))
+                    return value.name.starts(with: Array("refs/heads/".utf8)) ||
+                        value.name.starts(with: Array("refs/tags/".utf8))
                 }
                 return request.refNames.contains { $0.bytes == value.name }
             }
             guard !selected.isEmpty else { throw TreeishError.referenceNotFound }
             let wants = Array(Set(selected.map(\.objectID)))
+            let localReferences =
+                try Repository.packedReferences(directory: common)
+                    .merging(
+                        Repository.looseReferences(directory: common),
+                        uniquingKeysWith: { _, loose in loose }
+                    )
+            let haves = Array(Set(localReferences.values.map(\.bytes)))
             let body = if let v2Capabilities {
-                try UploadPackV2.fetchRequest(wants: wants, capabilities: v2Capabilities)
+                try UploadPackV2.fetchRequest(
+                    wants: wants,
+                    haves: haves,
+                    capabilities: v2Capabilities
+                )
             } else {
                 try UploadPackV0.fetchRequest(
                     wants: wants,
+                    haves: haves,
                     capabilities: advertisement.capabilities
                 )
             }
@@ -699,11 +773,29 @@ public actor Repository {
             )
             try Repository.publishPack(pack.objects, in: common)
             var updates: [RefUpdateResult] = []
+            var fetchHead: [UInt8] = []
             for value in selected {
-                let prefix = Array("refs/heads/".utf8)
-                guard value.name.starts(with: prefix) else { continue }
-                let branch = String(decoding: value.name.dropFirst(prefix.count), as: UTF8.self)
-                let target = try RefName("refs/remotes/\(request.remoteName)/\(branch)")
+                let headPrefix = Array("refs/heads/".utf8)
+                let tagPrefix = Array("refs/tags/".utf8)
+                let target: RefName
+                let description: String
+                if value.name.starts(with: headPrefix) {
+                    let branch = String(
+                        decoding: value.name.dropFirst(headPrefix.count),
+                        as: UTF8.self
+                    )
+                    target = try RefName(
+                        "refs/remotes/\(request.remoteName)/\(branch)"
+                    )
+                    description = "branch '\(branch)'"
+                } else if value.name.starts(with: tagPrefix) {
+                    target = try RefName(
+                        String(decoding: value.name, as: UTF8.self)
+                    )
+                    description = "tag '\(String(decoding: value.name.dropFirst(tagPrefix.count), as: UTF8.self))'"
+                } else {
+                    continue
+                }
                 let current = try ObjectID(algorithm: .sha1, bytes: value.objectID)
                 let prior = try? Repository.readDirectReference(
                     directory: common,
@@ -714,7 +806,11 @@ public actor Repository {
                     to: target.pathComponents
                 )
                 updates.append(RefUpdateResult(name: target, previous: prior, current: current))
+                fetchHead += Array(
+                    "\(current.description)\t\t\(description) of \(request.remote.description)\n".utf8
+                )
             }
+            try headDirectory.writeAtomically(fetchHead, to: ["FETCH_HEAD"])
             let remoteHead = try advertisement.symbolicHead.flatMap { symbolic -> RefName? in
                 let prefix = "refs/heads/"
                 guard symbolic.hasPrefix(prefix) else { return nil }
@@ -1169,7 +1265,9 @@ public actor Repository {
                 }
                 }
                 if request.restoreIndex {
-                    try indexStore.write(GitIndex(entries: index.entries))
+                    try indexStore.write(
+                        GitIndex(version: index.version, entries: index.entries)
+                    )
                 }
                 return IndexUpdate(addedOrUpdated: updated, removed: removed)
             }
@@ -1283,7 +1381,9 @@ public actor Repository {
                 else { updated.append(path) }
                 }
                 if request.updateIndex {
-                    try indexStore.write(GitIndex(entries: index.entries))
+                    try indexStore.write(
+                        GitIndex(version: index.version, entries: index.entries)
+                    )
                 }
                 return ApplyPatchResult(updated: updated, deleted: deleted)
             }
@@ -3295,13 +3395,33 @@ public actor Repository {
         ) ?? 0
         var restrictions: [RepositoryRestriction] = []
         var extensions: [RepositoryExtensionCapability] = []
-        if format != 0 {
+        if format < 0 || format > 1 {
             restrictions.append(
                 RepositoryRestriction(reason: .repositoryFormat(format))
             )
         }
+        var objectFormat = ObjectHashAlgorithm.sha1
+        var refStorage = RefStorageFormat.files
         for (name, value) in configuration.values(in: "extensions") {
-            let understood = name.lowercased() == "objectformat" && value == "sha1"
+            let normalizedName = name.lowercased()
+            let normalizedValue = value.lowercased()
+            let understood: Bool
+            switch normalizedName {
+            case "objectformat":
+                if let value = ObjectHashAlgorithm(rawValue: normalizedValue) {
+                    objectFormat = value
+                }
+                understood = normalizedValue == ObjectHashAlgorithm.sha1.rawValue
+            case "refstorage":
+                if let value = RefStorageFormat(rawValue: normalizedValue) {
+                    refStorage = value
+                }
+                understood = normalizedValue == RefStorageFormat.files.rawValue
+            case "noop":
+                understood = true
+            default:
+                understood = false
+            }
             extensions.append(
                 RepositoryExtensionCapability(
                     name: name,
@@ -3309,11 +3429,49 @@ public actor Repository {
                     understood: understood
                 )
             )
-            if !understood {
+            if format == 1, !understood {
                 restrictions.append(
                     RepositoryRestriction(reason: .requiredExtension(name))
                 )
             }
+        }
+        if objectFormat != .sha1 {
+            restrictions.append(
+                RepositoryRestriction(reason: .objectFormat(objectFormat))
+            )
+        }
+        if refStorage != .files {
+            restrictions.append(
+                RepositoryRestriction(reason: .refStorage(refStorage.rawValue))
+            )
+        }
+        let indexCapabilities: IndexCapabilities
+        if try gitDirectory.exists(["index"]) {
+            do {
+                let index = try GitIndexStore(gitDirectory: gitDirectory).read()
+                indexCapabilities = IndexCapabilities(
+                    version: Int(index.version),
+                    canRead: true,
+                    canWrite: true
+                )
+            } catch {
+                indexCapabilities = IndexCapabilities(
+                    version: nil,
+                    canRead: false,
+                    canWrite: false
+                )
+                restrictions.append(
+                    RepositoryRestriction(
+                        reason: .indexFormat(String(describing: error))
+                    )
+                )
+            }
+        } else {
+            indexCapabilities = IndexCapabilities(
+                version: nil,
+                canRead: true,
+                canWrite: true
+            )
         }
         if root.policy.readOnly {
             restrictions.append(RepositoryRestriction(reason: .rootIsReadOnly))
@@ -3327,13 +3485,14 @@ public actor Repository {
         if case .readWrite = access {
             operations.formUnion([
                 .writeObjects, .updateRefs, .createCommit, .status, .stage,
+                .checkout, .fetch, .push, .merge, .linkedWorktrees,
             ])
         }
         return RepositoryCapabilities(
             access: access,
-            objectFormat: .sha1,
-            refStorage: .files,
-            index: IndexCapabilities(version: 2, canRead: true, canWrite: true),
+            objectFormat: objectFormat,
+            refStorage: refStorage,
+            index: indexCapabilities,
             repositoryExtensions: extensions,
             operations: operations,
             restrictions: restrictions

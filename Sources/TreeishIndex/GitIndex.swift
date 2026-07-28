@@ -18,6 +18,9 @@ public struct GitIndexEntry: Sendable, Hashable {
     public let modificationSeconds: UInt32
     public let modificationNanoseconds: UInt32
     public let stage: UInt8
+    public let assumeValid: Bool
+    public let skipWorktree: Bool
+    public let intentToAdd: Bool
 
     public init(
         path: [UInt8],
@@ -26,7 +29,10 @@ public struct GitIndexEntry: Sendable, Hashable {
         size: UInt32,
         modificationSeconds: UInt32,
         modificationNanoseconds: UInt32,
-        stage: UInt8 = 0
+        stage: UInt8 = 0,
+        assumeValid: Bool = false,
+        skipWorktree: Bool = false,
+        intentToAdd: Bool = false
     ) throws {
         guard !path.isEmpty,
               !path.contains(0),
@@ -42,12 +48,18 @@ public struct GitIndexEntry: Sendable, Hashable {
         self.modificationSeconds = modificationSeconds
         self.modificationNanoseconds = modificationNanoseconds
         self.stage = stage
+        self.assumeValid = assumeValid
+        self.skipWorktree = skipWorktree
+        self.intentToAdd = intentToAdd
     }
 }
 public struct GitIndex: Sendable, Hashable {
+    public let version: UInt32
     public var entries: [GitIndexEntry]
 
-    public init(entries: [GitIndexEntry] = []) {
+    public init(version: UInt32 = 2, entries: [GitIndexEntry] = []) {
+        precondition((2...4).contains(version))
+        self.version = version
         self.entries = entries.sorted {
             if $0.path == $1.path { return $0.stage < $1.stage }
             return $0.path.lexicographicallyPrecedes($1.path)
@@ -65,13 +77,14 @@ public struct GitIndex: Sendable, Hashable {
             throw GitIndexError.invalidSignature
         }
         let version = try reader.readUInt32BE()
-        guard version == 2 else {
+        guard (2...4).contains(version) else {
             throw GitIndexError.unsupportedVersion(version)
         }
         let count = try reader.readUInt32BE()
         guard count <= 10_000_000 else { throw GitIndexError.corrupt }
         var entries: [GitIndexEntry] = []
         entries.reserveCapacity(Int(count))
+        var previousPath: [UInt8] = []
         for _ in 0..<count {
             let entryStart = reader.offset
             let mtimeSeconds: UInt32
@@ -90,21 +103,41 @@ public struct GitIndex: Sendable, Hashable {
             let flagsHigh = try reader.readByte()
             let flagsLow = try reader.readByte()
             let flags = UInt16(flagsHigh) << 8 | UInt16(flagsLow)
-            guard flags & 0x4000 == 0 else {
-                throw GitIndexError.unsupportedExtension("extended entry flags")
+            let extendedFlags: UInt16
+            if flags & 0x4000 != 0 {
+                guard version >= 3 else { throw GitIndexError.corrupt }
+                extendedFlags =
+                    UInt16(try reader.readByte()) << 8 |
+                    UInt16(try reader.readByte())
+                guard extendedFlags & ~UInt16(0x6000) == 0 else {
+                    throw GitIndexError.unsupportedExtension(
+                        "unknown extended entry flags"
+                    )
+                }
+            } else {
+                extendedFlags = 0
             }
             let stage = UInt8((flags >> 12) & 0x3)
             var path: [UInt8] = []
+            if version == 4 {
+                let remove = try decodeIndexVariableInteger(&reader)
+                guard remove <= previousPath.count else {
+                    throw GitIndexError.corrupt
+                }
+                path = Array(previousPath.dropLast(remove))
+            }
             while true {
                 let byte = try reader.readByte()
                 if byte == 0 { break }
                 path.append(byte)
             }
-            let consumed = reader.offset - entryStart
-            let padding = (8 - (consumed % 8)) % 8
-            let paddingBytes = try reader.read(count: padding)
-            guard paddingBytes.allSatisfy({ $0 == 0 }) else {
-                throw GitIndexError.corrupt
+            if version < 4 {
+                let consumed = reader.offset - entryStart
+                let padding = (8 - (consumed % 8)) % 8
+                let paddingBytes = try reader.read(count: padding)
+                guard paddingBytes.allSatisfy({ $0 == 0 }) else {
+                    throw GitIndexError.corrupt
+                }
             }
             entries.append(
                 try GitIndexEntry(
@@ -114,24 +147,37 @@ public struct GitIndex: Sendable, Hashable {
                     size: size,
                     modificationSeconds: mtimeSeconds,
                     modificationNanoseconds: mtimeNanoseconds,
-                    stage: stage
+                    stage: stage,
+                    assumeValid: flags & 0x8000 != 0,
+                    skipWorktree: extendedFlags & 0x4000 != 0,
+                    intentToAdd: extendedFlags & 0x2000 != 0
                 )
             )
+            previousPath = path
         }
-        guard reader.remainingCount == 0 else {
-            let signature = try reader.read(count: min(4, reader.remainingCount))
-            throw GitIndexError.unsupportedExtension(
-                String(decoding: signature, as: UTF8.self)
-            )
+        while reader.remainingCount > 0 {
+            guard reader.remainingCount >= 8 else { throw GitIndexError.corrupt }
+            let signature = Array(try reader.read(count: 4))
+            let size = try reader.readUInt32BE()
+            guard UInt64(size) <= UInt64(reader.remainingCount) else {
+                throw GitIndexError.corrupt
+            }
+            _ = try reader.read(count: Int(size))
+            if let first = signature.first, first >= 0x61, first <= 0x7a {
+                throw GitIndexError.unsupportedExtension(
+                    String(decoding: signature, as: UTF8.self)
+                )
+            }
         }
-        return GitIndex(entries: entries)
+        return GitIndex(version: version, entries: entries)
     }
 
     public func encode() -> [UInt8] {
         var writer = CheckedByteWriter()
         writer.append(contentsOf: "DIRC".utf8)
-        writer.appendUInt32BE(2)
+        writer.appendUInt32BE(version)
         writer.appendUInt32BE(UInt32(entries.count))
+        var previousPath: [UInt8] = []
         for entry in entries {
             let entryStart = writer.bytes.count
             writer.appendUInt32BE(0)
@@ -146,16 +192,64 @@ public struct GitIndex: Sendable, Hashable {
             writer.appendUInt32BE(entry.size)
             writer.append(contentsOf: entry.objectID)
             let pathLength = min(entry.path.count, 0x0fff)
-            let flags = UInt16(pathLength) | UInt16(entry.stage) << 12
+            let hasExtendedFlags = entry.skipWorktree || entry.intentToAdd
+            let flags = UInt16(pathLength) |
+                UInt16(entry.stage) << 12 |
+                (hasExtendedFlags ? 0x4000 : 0) |
+                (entry.assumeValid ? 0x8000 : 0)
             writer.append(UInt8((flags >> 8) & 0xff))
             writer.append(UInt8(flags & 0xff))
-            writer.append(contentsOf: entry.path)
-            writer.append(0)
-            while (writer.bytes.count - entryStart) % 8 != 0 {
-                writer.append(0)
+            if hasExtendedFlags {
+                let extended: UInt16 =
+                    (entry.skipWorktree ? 0x4000 : 0) |
+                    (entry.intentToAdd ? 0x2000 : 0)
+                writer.append(UInt8((extended >> 8) & 0xff))
+                writer.append(UInt8(extended & 0xff))
             }
+            if version == 4 {
+                let shared = zip(previousPath, entry.path).prefix {
+                    $0 == $1
+                }.count
+                writer.append(contentsOf: Self.encodeIndexVariableInteger(
+                    previousPath.count - shared
+                ))
+                writer.append(contentsOf: entry.path.dropFirst(shared))
+            } else {
+                writer.append(contentsOf: entry.path)
+            }
+            writer.append(0)
+            if version < 4 {
+                while (writer.bytes.count - entryStart) % 8 != 0 {
+                    writer.append(0)
+                }
+            }
+            previousPath = entry.path
         }
         return writer.bytes + SHA1.hash(writer.bytes)
+    }
+
+    private static func decodeIndexVariableInteger(
+        _ reader: inout CheckedByteReader
+    ) throws -> Int {
+        var value = 0
+        while true {
+            let byte = try reader.readByte()
+            guard value <= (Int.max >> 7) else { throw GitIndexError.corrupt }
+            value = (value << 7) | Int(byte & 0x7f)
+            if byte & 0x80 == 0 { return value }
+            guard value < Int.max else { throw GitIndexError.corrupt }
+            value += 1
+        }
+    }
+
+    private static func encodeIndexVariableInteger(_ input: Int) -> [UInt8] {
+        var value = input
+        var bytes = [UInt8(value & 0x7f)]
+        while value >= 0x80 {
+            value = (value >> 7) - 1
+            bytes.append(UInt8(value & 0x7f) | 0x80)
+        }
+        return Array(bytes.reversed())
     }
 }
 

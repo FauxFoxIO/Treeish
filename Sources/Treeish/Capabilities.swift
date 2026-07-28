@@ -6,6 +6,7 @@ public enum CapabilityReason: Sendable, Hashable, Codable, CustomStringConvertib
     case objectFormat(ObjectHashAlgorithm)
     case requiredExtension(String)
     case refStorage(String)
+    case indexFormat(String)
     case interruptedTransaction(String)
 
     public var description: String {
@@ -15,6 +16,7 @@ public enum CapabilityReason: Sendable, Hashable, Codable, CustomStringConvertib
         case .objectFormat(let format): "object format \(format.rawValue) is not writable"
         case .requiredExtension(let name): "required extension \(name) is unsupported"
         case .refStorage(let storage): "ref storage \(storage) is unsupported"
+        case .indexFormat(let detail): "index format is unsupported: \(detail)"
         case .interruptedTransaction(let detail): "recovery is required: \(detail)"
         }
     }

@@ -75,6 +75,55 @@ import Testing
     #expect(commit.objectID.description.count == 40)
 }
 
+@Test func treeishStatusSeparatesStagedAndWorktreeChanges() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let file = directory.appendingPathComponent("file.txt")
+    try Data("one\n".utf8).write(to: file)
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.initialize(in: root)
+    _ = try await repository.stage(
+        StageRequest(pathspecs: [try GitPathspec("file.txt")])
+    ).value()
+    let tree = try await repository.writeIndexTree().value()
+    let signature = Signature(
+        name: "Treeish",
+        email: "treeish@example.com",
+        secondsSinceEpoch: 1_700_000_000,
+        timeZoneOffsetMinutes: 0
+    )
+    _ = try await repository.commit(
+        CommitRequest(
+            tree: tree,
+            author: signature,
+            committer: signature,
+            message: Array("initial\n".utf8)
+        )
+    ).value()
+
+    try Data("two\n".utf8).write(to: file)
+    _ = try await repository.stage(
+        StageRequest(pathspecs: [try GitPathspec("file.txt")])
+    ).value()
+    #expect(try await repository.status().value().entries == [
+        StatusEntry(path: try GitPath("file.txt"), indexChange: .modified),
+    ])
+
+    try Data("three\n".utf8).write(to: file)
+    #expect(try await repository.status().value().entries == [
+        StatusEntry(
+            path: try GitPath("file.txt"),
+            indexChange: .modified,
+            worktreeChange: .modified
+        ),
+    ])
+}
+
 @Test func systemGitReadsTreeishUnifiedPatchWorktreeAndIndex() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString)
@@ -762,7 +811,10 @@ import Testing
         )
     ).value()
     #expect(try await repository.status().value().entries == [
-        WorktreeStatusEntry(path: try GitPath("secret.bin"), kind: .untracked),
+        StatusEntry(
+            path: try GitPath("secret.bin"),
+            worktreeChange: .untracked
+        ),
     ])
 
     let show = Process()

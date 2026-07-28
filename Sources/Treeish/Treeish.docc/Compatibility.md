@@ -21,5 +21,7 @@ the standard `tables.list.lock` compare-and-swap boundary.
 
 Object lookup follows root-contained alternate object databases and classic or
 incremental multi-pack indexes. Revision traversal honors `shallow` boundaries
-and replacement references. Partial-clone configuration is recognized and
-reported through ``RepositoryCapabilities/promisorRemote``.
+and replacement references. Partial-clone configuration is reported through
+``RepositoryCapabilities/promisorRemote``; ``Repository/readObject(_:services:)``
+materializes missing promised objects through smart HTTP or host-provided SSH
+and publishes the validated response as a canonical local pack.

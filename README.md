@@ -268,8 +268,8 @@ decisions for the host app.
 - SHA-1 and SHA-256 loose objects, packfiles, pack indexes, and indexes;
 - OFS and REF deltas, thin-pack resolution, pack indexes, and zlib streams;
 - root-contained alternate object databases, multi-pack-index v1/v2 lookup,
-  shallow history boundaries, replacement objects, and promisor repository
-  configuration;
+  shallow history boundaries, replacement objects, and on-demand promisor
+  object materialization over smart HTTP or host-provided SSH;
 - repository formats 0 and 1 when all required extensions are understood,
   normal repositories, and bare repositories;
 - loose, symbolic, and packed references with reflogs, plus bounded reftable

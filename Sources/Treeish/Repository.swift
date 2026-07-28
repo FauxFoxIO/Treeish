@@ -104,8 +104,13 @@ public actor Repository {
         }
     }
 
-    public func readObject(_ identifier: ObjectID) -> GitOperation<StoredObject> {
+    public func readObject(
+        _ identifier: ObjectID,
+        services: RepositoryServices = .init()
+    ) -> GitOperation<StoredObject> {
         let store = objectStore
+        let common = commonDirectory
+        let promisorRemote = repositoryCapabilities.promisorRemote
         return GitOperation(phase: .validating) {
             try Task.checkCancellation()
             guard identifier.algorithm == store.objectFormat else {
@@ -113,7 +118,22 @@ public actor Repository {
                     identifier.algorithm.rawValue
                 )
             }
-            let object = try store.read(identifier: identifier.bytes)
+            let object: GitObject
+            do {
+                object = try store.read(identifier: identifier.bytes)
+            } catch GitObjectError.objectNotFound {
+                guard let promisorRemote else {
+                    throw GitObjectError.objectNotFound
+                }
+                try await Repository.materializePromisedObject(
+                    identifier,
+                    remoteName: promisorRemote,
+                    services: services,
+                    store: store,
+                    directory: common
+                )
+                object = try store.read(identifier: identifier.bytes)
+            }
             return StoredObject(
                 type: GitObjectKind(storageType: object.type),
                 payload: object.payload
@@ -3174,6 +3194,127 @@ public actor Repository {
         case .reject: return nil
         case .cancel: throw CancellationError()
         }
+    }
+
+    private static func materializePromisedObject(
+        _ identifier: ObjectID,
+        remoteName: String,
+        services: RepositoryServices,
+        store: RepositoryObjectStore,
+        directory: RootDirectory
+    ) async throws {
+        let configuration = try GitConfiguration.load(from: directory)
+        guard let value = configuration.value(
+            section: "remote",
+            subsection: remoteName,
+            key: "url"
+        ) else {
+            throw TreeishError.referenceNotFound
+        }
+        let remote = try RemoteURL(value)
+        let responseBody: [UInt8]
+        let usesV2: Bool
+        switch remote.transport {
+        case .https:
+            let credential = try await credential(
+                for: remote.url,
+                services: services
+            )
+            let client = SmartHTTPClient(
+                transport: services.httpTransport
+                    ?? URLSessionSmartHTTPTransport()
+            )
+            let advertisement = try await client.advertisement(
+                remote: remote.url,
+                authorization: credential?.authorizationHeader,
+                protocolVersion: 2
+            )
+            var decoder = PacketLineDecoder()
+            let packets = try decoder.append(advertisement.body)
+            try decoder.finish()
+            usesV2 = packets.contains {
+                if case .data(let bytes) = $0 {
+                    return bytes == Array("version 2\n".utf8)
+                        || bytes == Array("version 2".utf8)
+                }
+                return false
+            }
+            let requestBody: [UInt8]
+            if usesV2 {
+                let capabilities = try UploadPackV2.parseCapabilities(
+                    packets
+                )
+                requestBody = try UploadPackV2.fetchRequest(
+                    wants: [identifier.bytes],
+                    objectFormat: store.objectFormat,
+                    capabilities: capabilities
+                )
+            } else {
+                let advertisement = try UploadPackV0.parseAdvertisement(
+                    packets
+                )
+                requestBody = try UploadPackV0.fetchRequest(
+                    wants: [identifier.bytes],
+                    objectFormat: store.objectFormat,
+                    capabilities: advertisement.capabilities
+                )
+            }
+            responseBody = try await client.uploadPack(
+                remote: remote.url,
+                body: requestBody,
+                authorization: credential?.authorizationHeader
+            ).body
+        case .ssh:
+            guard let endpoint = remote.sshEndpoint,
+                  let transport = services.sshTransport else {
+                throw TreeishError.remoteTransportUnavailable(.ssh)
+            }
+            let session = try await transport.open(
+                SSHGitSessionRequest(
+                    endpoint: endpoint,
+                    service: .uploadPack
+                )
+            )
+            var decoder = PacketLineDecoder()
+            let packets = try decoder.append(
+                try await session.advertisement()
+            )
+            try decoder.finish()
+            let advertisement = try UploadPackV0.parseAdvertisement(packets)
+            let requestBody = try UploadPackV0.fetchRequest(
+                wants: [identifier.bytes],
+                objectFormat: store.objectFormat,
+                capabilities: advertisement.capabilities
+            )
+            responseBody = try await session.exchange(requestBody)
+            usesV2 = false
+        }
+        let packBytes: [UInt8]
+        if usesV2 {
+            var decoder = PacketLineDecoder()
+            let packets = try decoder.append(responseBody)
+            try decoder.finish()
+            packBytes = try UploadPackV2.parseFetchResponse(packets)
+        } else {
+            packBytes = try UploadPackV0.parseFetchResponse(responseBody)
+        }
+        let pack = try PackReader.read(
+            packBytes,
+            objectFormat: store.objectFormat,
+            externalBase: { value in
+                try? store.read(identifier: value)
+            }
+        )
+        guard pack.objects.contains(where: {
+            $0.identifier == identifier.bytes
+        }) else {
+            throw GitObjectError.objectNotFound
+        }
+        try publishPack(
+            pack.objects,
+            objectFormat: store.objectFormat,
+            in: directory
+        )
     }
 
     private static func publishPack(

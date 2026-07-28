@@ -189,6 +189,101 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
     #expect(String(decoding: requests[2].body, as: UTF8.self).contains("command=fetch"))
 }
 
+@Test func readObjectMaterializesMissingPromisorObject() async throws {
+    let blob = GitObject(
+        type: .blob,
+        payload: Array("promised object\n".utf8)
+    )
+    let identifier = SHA1.hash(blob.canonicalBytes)
+    let identifierHex = identifier.map {
+        String(format: "%02x", $0)
+    }.joined()
+    let archive = try PackWriter.write([
+        try PackObject(identifier: identifier, object: blob),
+    ])
+    let advertisement =
+        try PacketLineEncoder.encode(.data(Array("version 2\n".utf8)))
+        + PacketLineEncoder.encode(.data(Array("fetch=wait-for-done\n".utf8)))
+        + PacketLineEncoder.encode(.data(Array("object-format=sha1\n".utf8)))
+        + PacketLineEncoder.encode(.flush)
+    let fetch =
+        try PacketLineEncoder.encode(.data(Array("packfile\n".utf8)))
+        + PacketLineEncoder.encode(.data([1] + archive.pack))
+        + PacketLineEncoder.encode(.flush)
+    let remote = try RemoteURL(
+        URL(string: "https://example.test/promisor.git")!
+    )
+    let transport = ScriptedSmartHTTPTransport(responses: [
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type":
+                    "application/x-git-upload-pack-advertisement",
+            ],
+            body: advertisement,
+            finalURL: remote.url.appendingPathComponent("info/refs")
+        ),
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type": "application/x-git-upload-pack-result",
+            ],
+            body: fetch,
+            finalURL: remote.url.appendingPathComponent("git-upload-pack")
+        ),
+    ])
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    _ = try await Treeish.initialize(in: root)
+    var configuration = try root.directory.read(
+        [".git", "config"],
+        limit: 1024 * 1024
+    )
+    configuration += Array(
+        """
+
+        [extensions]
+            partialClone = origin
+        [remote "origin"]
+            url = https://example.test/promisor.git
+            promisor = true
+            partialCloneFilter = blob:none
+
+        """.utf8
+    )
+    try root.directory.writeAtomically(
+        configuration,
+        to: [".git", "config"]
+    )
+    let repository = try await Treeish.open(
+        try await Treeish.discover(in: root),
+        roots: [root]
+    )
+
+    let object = try await repository.readObject(
+        try ObjectID(bytes: identifier),
+        services: RepositoryServices(httpTransport: transport)
+    ).value()
+    #expect(object.type == .blob)
+    #expect(object.payload == blob.payload)
+    let requests = await transport.requests
+    #expect(requests.count == 2)
+    #expect(
+        String(decoding: requests[1].body, as: UTF8.self)
+            .contains("want \(identifierHex)")
+    )
+    #expect(
+        try await repository.readObject(try ObjectID(bytes: identifier))
+            .value().payload == blob.payload
+    )
+}
+
 @Test func fetchUsesStatefulSSHUploadPackSession() async throws {
     let blob = GitObject(type: .blob, payload: Array("ssh\n".utf8))
     let blobID = SHA1.hash(blob.canonicalBytes)

@@ -175,6 +175,11 @@ public actor Repository {
             }
             let rules = try WorkingTreeRules(worktree: worktree)
             var index = try indexStore.read()
+            let existing = Dictionary(
+                uniqueKeysWithValues: index.entries
+                    .filter { $0.stage == 0 }
+                    .map { ($0.path, $0) }
+            )
             let requested = try Repository.expandPathspecs(
                 request.pathspecs,
                 in: worktree,
@@ -184,6 +189,10 @@ public actor Repository {
             var removed: [GitPath] = []
             for path in requested {
                 try Task.checkCancellation()
+                if existing[path.bytes]?.skipWorktree == true,
+                   !request.includeSparsePaths {
+                    throw TreeishError.pathOutsideSparseCheckout(path)
+                }
                 if rules.isIgnored(path), !request.forceIgnored {
                     throw TreeishError.ignoredPath(path)
                 }
@@ -319,11 +328,15 @@ public actor Repository {
             }
 
             for (bytes, entry) in stageZero where !conflicted.contains(bytes) {
+                let path = try GitPath(bytes: bytes)
                 let url = try worktree.url(
-                    for: try GitPath(bytes: bytes).components,
+                    for: path.components,
                     followFinalSymlink: false
                 )
-                guard try worktree.exists(try GitPath(bytes: bytes).components) else {
+                guard try worktree.exists(path.components) else {
+                    if entry.skipWorktree {
+                        continue
+                    }
                     changes[bytes, default: (nil, nil)].worktree = .deleted
                     continue
                 }
@@ -342,7 +355,7 @@ public actor Repository {
                 let payload = try Repository.worktreePayload(url: url)
                 let data = isSymbolicLink
                     ? payload
-                    : try rules.clean(payload, path: try GitPath(bytes: bytes))
+                    : try rules.clean(payload, path: path)
                 let canonical = Array("blob \(data.count)\0".utf8) + data
                 let permissions = (attributes[.posixPermissions] as? NSNumber)?
                     .uint16Value ?? 0o644
@@ -1340,7 +1353,14 @@ public actor Repository {
                 store: store,
                 directory: refsDirectory
             )
-            for entry in target where entry.mode != 0o160000 {
+            let sparse = try SparseCheckoutRules(
+                gitDirectory: headDirectory,
+                commonDirectory: refsDirectory
+            )
+            let includedTarget = try target.filter {
+                sparse.includes(try GitPath(bytes: $0.path))
+            }
+            for entry in includedTarget where entry.mode != 0o160000 {
                 _ = try await Repository.readPromisedObject(
                     entry.objectID,
                     preferredRemotes: promisorRemotes,
@@ -1351,7 +1371,7 @@ public actor Repository {
             }
             let currentIndex = try indexStore.read()
             let tracked = Set(currentIndex.entries.filter { $0.stage == 0 }.map(\.path))
-            let targetPaths = Set(target.map(\.path))
+            let targetPaths = Set(includedTarget.map(\.path))
             for entry in target where !tracked.contains(entry.path) {
                 let path = try GitPath(bytes: entry.path)
                 if try worktree.exists(path.components) {
@@ -1360,8 +1380,17 @@ public actor Repository {
             }
             for entry in currentIndex.entries where entry.stage == 0 {
                 let path = try GitPath(bytes: entry.path)
-                guard try worktree.exists(path.components) else { continue }
+                guard try worktree.exists(path.components) else {
+                    continue
+                }
                 let url = try worktree.url(for: path.components, followFinalSymlink: false)
+                let attributes = try FileManager.default.attributesOfItem(
+                    atPath: url.path
+                )
+                if entry.mode == 0o160000,
+                   attributes[.type] as? FileAttributeType == .typeDirectory {
+                    continue
+                }
                 let bytes = try Repository.worktreePayload(url: url)
                 let canonical = Array("blob \(bytes.count)\0".utf8) + bytes
                 guard store.objectFormat.hash(canonical) == entry.objectID else {
@@ -1392,15 +1421,18 @@ public actor Repository {
                         try FileManager.default.removeItem(at: url)
                     }
                 }
-                try Repository.materializeTree(
-                    identifier: commit.tree,
-                    at: [],
-                    root: worktree,
-                    store: store
-                )
+                for entry in includedTarget {
+                    try Repository.materializeFlatEntry(
+                        entry,
+                        worktree: worktree,
+                        store: store
+                    )
+                }
                 let entries = try target.map { value -> GitIndexEntry in
                     let size: UInt32
-                    if value.mode == 0o160000 {
+                    let path = try GitPath(bytes: value.path)
+                    let included = sparse.includes(path)
+                    if value.mode == 0o160000 || !included {
                         size = 0
                     } else {
                         let blob = try store.read(identifier: value.objectID)
@@ -1414,10 +1446,17 @@ public actor Repository {
                         mode: value.mode,
                         size: size,
                         modificationSeconds: 0,
-                        modificationNanoseconds: 0
+                        modificationNanoseconds: 0,
+                        skipWorktree: !included
                     )
                 }
-                try indexStore.write(GitIndex(entries: entries))
+                try indexStore.write(GitIndex(
+                    version: sparse.enabled
+                        ? max(currentIndex.version, 3)
+                        : currentIndex.version,
+                    objectFormat: currentIndex.objectFormat,
+                    entries: entries
+                ))
                 if let reference = request.reference {
                     try Repository.publishCheckoutReferences(
                         headDirectory: headDirectory,
@@ -1436,7 +1475,7 @@ public actor Repository {
                 return CheckoutResult(
                     commit: request.commit,
                     reference: request.reference,
-                    pathsWritten: entries.count
+                    pathsWritten: includedTarget.count
                 )
             } catch {
                 try transaction.reconcileAfterFailure(
@@ -4202,11 +4241,18 @@ public actor Repository {
         store: RepositoryObjectStore
     ) throws {
         let path = try GitPath(bytes: entry.path)
-        let object = try store.read(identifier: entry.objectID)
         let url = try worktree.url(for: path.components, followFinalSymlink: false)
         if try worktree.exists(path.components) {
             try FileManager.default.removeItem(at: url)
         }
+        if entry.mode == 0o160000 {
+            try FileManager.default.createDirectory(
+                at: url,
+                withIntermediateDirectories: true
+            )
+            return
+        }
+        let object = try store.read(identifier: entry.objectID)
         if entry.mode == 0o120000 {
             try FileManager.default.createDirectory(
                 at: url.deletingLastPathComponent(),

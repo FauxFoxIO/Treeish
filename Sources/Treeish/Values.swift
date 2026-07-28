@@ -19,6 +19,7 @@ public enum TreeishError: Error, Sendable, Equatable {
     case indeterminateRemoteResult(String)
     case worktreeCollision(GitPath)
     case ignoredPath(GitPath)
+    case pathOutsideSparseCheckout(GitPath)
     case unsupportedContentConversion(GitPath, String)
 }
 

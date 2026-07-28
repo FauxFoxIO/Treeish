@@ -1703,3 +1703,102 @@ func systemGitRecognizesTreeishLinkedWorktree(
     #expect(history.last == onto.description)
     #expect(!FileManager.default.fileExists(atPath: directory.appendingPathComponent(".git/rebase-treeish").path))
 }
+
+@Test func treeishPreservesSystemGitSparseCheckout() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    func git(_ arguments: [String]) throws -> (Int32, String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory.path] + arguments
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "GIT_AUTHOR_NAME": "System Git",
+            "GIT_AUTHOR_EMAIL": "git@example.com",
+            "GIT_COMMITTER_NAME": "System Git",
+            "GIT_COMMITTER_EMAIL": "git@example.com",
+        ], uniquingKeysWith: { _, new in new })
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        return (
+            process.terminationStatus,
+            String(
+                decoding: output.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            )
+        )
+    }
+
+    #expect(try git(["init"]).0 == 0)
+    try FileManager.default.createDirectory(
+        at: directory.appendingPathComponent("included"),
+        withIntermediateDirectories: true
+    )
+    try FileManager.default.createDirectory(
+        at: directory.appendingPathComponent("excluded"),
+        withIntermediateDirectories: true
+    )
+    try Data("root\n".utf8).write(
+        to: directory.appendingPathComponent("root.txt")
+    )
+    try Data("included\n".utf8).write(
+        to: directory.appendingPathComponent("included/file.txt")
+    )
+    try Data("excluded\n".utf8).write(
+        to: directory.appendingPathComponent("excluded/file.txt")
+    )
+    #expect(try git(["add", "."]).0 == 0)
+    #expect(try git(["commit", "-m", "sparse fixture"]).0 == 0)
+    let head = try ObjectID(
+        hex: git(["rev-parse", "HEAD"]).1
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    )
+    #expect(try git(["sparse-checkout", "set", "included"]).0 == 0)
+    #expect(
+        !FileManager.default.fileExists(
+            atPath: directory.appendingPathComponent("excluded/file.txt").path
+        )
+    )
+
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.open(
+        try await Treeish.discover(in: root),
+        roots: [root]
+    )
+    #expect(try await repository.status().value().isClean)
+    let result = try await repository.checkout(
+        CheckoutRequest(
+            commit: head,
+            reference: try RefName("refs/heads/main")
+        )
+    ).value()
+    #expect(result.pathsWritten == 2)
+    #expect(
+        !FileManager.default.fileExists(
+            atPath: directory.appendingPathComponent("excluded/file.txt").path
+        )
+    )
+    await #expect(
+        throws: TreeishError.pathOutsideSparseCheckout(
+            try GitPath("excluded/file.txt")
+        )
+    ) {
+        _ = try await repository.stage(
+            StageRequest(
+                pathspecs: [try GitPathspec("excluded/file.txt")]
+            )
+        ).value()
+    }
+    #expect(try git(["status", "--porcelain=v1"]).1.isEmpty)
+    let files = try git(["ls-files", "-t"]).1
+    #expect(files.contains("S excluded/file.txt"))
+    #expect(files.contains("H included/file.txt"))
+}

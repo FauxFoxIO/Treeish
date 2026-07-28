@@ -47,3 +47,10 @@ canonical empty pack when the remote already has every required object.
 leading `+` force and `^` negative forms. ``FetchRequest/prune`` removes only
 destinations covered by positive mappings and protects negative selections.
 Empty repositories clone without fabricating a commit or reference.
+
+Checkout honors standard `$GIT_DIR/info/sparse-checkout` patterns when
+`core.sparseCheckout` is enabled in shared or worktree configuration. Excluded
+index entries retain `skip-worktree`, status does not report their intentional
+absence as deletion, and staging rejects them unless
+``StageRequest/includeSparsePaths`` explicitly opts into Git's `--sparse`
+behavior.

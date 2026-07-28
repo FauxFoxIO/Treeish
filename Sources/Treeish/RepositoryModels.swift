@@ -410,10 +410,16 @@ public struct WorkspaceState: Sendable, Hashable, Codable {
 public struct StageRequest: Sendable, Hashable, Codable {
     public let pathspecs: [GitPathspec]
     public let forceIgnored: Bool
+    public let includeSparsePaths: Bool
 
-    public init(pathspecs: [GitPathspec], forceIgnored: Bool = false) {
+    public init(
+        pathspecs: [GitPathspec],
+        forceIgnored: Bool = false,
+        includeSparsePaths: Bool = false
+    ) {
         self.pathspecs = pathspecs
         self.forceIgnored = forceIgnored
+        self.includeSparsePaths = includeSparsePaths
     }
 }
 

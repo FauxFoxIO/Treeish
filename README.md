@@ -286,12 +286,14 @@ decisions for the host app.
 - loose, symbolic, and packed references with reflogs, plus bounded reftable
   v1/v2 stacks, atomic updates, tombstones, and reflogs; and
 - index versions 2–4, extended entry flags, optional index extensions,
-  executable files, symbolic links, ignore rules, and attributes.
+  executable files, symbolic links, sparse-checkout patterns, ignore rules,
+  and attributes.
 
 ### Everyday Git
 
 - initialize, discover, open, clone, fetch, and push;
-- staged and unstaged status, stage, commit, checkout, restore, and reset;
+- staged and unstaged status, sparse-aware stage and checkout, commit, restore,
+  and reset;
 - branches, lightweight and annotated tags, and linked worktrees;
 - revision expressions, ancestry, ranges, logs, and merge bases;
 - merge, cherry-pick, rebase, continuation, conflict state, and abort;

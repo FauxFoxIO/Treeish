@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import TreeishCore
 @testable import TreeishDiff
@@ -6,6 +7,54 @@ import Testing
 @testable import TreeishObjects
 @testable import TreeishPacks
 @testable import TreeishProtocol
+
+@Test func readsSystemGitMultiPackIndex() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    func git(_ arguments: [String]) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory.path] + arguments
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "GIT_AUTHOR_NAME": "System Git",
+            "GIT_AUTHOR_EMAIL": "git@example.com",
+            "GIT_COMMITTER_NAME": "System Git",
+            "GIT_COMMITTER_EMAIL": "git@example.com",
+        ], uniquingKeysWith: { _, new in new })
+        try process.run()
+        process.waitUntilExit()
+        #expect(process.terminationStatus == 0)
+    }
+    try git(["init"])
+    for name in ["one", "two"] {
+        try Data("\(name)\n".utf8).write(
+            to: directory.appendingPathComponent(name)
+        )
+        try git(["add", name])
+        try git(["commit", "-m", name])
+        try git(["repack", "-d"])
+    }
+    try git(["multi-pack-index", "write"])
+    let bytes = try Data(
+        contentsOf: directory.appendingPathComponent(
+            ".git/objects/pack/multi-pack-index"
+        )
+    )
+    let index = try MultiPackIndex.read(Array(bytes), objectFormat: .sha1)
+    #expect(index.packNames.count == 2)
+    #expect(index.entries.count == 6)
+    #expect(index.entries.allSatisfy {
+        index.packNames.contains($0.packName)
+    })
+    #expect(index.entries.allSatisfy {
+        index.entry(for: $0.identifier) == $0
+    })
+}
 
 @Test func sha1Vectors() {
     let digest = SHA1.hash(Array("abc".utf8))

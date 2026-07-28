@@ -83,6 +83,10 @@ public struct RepositoryCapabilities: Sendable, Hashable, Codable {
     public let access: RepositoryAccess
     public let objectFormat: ObjectHashAlgorithm
     public let refStorage: RefStorageFormat
+    public let isShallow: Bool
+    public let usesAlternates: Bool
+    public let hasMultiPackIndex: Bool
+    public let promisorRemote: String?
     public let index: IndexCapabilities
     public let repositoryExtensions: [RepositoryExtensionCapability]
     public let operations: Set<RepositoryOperationCapability>
@@ -92,6 +96,10 @@ public struct RepositoryCapabilities: Sendable, Hashable, Codable {
         access: RepositoryAccess,
         objectFormat: ObjectHashAlgorithm,
         refStorage: RefStorageFormat,
+        isShallow: Bool,
+        usesAlternates: Bool,
+        hasMultiPackIndex: Bool,
+        promisorRemote: String?,
         index: IndexCapabilities,
         repositoryExtensions: [RepositoryExtensionCapability],
         operations: Set<RepositoryOperationCapability>,
@@ -100,6 +108,10 @@ public struct RepositoryCapabilities: Sendable, Hashable, Codable {
         self.access = access
         self.objectFormat = objectFormat
         self.refStorage = refStorage
+        self.isShallow = isShallow
+        self.usesAlternates = usesAlternates
+        self.hasMultiPackIndex = hasMultiPackIndex
+        self.promisorRemote = promisorRemote
         self.index = index
         self.repositoryExtensions = repositoryExtensions
         self.operations = operations

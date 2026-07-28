@@ -18,3 +18,8 @@ declared object format.
 Reftable v1 and v2 stacks support symbolic references, peeled values, deletion
 records, and append-only reference/reflog transactions. Stack publication uses
 the standard `tables.list.lock` compare-and-swap boundary.
+
+Object lookup follows root-contained alternate object databases and classic or
+incremental multi-pack indexes. Revision traversal honors `shallow` boundaries
+and replacement references. Partial-clone configuration is recognized and
+reported through ``RepositoryCapabilities/promisorRemote``.

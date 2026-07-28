@@ -40,10 +40,16 @@ public actor Repository {
             commonDirectory: commonDirectory
         )
         repositoryCapabilities = capabilities
-        objectStore = RepositoryObjectStore(
+        let replacementObjects = try Repository.replacementObjects(
             directory: commonDirectory,
+            objectFormat: capabilities.objectFormat
+        )
+        objectStore = try RepositoryObjectStore(
+            directory: commonDirectory,
+            grantedRoot: root.directory,
             objectFormat: capabilities.objectFormat,
-            limits: options.resourceLimits
+            limits: options.resourceLimits,
+            replacementObjects: replacementObjects
         )
         resourceLimits = options.resourceLimits
         indexStore = GitIndexStore(
@@ -2447,6 +2453,7 @@ public actor Repository {
         reflog: ReflogMetadata? = nil
     ) -> GitOperation<RefUpdateResult> {
         let directory = commonDirectory
+        let store = objectStore
         let access = repositoryCapabilities.access
         let objectFormat = repositoryCapabilities.objectFormat
         return GitOperation(phase: .updatingRefs) {
@@ -2473,6 +2480,15 @@ public actor Repository {
                 requireMissing: false,
                 reflog: reflog
             )
+            if let original = try Repository.replacedIdentifier(
+                name,
+                objectFormat: objectFormat
+            ) {
+                store.setReplacement(
+                    for: original.bytes,
+                    to: newValue.bytes
+                )
+            }
             return RefUpdateResult(name: name, previous: prior, current: newValue)
         }
     }
@@ -2533,7 +2549,9 @@ public actor Repository {
         expected: ObjectID
     ) -> GitOperation<ObjectID> {
         let directory = commonDirectory
+        let store = objectStore
         let access = repositoryCapabilities.access
+        let objectFormat = repositoryCapabilities.objectFormat
         return GitOperation(phase: .updatingRefs) {
             guard case .readWrite = access else {
                 throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
@@ -2545,6 +2563,12 @@ public actor Repository {
                 name: name,
                 expected: expected
             )
+            if let original = try Repository.replacedIdentifier(
+                name,
+                objectFormat: objectFormat
+            ) {
+                store.setReplacement(for: original.bytes, to: nil)
+            }
             return current
         }
     }
@@ -2880,6 +2904,39 @@ public actor Repository {
         return try packedReferences(directory: directory).merging(
             looseReferences(directory: directory),
             uniquingKeysWith: { _, loose in loose }
+        )
+    }
+
+    private static func replacementObjects(
+        directory: RootDirectory,
+        objectFormat: ObjectHashAlgorithm
+    ) throws -> [[UInt8]: [UInt8]] {
+        let prefix = "refs/replace/"
+        var result: [[UInt8]: [UInt8]] = [:]
+        for (name, target) in try allReferences(directory: directory)
+        where name.description.hasPrefix(prefix) {
+            let originalHex = String(name.description.dropFirst(prefix.count))
+            let original = try ObjectID(
+                hex: originalHex,
+                algorithm: objectFormat
+            )
+            guard target.algorithm == objectFormat else {
+                throw TreeishError.invalidObjectID
+            }
+            result[original.bytes] = target.bytes
+        }
+        return result
+    }
+
+    private static func replacedIdentifier(
+        _ name: RefName,
+        objectFormat: ObjectHashAlgorithm
+    ) throws -> ObjectID? {
+        let prefix = "refs/replace/"
+        guard name.description.hasPrefix(prefix) else { return nil }
+        return try ObjectID(
+            hex: String(name.description.dropFirst(prefix.count)),
+            algorithm: objectFormat
         )
     }
 
@@ -3813,6 +3870,7 @@ public actor Repository {
         }
         var objectFormat = ObjectHashAlgorithm.sha1
         var refStorage = RefStorageFormat.files
+        var promisorRemote: String?
         for (name, value) in configuration.values(in: "extensions") {
             let normalizedName = name.lowercased()
             let normalizedValue = value.lowercased()
@@ -3828,6 +3886,9 @@ public actor Repository {
                     refStorage = value
                 }
                 understood = RefStorageFormat(rawValue: normalizedValue) != nil
+            case "partialclone":
+                promisorRemote = value
+                understood = !value.isEmpty
             case "noop":
                 understood = true
             default:
@@ -3896,6 +3957,17 @@ public actor Repository {
             access: access,
             objectFormat: objectFormat,
             refStorage: refStorage,
+            isShallow: try commonDirectory.exists(["shallow"]),
+            usesAlternates: try commonDirectory.exists([
+                "objects", "info", "alternates",
+            ]),
+            hasMultiPackIndex: try commonDirectory.exists([
+                "objects", "pack", "multi-pack-index",
+            ]) || commonDirectory.exists([
+                "objects", "pack", "multi-pack-index.d",
+                "multi-pack-index-chain",
+            ]),
+            promisorRemote: promisorRemote,
             index: indexCapabilities,
             repositoryExtensions: extensions,
             operations: operations,
@@ -4052,7 +4124,7 @@ private struct RepositoryCommitSource: CommitObjectSource {
     let store: RepositoryObjectStore
 
     func object(identifier: [UInt8]) async throws -> GitObject {
-        try store.read(identifier: identifier)
+        try store.commitGraphObject(identifier: identifier)
     }
 }
 

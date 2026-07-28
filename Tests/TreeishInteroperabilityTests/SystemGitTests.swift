@@ -2,6 +2,379 @@ import Foundation
 import Testing
 @testable import Treeish
 
+@Test(arguments: [false, true])
+func treeishReadsLooseAndPackedAlternateObjectDatabases(
+    packed: Bool
+) async throws {
+    let parent = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    let source = parent.appendingPathComponent("source")
+    let shared = parent.appendingPathComponent("shared")
+    try FileManager.default.createDirectory(
+        at: source,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: parent) }
+
+    func git(_ directory: URL, _ arguments: [String]) throws -> (Int32, String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory.path] + arguments
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "GIT_AUTHOR_NAME": "System Git",
+            "GIT_AUTHOR_EMAIL": "git@example.com",
+            "GIT_COMMITTER_NAME": "System Git",
+            "GIT_COMMITTER_EMAIL": "git@example.com",
+        ], uniquingKeysWith: { _, new in new })
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        return (
+            process.terminationStatus,
+            String(
+                decoding: output.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            )
+        )
+    }
+    #expect(try git(source, ["init"]).0 == 0)
+    try Data("alternate\n".utf8).write(
+        to: source.appendingPathComponent("file.txt")
+    )
+    #expect(try git(source, ["add", "file.txt"]).0 == 0)
+    #expect(try git(source, ["commit", "-m", "alternate"]).0 == 0)
+    let expected = try ObjectID(
+        hex: git(source, ["rev-parse", "HEAD"]).1
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    )
+    if packed {
+        #expect(try git(source, ["repack", "-ad"]).0 == 0)
+        #expect(try git(source, ["prune-packed"]).0 == 0)
+    }
+    let clone = Process()
+    clone.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+    clone.arguments = ["clone", "--shared", source.path, shared.path]
+    try clone.run()
+    clone.waitUntilExit()
+    #expect(clone.terminationStatus == 0)
+
+    let root = try await TreeishRoot.localDirectory(at: parent)
+    let repository = try await Treeish.open(
+        try await Treeish.discover(
+            in: root,
+            from: try GitPath("shared")
+        ),
+        roots: [root]
+    )
+    #expect(await repository.capabilities().usesAlternates)
+    #expect(try await repository.snapshot().headObjectID == expected)
+    #expect(try await repository.status().value().isClean)
+    #expect(
+        try await repository.log(from: [expected], limit: 1)
+            .value().first?.objectID == expected
+    )
+}
+
+@Test func treeishHonorsSystemGitShallowBoundaries() async throws {
+    let parent = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    let source = parent.appendingPathComponent("source")
+    let shallow = parent.appendingPathComponent("shallow")
+    try FileManager.default.createDirectory(
+        at: source,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: parent) }
+
+    func git(_ directory: URL, _ arguments: [String]) throws -> (Int32, String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory.path] + arguments
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "GIT_AUTHOR_NAME": "System Git",
+            "GIT_AUTHOR_EMAIL": "git@example.com",
+            "GIT_COMMITTER_NAME": "System Git",
+            "GIT_COMMITTER_EMAIL": "git@example.com",
+        ], uniquingKeysWith: { _, new in new })
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        return (
+            process.terminationStatus,
+            String(
+                decoding: output.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            )
+        )
+    }
+    #expect(try git(source, ["init"]).0 == 0)
+    for number in 1...4 {
+        try Data("\(number)\n".utf8).write(
+            to: source.appendingPathComponent("value.txt")
+        )
+        #expect(try git(source, ["add", "value.txt"]).0 == 0)
+        #expect(try git(source, ["commit", "-m", "commit \(number)"]).0 == 0)
+    }
+    let clone = Process()
+    clone.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+    clone.arguments = [
+        "clone", "--depth=2", source.absoluteString, shallow.path,
+    ]
+    try clone.run()
+    clone.waitUntilExit()
+    #expect(clone.terminationStatus == 0)
+    let head = try ObjectID(
+        hex: git(shallow, ["rev-parse", "HEAD"]).1
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    )
+    let boundary = try ObjectID(
+        hex: git(shallow, ["rev-parse", "HEAD~1"]).1
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    )
+
+    let root = try await TreeishRoot.localDirectory(at: parent)
+    let repository = try await Treeish.open(
+        try await Treeish.discover(
+            in: root,
+            from: try GitPath("shallow")
+        ),
+        roots: [root]
+    )
+    #expect(await repository.capabilities().isShallow)
+    let log = try await repository.log(from: [head]).value()
+    #expect(log.map(\.objectID) == [head, boundary])
+    #expect(log.last?.parents.isEmpty == true)
+}
+
+@Test func treeishAppliesSystemGitReplacementReferences() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    func git(
+        _ arguments: [String],
+        input: String? = nil
+    ) throws -> (Int32, String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory.path] + arguments
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "GIT_AUTHOR_NAME": "System Git",
+            "GIT_AUTHOR_EMAIL": "git@example.com",
+            "GIT_COMMITTER_NAME": "System Git",
+            "GIT_COMMITTER_EMAIL": "git@example.com",
+        ], uniquingKeysWith: { _, new in new })
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        if let input {
+            let standardInput = Pipe()
+            process.standardInput = standardInput
+            try process.run()
+            standardInput.fileHandleForWriting.write(Data(input.utf8))
+            try standardInput.fileHandleForWriting.close()
+        } else {
+            try process.run()
+        }
+        process.waitUntilExit()
+        return (
+            process.terminationStatus,
+            String(
+                decoding: output.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            )
+        )
+    }
+    #expect(try git(["init"]).0 == 0)
+    try Data("replacement\n".utf8).write(
+        to: directory.appendingPathComponent("file.txt")
+    )
+    #expect(try git(["add", "file.txt"]).0 == 0)
+    #expect(try git(["commit", "-m", "original message"]).0 == 0)
+    let original = try ObjectID(
+        hex: git(["rev-parse", "HEAD"]).1
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    )
+    let tree = try git(["rev-parse", "HEAD^{tree}"]).1
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    let replacementResult = try git(
+        ["commit-tree", tree],
+        input: "replacement message\n"
+    )
+    #expect(replacementResult.0 == 0)
+    let replacement = try ObjectID(
+        hex: replacementResult.1
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    )
+    #expect(
+        try git(["replace", original.description, replacement.description]).0
+            == 0
+    )
+
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.open(
+        try await Treeish.discover(in: root),
+        roots: [root]
+    )
+    let log = try await repository.log(from: [original], limit: 1).value()
+    #expect(log.first?.objectID == original)
+    #expect(log.first?.parents.isEmpty == true)
+    #expect(String(decoding: log.first?.message ?? [], as: UTF8.self)
+        == "replacement message\n")
+    let object = try await repository.readObject(original).value()
+    #expect(
+        String(decoding: object.payload, as: UTF8.self)
+            .contains("replacement message")
+    )
+
+    let updatedReplacementResult = try git(
+        ["commit-tree", tree],
+        input: "updated replacement message\n"
+    )
+    #expect(updatedReplacementResult.0 == 0)
+    let updatedReplacement = try ObjectID(
+        hex: updatedReplacementResult.1
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    )
+    let replacementReference = try RefName(
+        "refs/replace/\(original.description)"
+    )
+    _ = try await repository.updateReference(
+        replacementReference,
+        to: updatedReplacement,
+        expected: replacement
+    ).value()
+    let updatedObject = try await repository.readObject(original).value()
+    #expect(
+        String(decoding: updatedObject.payload, as: UTF8.self)
+            .contains("updated replacement message")
+    )
+
+    _ = try await repository.deleteReference(
+        replacementReference,
+        expected: updatedReplacement
+    ).value()
+    let restoredObject = try await repository.readObject(original).value()
+    #expect(
+        String(decoding: restoredObject.payload, as: UTF8.self)
+            .contains("original message")
+    )
+}
+
+@Test(arguments: [false, true])
+func treeishUsesSystemGitMultiPackIndexForObjectLookup(
+    incremental: Bool
+) async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    func git(_ arguments: [String]) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory.path] + arguments
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "GIT_AUTHOR_NAME": "System Git",
+            "GIT_AUTHOR_EMAIL": "git@example.com",
+            "GIT_COMMITTER_NAME": "System Git",
+            "GIT_COMMITTER_EMAIL": "git@example.com",
+        ], uniquingKeysWith: { _, new in new })
+        try process.run()
+        process.waitUntilExit()
+        #expect(process.terminationStatus == 0)
+    }
+    try git(["init"])
+    for number in 1...2 {
+        try Data("\(number)\n".utf8).write(
+            to: directory.appendingPathComponent("value.txt")
+        )
+        try git(["add", "value.txt"])
+        try git(["commit", "-m", "commit \(number)"])
+        try git(["repack", "-d"])
+        if incremental {
+            try git(["multi-pack-index", "write", "--incremental"])
+        }
+    }
+    if !incremental {
+        try git(["multi-pack-index", "write"])
+    }
+    let packDirectory = directory.appendingPathComponent(".git/objects/pack")
+    for file in try FileManager.default.contentsOfDirectory(
+        at: packDirectory,
+        includingPropertiesForKeys: nil
+    ) where file.pathExtension == "idx" {
+        try FileManager.default.removeItem(at: file)
+    }
+
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.open(
+        try await Treeish.discover(in: root),
+        roots: [root]
+    )
+    #expect(await repository.capabilities().hasMultiPackIndex)
+    let head = try #require(try await repository.snapshot().headObjectID)
+    #expect(try await repository.log(from: [head]).value().count == 2)
+    #expect(try await repository.status().value().isClean)
+}
+
+@Test func treeishRecognizesPromisorRepositoryConfiguration() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    func git(_ arguments: [String]) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory.path] + arguments
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "GIT_AUTHOR_NAME": "System Git",
+            "GIT_AUTHOR_EMAIL": "git@example.com",
+            "GIT_COMMITTER_NAME": "System Git",
+            "GIT_COMMITTER_EMAIL": "git@example.com",
+        ], uniquingKeysWith: { _, new in new })
+        try process.run()
+        process.waitUntilExit()
+        #expect(process.terminationStatus == 0)
+    }
+    try git(["init"])
+    try Data("promisor\n".utf8).write(
+        to: directory.appendingPathComponent("file.txt")
+    )
+    try git(["add", "file.txt"])
+    try git(["commit", "-m", "promisor"])
+    try git(["config", "core.repositoryformatversion", "1"])
+    try git(["config", "extensions.partialClone", "origin"])
+    try git(["config", "remote.origin.url", "https://example.com/repository.git"])
+    try git(["config", "remote.origin.promisor", "true"])
+    try git(["config", "remote.origin.partialclonefilter", "blob:none"])
+
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.open(
+        try await Treeish.discover(in: root),
+        roots: [root]
+    )
+    let capabilities = await repository.capabilities()
+    #expect(capabilities.promisorRemote == "origin")
+    #expect(capabilities.access == .readWrite)
+    #expect(try await repository.status().value().isClean)
+}
+
 @Test func treeishReadsSystemGitReftableStack() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString)

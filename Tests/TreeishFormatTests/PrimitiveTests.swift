@@ -390,13 +390,31 @@ import Testing
     let fetch = try UploadPackV2.fetchRequest(
         wants: [object],
         shallow: [object],
-        depth: 2,
+        deepen: 2,
         filter: "blob:none",
         capabilities: capabilities
     )
     #expect(String(decoding: fetch, as: UTF8.self).contains("command=fetch"))
     #expect(String(decoding: fetch, as: UTF8.self).contains("filter blob:none"))
     #expect(String(decoding: fetch, as: UTF8.self).contains("deepen 2"))
+    let since = try UploadPackV2.fetchRequest(
+        wants: [object],
+        deepenSince: 1_700_000_000,
+        capabilities: capabilities
+    )
+    #expect(
+        String(decoding: since, as: UTF8.self)
+            .contains("deepen-since 1700000000")
+    )
+    let excluding = try UploadPackV2.fetchRequest(
+        wants: [object],
+        deepenNot: ["refs/heads/archive"],
+        capabilities: capabilities
+    )
+    #expect(
+        String(decoding: excluding, as: UTF8.self)
+            .contains("deepen-not refs/heads/archive")
+    )
     let pack = Array("PACKpayload".utf8)
     let response = try UploadPackV2.parseFetchResponse([
         .data(Array("acknowledgments\n".utf8)),
@@ -417,7 +435,7 @@ import Testing
     let request = try UploadPackV0.fetchRequest(
         wants: [object],
         shallow: [object],
-        depth: 3,
+        deepen: 3,
         filter: "blob:limit=1024",
         capabilities: ["filter", "shallow", "side-band-64k"]
     )

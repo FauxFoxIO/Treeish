@@ -255,7 +255,7 @@ public enum Treeish {
                     ]
                 } ?? [],
                 filter: request.filter,
-                depth: request.depth
+                shallow: request.shallow
             ),
             services: services
         ).value()

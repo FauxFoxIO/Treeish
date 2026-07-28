@@ -97,12 +97,19 @@ public enum UploadPackV0 {
         wants: [[UInt8]],
         haves: [[UInt8]] = [],
         shallow: [[UInt8]] = [],
-        depth: UInt32? = nil,
+        deepen: UInt32? = nil,
+        deepenSince: Int64? = nil,
+        deepenNot: [String] = [],
         filter: String? = nil,
         objectFormat: GitHashAlgorithm = .sha1,
         capabilities advertised: Set<String>
     ) throws -> [UInt8] {
-        guard !wants.isEmpty else { throw UploadPackError.invalidObjectID }
+        guard !wants.isEmpty,
+              !(deepen != nil
+                  && (deepenSince != nil || !deepenNot.isEmpty)),
+              deepenNot.count <= 1_024 else {
+            throw UploadPackError.invalidObjectID
+        }
         var supported = [
             "multi_ack_detailed", "side-band-64k", "ofs-delta", "include-tag",
         ]
@@ -118,11 +125,24 @@ public enum UploadPackV0 {
             }
             supported.append("filter")
         }
-        if !shallow.isEmpty || depth != nil {
+        if !shallow.isEmpty || deepen != nil || deepenSince != nil
+            || !deepenNot.isEmpty {
             guard advertised.contains("shallow") else {
                 throw UploadPackError.malformedAdvertisement
             }
             supported.append("shallow")
+        }
+        if deepenSince != nil {
+            guard advertised.contains("deepen-since") else {
+                throw UploadPackError.malformedAdvertisement
+            }
+            supported.append("deepen-since")
+        }
+        if !deepenNot.isEmpty {
+            guard advertised.contains("deepen-not") else {
+                throw UploadPackError.malformedAdvertisement
+            }
+            supported.append("deepen-not")
         }
         let selected = supported.filter(advertised.contains)
         var output: [UInt8] = []
@@ -145,12 +165,28 @@ public enum UploadPackV0 {
                 .data(Array("shallow \(hex(identifier))\n".utf8))
             )
         }
-        if let depth {
-            guard depth > 0 else {
+        if let deepen {
+            guard deepen > 0 else {
                 throw UploadPackError.malformedAdvertisement
             }
             output += try PacketLineEncoder.encode(
-                .data(Array("deepen \(depth)\n".utf8))
+                .data(Array("deepen \(deepen)\n".utf8))
+            )
+        }
+        if let deepenSince {
+            guard deepenSince >= 0 else {
+                throw UploadPackError.malformedAdvertisement
+            }
+            output += try PacketLineEncoder.encode(
+                .data(Array("deepen-since \(deepenSince)\n".utf8))
+            )
+        }
+        for revision in deepenNot {
+            guard validRevision(revision) else {
+                throw UploadPackError.malformedAdvertisement
+            }
+            output += try PacketLineEncoder.encode(
+                .data(Array("deepen-not \(revision)\n".utf8))
             )
         }
         if let filter {
@@ -362,12 +398,18 @@ public enum UploadPackV2 {
         wants: [[UInt8]],
         haves: [[UInt8]] = [],
         shallow: [[UInt8]] = [],
-        depth: UInt32? = nil,
+        deepen: UInt32? = nil,
+        deepenSince: Int64? = nil,
+        deepenNot: [String] = [],
         filter: String? = nil,
         objectFormat: GitHashAlgorithm = .sha1,
         capabilities: UploadPackV2Capabilities
     ) throws -> [UInt8] {
-        guard !wants.isEmpty, capabilities.supports("fetch") else {
+        guard !wants.isEmpty,
+              capabilities.supports("fetch"),
+              !(deepen != nil
+                  && (deepenSince != nil || !deepenNot.isEmpty)),
+              deepenNot.count <= 1_024 else {
             throw UploadPackError.invalidObjectID
         }
         var output = try PacketLineEncoder.encode(.data(Array("command=fetch\n".utf8)))
@@ -391,7 +433,8 @@ public enum UploadPackV2 {
                 .data(Array("filter \(filter)\n".utf8))
             )
         }
-        if !shallow.isEmpty || depth != nil {
+        if !shallow.isEmpty || deepen != nil || deepenSince != nil
+            || !deepenNot.isEmpty {
             guard capabilities.feature("fetch", includes: "shallow") else {
                 throw UploadPackError.malformedAdvertisement
             }
@@ -403,12 +446,28 @@ public enum UploadPackV2 {
                     .data(Array("shallow \(hexV2(identifier))\n".utf8))
                 )
             }
-            if let depth {
-                guard depth > 0 else {
+            if let deepen {
+                guard deepen > 0 else {
                     throw UploadPackError.malformedAdvertisement
                 }
                 output += try PacketLineEncoder.encode(
-                    .data(Array("deepen \(depth)\n".utf8))
+                    .data(Array("deepen \(deepen)\n".utf8))
+                )
+            }
+            if let deepenSince {
+                guard deepenSince >= 0 else {
+                    throw UploadPackError.malformedAdvertisement
+                }
+                output += try PacketLineEncoder.encode(
+                    .data(Array("deepen-since \(deepenSince)\n".utf8))
+                )
+            }
+            for revision in deepenNot {
+                guard validRevision(revision) else {
+                    throw UploadPackError.malformedAdvertisement
+                }
+                output += try PacketLineEncoder.encode(
+                    .data(Array("deepen-not \(revision)\n".utf8))
                 )
             }
         }
@@ -500,6 +559,13 @@ private func validFilter(_ value: String) -> Bool {
     !value.isEmpty
         && value.utf8.count <= 4_096
         && value.utf8.allSatisfy { (0x21...0x7e).contains($0) }
+}
+
+private func validRevision(_ value: String) -> Bool {
+    !value.isEmpty
+        && value.utf8.count <= 4_096
+        && !value.contains("\0")
+        && !value.contains("\n")
 }
 
 private func linePayload<C: Collection>(

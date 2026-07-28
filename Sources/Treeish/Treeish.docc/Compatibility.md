@@ -32,9 +32,10 @@ capability. Filtered and demand-fetched packs carry standard `.promisor`
 markers. Checkout materializes omitted tree and blob objects before beginning
 its recoverable worktree transaction.
 
-``FetchRequest/depth`` and ``CloneRequest/depth`` negotiate commit depth over
-protocol v0 or v2. Server `shallow` and `unshallow` responses update the
-standard shallow-boundary file before fetched references are published.
+``FetchRequest/shallow`` and ``CloneRequest/shallow`` negotiate commit depth,
+timestamp cutoffs, excluded revisions, or complete unshallowing over protocol
+v0 or v2. Server `shallow` and `unshallow` responses update the standard
+shallow-boundary file before fetched references are published.
 
 Receive-pack selects `report-status-v2` ahead of `report-status`, requests
 `atomic` only for atomic pushes, frames standard push options, and refuses

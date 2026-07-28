@@ -406,12 +406,20 @@ extension FetchRefspec {
     }
 }
 
+public enum GitShallowRequest: Sendable, Hashable, Codable {
+    case depth(UInt32)
+    case since(secondsSinceEpoch: Int64)
+    case excluding([String])
+    case sinceExcluding(secondsSinceEpoch: Int64, revisions: [String])
+    case unshallow
+}
+
 public struct FetchRequest: Sendable, Hashable {
     public let remote: RemoteURL
     public let remoteName: String
     public let refspecs: [FetchRefspec]
     public let filter: GitObjectFilter?
-    public let depth: UInt32?
+    public let shallow: GitShallowRequest?
     public let prune: Bool
     let requiresMatch: Bool
 
@@ -420,14 +428,14 @@ public struct FetchRequest: Sendable, Hashable {
         remoteName: String = "origin",
         refspecs: [FetchRefspec] = [],
         filter: GitObjectFilter? = nil,
-        depth: UInt32? = nil,
+        shallow: GitShallowRequest? = nil,
         prune: Bool = false
     ) throws {
         guard !remoteName.isEmpty,
               remoteName.allSatisfy({
                   $0.isLetter || $0.isNumber || "-_.".contains($0)
               }),
-              depth.map({ $0 > 0 }) ?? true
+              Self.valid(shallow)
         else { throw TreeishError.invalidRefName }
         self.remote = remote
         self.remoteName = remoteName
@@ -443,8 +451,38 @@ public struct FetchRequest: Sendable, Hashable {
             self.refspecs = refspecs
         }
         self.filter = filter
-        self.depth = depth
+        self.shallow = shallow
         self.prune = prune
+    }
+
+    fileprivate static func valid(_ request: GitShallowRequest?) -> Bool {
+        switch request {
+        case .none, .some(.unshallow):
+            return true
+        case .some(.depth(let depth)):
+            return depth > 0 && depth <= UInt32(Int32.max)
+        case .some(.since(let seconds)):
+            return seconds >= 0
+        case .some(.excluding(let revisions)):
+            return !revisions.isEmpty
+                && revisions.count <= 1_024
+                && revisions.allSatisfy {
+                    !$0.isEmpty
+                        && $0.utf8.count <= 4_096
+                        && !$0.contains("\0")
+                        && !$0.contains("\n")
+                }
+        case .some(.sinceExcluding(let seconds, let revisions)):
+            return seconds >= 0
+                && !revisions.isEmpty
+                && revisions.count <= 1_024
+                && revisions.allSatisfy {
+                    !$0.isEmpty
+                        && $0.utf8.count <= 4_096
+                        && !$0.contains("\0")
+                        && !$0.contains("\n")
+                }
+        }
     }
 }
 
@@ -476,7 +514,7 @@ public struct CloneRequest: Sendable, Hashable {
     public let branch: RefName?
     public let remoteName: String
     public let filter: GitObjectFilter?
-    public let depth: UInt32?
+    public let shallow: GitShallowRequest?
 
     public init(
         remote: RemoteURL,
@@ -484,20 +522,20 @@ public struct CloneRequest: Sendable, Hashable {
         branch: RefName? = nil,
         remoteName: String = "origin",
         filter: GitObjectFilter? = nil,
-        depth: UInt32? = nil
+        shallow: GitShallowRequest? = nil
     ) throws {
         guard branch == nil || branch?.description.hasPrefix("refs/heads/") == true,
               !remoteName.isEmpty,
               remoteName.allSatisfy({ $0.isLetter || $0.isNumber || "-_ .".contains($0) }),
               !remoteName.contains(" "),
-              depth.map({ $0 > 0 }) ?? true
+              FetchRequest.valid(shallow)
         else { throw TreeishError.invalidRefName }
         self.remote = remote
         self.destination = destination
         self.branch = branch
         self.remoteName = remoteName
         self.filter = filter
-        self.depth = depth
+        self.shallow = shallow
     }
 }
 

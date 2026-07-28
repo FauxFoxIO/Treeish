@@ -877,12 +877,43 @@ public actor Repository {
                 directory: common,
                 objectFormat: store.objectFormat
             )
+            let deepen: UInt32?
+            let deepenSince: Int64?
+            let deepenNot: [String]
+            switch request.shallow {
+            case .none:
+                deepen = nil
+                deepenSince = nil
+                deepenNot = []
+            case .depth(let depth):
+                deepen = depth
+                deepenSince = nil
+                deepenNot = []
+            case .since(let seconds):
+                deepen = nil
+                deepenSince = seconds
+                deepenNot = []
+            case .excluding(let revisions):
+                deepen = nil
+                deepenSince = nil
+                deepenNot = revisions
+            case .sinceExcluding(let seconds, let revisions):
+                deepen = nil
+                deepenSince = seconds
+                deepenNot = revisions
+            case .unshallow:
+                deepen = UInt32(Int32.max)
+                deepenSince = nil
+                deepenNot = []
+            }
             let body = if let v2Capabilities {
                 try UploadPackV2.fetchRequest(
                     wants: wants,
                     haves: haves,
                     shallow: Array(existingShallow),
-                    depth: request.depth,
+                    deepen: deepen,
+                    deepenSince: deepenSince,
+                    deepenNot: deepenNot,
                     filter: request.filter?.rawValue,
                     objectFormat: store.objectFormat,
                     capabilities: v2Capabilities
@@ -892,7 +923,9 @@ public actor Repository {
                     wants: wants,
                     haves: haves,
                     shallow: Array(existingShallow),
-                    depth: request.depth,
+                    deepen: deepen,
+                    deepenSince: deepenSince,
+                    deepenNot: deepenNot,
                     filter: request.filter?.rawValue,
                     objectFormat: store.objectFormat,
                     capabilities: advertisement.capabilities

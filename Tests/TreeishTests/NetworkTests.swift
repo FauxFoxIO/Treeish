@@ -247,7 +247,11 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
     let root = try await TreeishRoot.localDirectory(at: directory)
     let repository = try await Treeish.initialize(in: root)
     let result = try await repository.fetch(
-        try FetchRequest(remote: remote, filter: .blobNone, depth: 2),
+        try FetchRequest(
+            remote: remote,
+            filter: .blobNone,
+            shallow: .depth(2)
+        ),
         services: RepositoryServices(
             credentials: GitHubTokenCredentials(token: "secret"),
             httpTransport: transport

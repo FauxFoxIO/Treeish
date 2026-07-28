@@ -1111,6 +1111,15 @@ func systemGitRecognizesTreeishLinkedWorktree(
         Issue.record("expected clean rename/modify merge")
         return
     }
+    #expect(
+        try await repository.headReflog().first?.message
+            .hasPrefix("merge \(theirs): Merge made by Treeish") == true
+    )
+    #expect(
+        try await repository.reflog(
+            for: try RefName("refs/heads/main")
+        ).first?.message.hasPrefix("merge \(theirs):") == true
+    )
     #expect(try Data(contentsOf: renamed) == Data("modified on other side\n".utf8))
     #expect(!FileManager.default.fileExists(atPath: file.path))
     #expect(
@@ -1377,6 +1386,116 @@ func treeishReadsSystemGitReflogsAndRevisionSelectors(
         ) == first
     )
     #expect(try await repository.headReflog().first?.current == second)
+}
+
+@Test(arguments: [RefStorageFormat.files, .reftable])
+func checkoutMovesOnlyHeadAndResetLogsResolvedHead(
+    refStorage: RefStorageFormat
+) async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.initialize(
+        in: root,
+        options: RepositoryInitialization(refStorage: refStorage)
+    )
+    let signature = Signature(
+        name: "Treeish",
+        email: "treeish@example.com",
+        secondsSinceEpoch: 1_700_000_000,
+        timeZoneOffsetMinutes: 0
+    )
+    let file = directory.appendingPathComponent("value.txt")
+
+    func commit(_ value: String, parents: [ObjectID]) async throws -> ObjectID {
+        try Data(value.utf8).write(to: file)
+        _ = try await repository.stage(
+            StageRequest(pathspecs: [try GitPathspec("value.txt")])
+        ).value()
+        return try await repository.commit(
+            CommitRequest(
+                tree: try await repository.writeIndexTree().value(),
+                parents: parents,
+                author: signature,
+                committer: signature,
+                message: Array("\(value)\n".utf8)
+            )
+        ).value().objectID
+    }
+
+    let base = try await commit("base", parents: [])
+    let feature = try RefName("refs/heads/feature")
+    _ = try await repository.createBranch(
+        named: "feature",
+        at: base,
+        reflog: ReflogMetadata(
+            signature: signature,
+            message: "branch: Created from main"
+        )
+    ).value()
+    let mainTip = try await commit("main", parents: [base])
+    await #expect(throws: TreeishError.referenceChanged) {
+        _ = try await repository.checkout(
+            CheckoutRequest(commit: mainTip, reference: feature)
+        ).value()
+    }
+    #expect(try await repository.resolveReference(feature) == base)
+    let checkoutLog = ReflogMetadata(
+        signature: signature,
+        message: "checkout: moving from main to feature"
+    )
+    _ = try await repository.checkout(
+        CheckoutRequest(
+            commit: base,
+            reference: feature,
+            reflog: checkoutLog
+        )
+    ).value()
+
+    #expect(
+        try await repository.resolveReference(
+            try RefName("refs/heads/main")
+        ) == mainTip
+    )
+    #expect(try await repository.resolveReference(feature) == base)
+    #expect(try await repository.snapshot().headReference == feature)
+    #expect(try await repository.headReflog().first?.message == checkoutLog.message)
+    #expect(
+        try await repository.reflog(for: feature).contains {
+            $0.message == checkoutLog.message
+        } == false
+    )
+
+    let resetLog = ReflogMetadata(
+        signature: signature,
+        message: "reset: moving to \(mainTip)"
+    )
+    _ = try await repository.reset(
+        ResetRequest(commit: mainTip, mode: .hard, reflog: resetLog)
+    ).value()
+    #expect(try await repository.resolveReference(feature) == mainTip)
+    #expect(try await repository.headReflog().first?.message == resetLog.message)
+    #expect(try await repository.reflog(for: feature).first?.message == resetLog.message)
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+    process.arguments = ["-C", directory.path, "symbolic-ref", "HEAD"]
+    let output = Pipe()
+    process.standardOutput = output
+    try process.run()
+    process.waitUntilExit()
+    #expect(process.terminationStatus == 0)
+    #expect(
+        String(
+            decoding: output.fileHandleForReading.readDataToEndOfFile(),
+            as: UTF8.self
+        ) == "refs/heads/feature\n"
+    )
 }
 
 @Test func treeishTraversesSystemGitDeltaPackAfterGC() async throws {
@@ -1798,6 +1917,15 @@ func treeishReadsSystemGitReflogsAndRevisionSelectors(
         return
     }
     #expect(try Data(contentsOf: file) == Data("ONE\ntwo\nTHREE\n".utf8))
+    #expect(
+        try await repository.headReflog().first?.message
+            .hasPrefix("cherry-pick:") == true
+    )
+    #expect(
+        try await repository.reflog(
+            for: try RefName("refs/heads/main")
+        ).first?.message.hasPrefix("cherry-pick:") == true
+    )
 
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/git")

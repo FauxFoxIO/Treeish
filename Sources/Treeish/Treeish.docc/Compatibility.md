@@ -21,6 +21,12 @@ File and reftable repositories support numbered and date-based reflog revision
 selectors. Stack publication uses the standard `tables.list.lock`
 compare-and-swap boundary.
 
+Branch checkout validates that the requested branch already names the requested
+commit and moves only symbolic `HEAD`; it never rewrites the branch as a side
+effect. ``CheckoutRequest/reflog`` and ``ResetRequest/reflog`` let the host
+supply the identity and message used for the corresponding `HEAD` and branch
+reflogs.
+
 Object lookup follows root-contained alternate object databases and classic or
 incremental multi-pack indexes. Revision traversal honors `shallow` boundaries
 and replacement references. Partial-clone configuration is reported through

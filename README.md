@@ -293,8 +293,9 @@ decisions for the host app.
 ### Everyday Git
 
 - initialize, discover, open, clone, fetch, and push;
-- staged and unstaged status, sparse-aware stage and checkout, commit, restore,
-  and reset;
+- staged and unstaged status, sparse-aware stage and reference-preserving
+  checkout, commit, restore, and reset, with caller-supplied checkout/reset
+  reflog identities;
 - branches, lightweight and annotated tags, and linked worktrees;
 - `.gitmodules` parsing, gitlink-aware status, and bounded native submodule
   initialization and exact-commit updates;

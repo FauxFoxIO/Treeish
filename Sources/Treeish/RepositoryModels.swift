@@ -199,15 +199,18 @@ public struct CheckoutRequest: Sendable, Hashable, Codable {
     public let commit: ObjectID
     public let reference: RefName?
     public let force: Bool
+    public let reflog: ReflogMetadata?
 
     public init(
         commit: ObjectID,
         reference: RefName? = nil,
-        force: Bool = false
+        force: Bool = false,
+        reflog: ReflogMetadata? = nil
     ) {
         self.commit = commit
         self.reference = reference
         self.force = force
+        self.reflog = reflog
     }
 }
 
@@ -232,10 +235,16 @@ public enum ResetMode: String, Sendable, Hashable, Codable {
 public struct ResetRequest: Sendable, Hashable, Codable {
     public let commit: ObjectID
     public let mode: ResetMode
+    public let reflog: ReflogMetadata?
 
-    public init(commit: ObjectID, mode: ResetMode = .mixed) {
+    public init(
+        commit: ObjectID,
+        mode: ResetMode = .mixed,
+        reflog: ReflogMetadata? = nil
+    ) {
         self.commit = commit
         self.mode = mode
+        self.reflog = reflog
     }
 }
 

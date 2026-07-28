@@ -1892,17 +1892,19 @@ public actor Repository {
                     entries: entries
                 ))
                 if let reference = request.reference {
-                    try Repository.publishCheckoutReferences(
+                    try Repository.publishCheckoutHead(
                         headDirectory: headDirectory,
                         refsDirectory: refsDirectory,
                         reference: reference,
-                        value: request.commit
+                        value: request.commit,
+                        reflog: request.reflog
                     )
                 } else {
                     try Repository.publishDetachedHead(
                         headDirectory: headDirectory,
                         refsDirectory: refsDirectory,
-                        value: request.commit
+                        value: request.commit,
+                        reflog: request.reflog
                     )
                 }
                 try transaction.commit()
@@ -1947,19 +1949,21 @@ public actor Repository {
             )
             func publishReference() throws {
                 if let reference = head.reference {
-                    try Repository.publishReference(
-                        directory: refsDirectory,
+                    try Repository.publishCurrentReference(
+                        headDirectory: headDirectory,
+                        refsDirectory: refsDirectory,
                         name: reference,
                         value: request.commit,
                         expected: head.objectID,
                         requireMissing: head.objectID == nil,
-                        reflog: nil
+                        reflog: request.reflog
                     )
                 } else {
                     try Repository.publishDetachedHead(
                         headDirectory: headDirectory,
                         refsDirectory: refsDirectory,
-                        value: request.commit
+                        value: request.commit,
+                        reflog: request.reflog
                     )
                 }
             }
@@ -2392,13 +2396,18 @@ public actor Repository {
                     worktree: worktree,
                     store: store
                 )
-                try Repository.publishReference(
-                    directory: refsDirectory,
+                let reflog = ReflogMetadata(
+                    signature: request.committer,
+                    message: "merge \(request.other.description): Fast-forward"
+                )
+                try Repository.publishCurrentReference(
+                    headDirectory: headDirectory,
+                    refsDirectory: refsDirectory,
                     name: headReference,
                     value: request.other,
                     expected: ours,
                     requireMissing: false,
-                    reflog: nil
+                    reflog: reflog
                 )
                 return .fastForward(from: ours, to: request.other)
             }
@@ -2464,13 +2473,17 @@ public actor Repository {
             )
             let commitBytes = try store.write(commitObject)
             let commitID = try ObjectID(bytes: commitBytes)
-            try Repository.publishReference(
-                directory: refsDirectory,
+            try Repository.publishCurrentReference(
+                headDirectory: headDirectory,
+                refsDirectory: refsDirectory,
                 name: headReference,
                 value: commitID,
                 expected: ours,
                 requireMissing: false,
-                reflog: nil
+                reflog: ReflogMetadata(
+                    signature: request.committer,
+                    message: "merge \(request.other.description): Merge made by Treeish"
+                )
             )
             try Repository.clearMergeState(in: headDirectory)
             return .merged(commitID)
@@ -2521,8 +2534,9 @@ public actor Repository {
                 message: request.message ?? storedMessage
             )
             let identifier = try ObjectID(bytes: store.write(commit))
-            try Repository.publishReference(
-                directory: refsDirectory,
+            try Repository.publishCurrentReference(
+                headDirectory: headDirectory,
+                refsDirectory: refsDirectory,
                 name: reference,
                 value: identifier,
                 expected: ours,
@@ -2661,7 +2675,9 @@ public actor Repository {
                 committer: request.committer,
                 message: message,
                 store: store,
-                refsDirectory: refsDirectory
+                headDirectory: headDirectory,
+                refsDirectory: refsDirectory,
+                reflogAction: "cherry-pick"
             )
             try Repository.clearCherryPickState(in: headDirectory)
             return .committed(identifier)
@@ -2704,7 +2720,9 @@ public actor Repository {
                 committer: request.committer,
                 message: request.message ?? stored,
                 store: store,
-                refsDirectory: refsDirectory
+                headDirectory: headDirectory,
+                refsDirectory: refsDirectory,
+                reflogAction: "cherry-pick"
             )
             try Repository.clearCherryPickState(in: headDirectory)
             return CommitResult(objectID: identifier, updatedReference: reference)
@@ -2789,13 +2807,17 @@ public actor Repository {
                 worktree: worktree,
                 store: store
             )
-            try Repository.publishReference(
-                directory: refsDirectory,
+            try Repository.publishCurrentReference(
+                headDirectory: headDirectory,
+                refsDirectory: refsDirectory,
                 name: reference,
                 value: request.onto,
                 expected: original,
                 requireMissing: false,
-                reflog: nil
+                reflog: ReflogMetadata(
+                    signature: request.committer,
+                    message: "rebase (start): checkout \(request.onto.description)"
+                )
             )
             var state = RebaseState(
                 original: original,
@@ -2851,7 +2873,9 @@ public actor Repository {
                 committer: state.committer,
                 message: picked.message,
                 store: store,
-                refsDirectory: refsDirectory
+                headDirectory: headDirectory,
+                refsDirectory: refsDirectory,
+                reflogAction: "rebase (continue)"
             )
             state.current = nil
             try Repository.writeRebaseState(state, in: headDirectory)
@@ -2887,13 +2911,17 @@ public actor Repository {
                 worktree: worktree,
                 store: store
             )
-            try Repository.publishReference(
-                directory: refsDirectory,
+            try Repository.publishCurrentReference(
+                headDirectory: headDirectory,
+                refsDirectory: refsDirectory,
                 name: state.reference,
                 value: state.original,
                 expected: state.currentHead,
                 requireMissing: false,
-                reflog: nil
+                reflog: ReflogMetadata(
+                    signature: state.committer,
+                    message: "rebase (abort): returning to \(state.reference.description)"
+                )
             )
             try Repository.clearRebaseState(in: headDirectory)
             return state.original
@@ -3006,17 +3034,19 @@ public actor Repository {
             }
             try indexStore.write(try GitIndex.decode(state.indexBytes))
             if let reference = state.headReference, let identifier = state.headObjectID {
-                try Repository.publishCheckoutReferences(
+                try Repository.publishCheckoutHead(
                     headDirectory: headDirectory,
                     refsDirectory: refsDirectory,
                     reference: reference,
-                    value: identifier
+                    value: identifier,
+                    reflog: nil
                 )
             } else if let identifier = state.headObjectID {
                 try Repository.publishDetachedHead(
                     headDirectory: headDirectory,
                     refsDirectory: refsDirectory,
-                    value: identifier
+                    value: identifier,
+                    reflog: nil
                 )
             }
             return state
@@ -3624,27 +3654,18 @@ public actor Repository {
             )
             let bytes = try store.write(object)
             let identifier = try ObjectID(bytes: bytes)
-            try Repository.publishReference(
-                directory: refsDirectory,
+            let reflog = ReflogMetadata(
+                signature: request.committer,
+                message: "commit: \(String(decoding: request.message, as: UTF8.self).split(separator: "\n").first.map(String.init) ?? "")"
+            )
+            try Repository.publishCurrentReference(
+                headDirectory: headDirectory,
+                refsDirectory: refsDirectory,
                 name: reference,
                 value: identifier,
                 expected: head.objectID,
                 requireMissing: head.objectID == nil,
-                reflog: ReflogMetadata(
-                    signature: request.committer,
-                    message: "commit: \(String(decoding: request.message, as: UTF8.self).split(separator: "\n").first.map(String.init) ?? "")"
-                )
-            )
-            try Repository.appendHeadReflog(
-                headDirectory: headDirectory,
-                refsDirectory: refsDirectory,
-                reference: reference,
-                previous: head.objectID,
-                current: identifier,
-                metadata: ReflogMetadata(
-                    signature: request.committer,
-                    message: "commit: \(String(decoding: request.message, as: UTF8.self).split(separator: "\n").first.map(String.init) ?? "")"
-                )
+                reflog: reflog
             )
             return CommitResult(
                 objectID: identifier,
@@ -3976,47 +3997,150 @@ public actor Repository {
         )
     }
 
-    private static func appendHeadReflog(
+    private static func headReftableUpdate(
+        value: ReftableReferenceValue,
+        objectFormat: ObjectHashAlgorithm,
+        previous: ObjectID?,
+        current: ObjectID,
+        metadata: ReflogMetadata?
+    ) throws -> ReftableUpdate {
+        let zero = try ObjectID(
+            algorithm: objectFormat,
+            bytes: [UInt8](repeating: 0, count: objectFormat.byteCount)
+        )
+        return ReftableUpdate(
+            name: try RefName("HEAD"),
+            value: value,
+            expected: .any,
+            reflog: metadata,
+            reflogObjects: metadata.map { _ in
+                ReftableLogObjects(
+                    previous: previous ?? zero,
+                    current: current
+                )
+            }
+        )
+    }
+
+    private static func publishCurrentReference(
+        headDirectory: RootDirectory,
+        refsDirectory: RootDirectory,
+        name: RefName,
+        value: ObjectID,
+        expected: ObjectID?,
+        requireMissing: Bool,
+        reflog: ReflogMetadata?
+    ) throws {
+        guard let reflog else {
+            try publishReference(
+                directory: refsDirectory,
+                name: name,
+                value: value,
+                expected: expected,
+                requireMissing: requireMissing,
+                reflog: nil
+            )
+            return
+        }
+        let storage = try referenceStorage(directory: refsDirectory)
+        if storage.format == .reftable {
+            let expectation: ReftableExpectedValue = if requireMissing {
+                .missing
+            } else if let expected {
+                .direct(expected)
+            } else {
+                .any
+            }
+            let branch = ReftableUpdate(
+                name: name,
+                value: .direct(value, peeled: nil),
+                expected: expectation,
+                reflog: reflog
+            )
+            let head = try headReftableUpdate(
+                value: .symbolic(name),
+                objectFormat: storage.objectFormat,
+                previous: expected,
+                current: value,
+                metadata: reflog
+            )
+            if headDirectory.identity == refsDirectory.identity {
+                try ReftableStack(
+                    directory: refsDirectory,
+                    objectFormat: storage.objectFormat
+                ).append([branch, head])
+            } else {
+                try ReftableStack(
+                    directory: refsDirectory,
+                    objectFormat: storage.objectFormat
+                ).append([branch])
+                try ReftableStack(
+                    directory: headDirectory,
+                    objectFormat: storage.objectFormat
+                ).append([head])
+            }
+            return
+        }
+        try publishReference(
+            directory: refsDirectory,
+            name: name,
+            value: value,
+            expected: expected,
+            requireMissing: requireMissing,
+            reflog: reflog
+        )
+        try appendReflog(
+            directory: headDirectory,
+            name: try RefName("HEAD"),
+            previous: expected,
+            current: value,
+            metadata: reflog
+        )
+    }
+
+    private static func publishCheckoutHead(
         headDirectory: RootDirectory,
         refsDirectory: RootDirectory,
         reference: RefName,
         previous: ObjectID?,
         current: ObjectID,
-        metadata: ReflogMetadata
+        metadata: ReflogMetadata?
     ) throws {
+        guard try readReference(
+            directory: refsDirectory,
+            name: reference
+        ) == current else {
+            throw TreeishError.referenceChanged
+        }
         let storage = try referenceStorage(directory: refsDirectory)
         if storage.format == .reftable {
-            let zero = try ObjectID(
-                algorithm: storage.objectFormat,
-                bytes: [UInt8](
-                    repeating: 0,
-                    count: storage.objectFormat.byteCount
-                )
-            )
             try ReftableStack(
                 directory: headDirectory,
                 objectFormat: storage.objectFormat
             ).append([
-                ReftableUpdate(
-                    name: try RefName("HEAD"),
+                try headReftableUpdate(
                     value: .symbolic(reference),
-                    expected: .any,
-                    reflog: metadata,
-                    reflogObjects: ReftableLogObjects(
-                        previous: previous ?? zero,
-                        current: current
-                    )
+                    objectFormat: storage.objectFormat,
+                    previous: previous,
+                    current: current,
+                    metadata: metadata
                 ),
             ])
             return
         }
-        try appendReflog(
-            directory: headDirectory,
-            name: try RefName("HEAD"),
-            previous: previous,
-            current: current,
-            metadata: metadata
+        try headDirectory.writeAtomically(
+            Array("ref: \(reference.description)\n".utf8),
+            to: ["HEAD"]
         )
+        if let metadata {
+            try appendReflog(
+                directory: headDirectory,
+                name: try RefName("HEAD"),
+                previous: previous,
+                current: current,
+                metadata: metadata
+            )
+        }
     }
 
     private static func publishReference(
@@ -4106,77 +4230,49 @@ public actor Repository {
         )
     }
 
-    private static func publishCheckoutReferences(
+    private static func publishCheckoutHead(
         headDirectory: RootDirectory,
         refsDirectory: RootDirectory,
         reference: RefName,
-        value: ObjectID
+        value: ObjectID,
+        reflog: ReflogMetadata?
     ) throws {
-        let storage = try referenceStorage(directory: refsDirectory)
-        if storage.format == .reftable {
-            let prior = try? readReference(
-                directory: refsDirectory,
-                name: reference
-            )
-            let branchUpdate = ReftableUpdate(
-                    name: reference,
-                    value: .direct(value, peeled: nil),
-                    expected: prior.map(ReftableExpectedValue.direct) ?? .missing,
-                    reflog: nil
-                )
-            let headUpdate = ReftableUpdate(
-                name: try RefName("HEAD"),
-                value: .symbolic(reference),
-                expected: .any,
-                reflog: nil
-            )
-            if headDirectory.identity == refsDirectory.identity {
-                try ReftableStack(
-                    directory: refsDirectory,
-                    objectFormat: storage.objectFormat
-                ).append([headUpdate, branchUpdate])
-            } else {
-                try ReftableStack(
-                    directory: refsDirectory,
-                    objectFormat: storage.objectFormat
-                ).append([branchUpdate])
-                try ReftableStack(
-                    directory: headDirectory,
-                    objectFormat: storage.objectFormat
-                ).append([headUpdate])
-            }
-            return
-        }
-        try headDirectory.writeAtomically(
-            Array("ref: \(reference.description)\n".utf8),
-            to: ["HEAD"]
-        )
-        try publishReference(
-            directory: refsDirectory,
-            name: reference,
-            value: value,
-            expected: nil,
-            requireMissing: false,
-            reflog: nil
+        let previous = try readHead(
+            headDirectory: headDirectory,
+            refsDirectory: refsDirectory
+        ).objectID
+        try publishCheckoutHead(
+            headDirectory: headDirectory,
+            refsDirectory: refsDirectory,
+            reference: reference,
+            previous: previous,
+            current: value,
+            metadata: reflog
         )
     }
 
     private static func publishDetachedHead(
         headDirectory: RootDirectory,
         refsDirectory: RootDirectory,
-        value: ObjectID
+        value: ObjectID,
+        reflog: ReflogMetadata?
     ) throws {
+        let previous = try readHead(
+            headDirectory: headDirectory,
+            refsDirectory: refsDirectory
+        ).objectID
         let storage = try referenceStorage(directory: refsDirectory)
         if storage.format == .reftable {
             try ReftableStack(
                 directory: headDirectory,
                 objectFormat: storage.objectFormat
             ).append([
-                ReftableUpdate(
-                    name: try RefName("HEAD"),
+                try headReftableUpdate(
                     value: .direct(value, peeled: nil),
-                    expected: .any,
-                    reflog: nil
+                    objectFormat: storage.objectFormat,
+                    previous: previous,
+                    current: value,
+                    metadata: reflog
                 ),
             ])
             return
@@ -4185,6 +4281,15 @@ public actor Repository {
             Array("\(value.description)\n".utf8),
             to: ["HEAD"]
         )
+        if let reflog {
+            try appendReflog(
+                directory: headDirectory,
+                name: try RefName("HEAD"),
+                previous: previous,
+                current: value,
+                metadata: reflog
+            )
+        }
     }
 
     private static func credential(
@@ -5452,7 +5557,9 @@ public actor Repository {
                 committer: state.committer,
                 message: picked.message,
                 store: store,
-                refsDirectory: refsDirectory
+                headDirectory: headDirectory,
+                refsDirectory: refsDirectory,
+                reflogAction: "rebase (pick)"
             )
             state.current = nil
             try writeRebaseState(state, in: headDirectory)
@@ -5494,7 +5601,9 @@ public actor Repository {
         committer: Signature,
         message: [UInt8],
         store: RepositoryObjectStore,
-        refsDirectory: RootDirectory
+        headDirectory: RootDirectory,
+        refsDirectory: RootDirectory,
+        reflogAction: String
     ) throws -> ObjectID {
         let items = index.entries.map {
             (components: $0.path.split(separator: 0x2f).map(Array.init), entry: $0)
@@ -5508,15 +5617,16 @@ public actor Repository {
             message: message
         )
         let identifier = try ObjectID(bytes: store.write(object))
-        try publishReference(
-            directory: refsDirectory,
+        try publishCurrentReference(
+            headDirectory: headDirectory,
+            refsDirectory: refsDirectory,
             name: reference,
             value: identifier,
             expected: parent,
             requireMissing: false,
             reflog: ReflogMetadata(
                 signature: committer,
-                message: "commit: \(String(decoding: message, as: UTF8.self).split(separator: "\n").first.map(String.init) ?? "")"
+                message: "\(reflogAction): \(String(decoding: message, as: UTF8.self).split(separator: "\n").first.map(String.init) ?? "")"
             )
         )
         return identifier

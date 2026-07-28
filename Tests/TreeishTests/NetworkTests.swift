@@ -782,6 +782,10 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
         configuration,
         to: [".git", "config"]
     )
+    _ = try await repository.createBranch(
+        named: "main",
+        at: commitID
+    ).value()
 
     let result = try await repository.checkout(
         CheckoutRequest(

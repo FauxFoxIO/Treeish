@@ -309,6 +309,10 @@ public enum Treeish {
         }
         let branchName = String(selectedRemote.name.description.split(separator: "/").last ?? "main")
         let localBranch = try RefName("refs/heads/\(branchName)")
+        _ = try await repository.createBranch(
+            named: branchName,
+            at: selectedRemote.current
+        ).value()
         _ = try await repository.checkout(
             CheckoutRequest(
                 commit: selectedRemote.current,

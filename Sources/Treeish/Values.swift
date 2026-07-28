@@ -23,6 +23,8 @@ public enum TreeishError: Error, Sendable, Equatable {
     case unsupportedSubmoduleUpdate(GitPath, String)
     case submoduleRecursionLimitExceeded
     case unsupportedContentConversion(GitPath, String)
+    case signingUnavailable
+    case invalidSignature
 }
 
 public struct GitPath: Sendable, Hashable, Codable {

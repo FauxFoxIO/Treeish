@@ -297,6 +297,8 @@ decisions for the host app.
   checkout, commit, restore, and reset, with caller-supplied checkout/reset
   reflog identities;
 - branches, lightweight and annotated tags, and linked worktrees;
+- host-backed OpenPGP, X.509, and SSH commit/tag signing with canonical Git
+  payload extraction and verification challenges;
 - `.gitmodules` parsing, gitlink-aware status, and bounded native submodule
   initialization and exact-commit updates;
 - revision expressions, numbered/date/prior-checkout reflog selectors,

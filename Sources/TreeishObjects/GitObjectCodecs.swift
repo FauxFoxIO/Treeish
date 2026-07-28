@@ -32,10 +32,14 @@ public enum GitObjectEncoder {
         objectType: GitObjectType,
         name: String,
         tagger: GitSignature,
-        message: [UInt8]
+        message: [UInt8],
+        signature: [UInt8]? = nil
     ) -> GitObject {
         let header = "object \(objectHex)\ntype \(objectType.rawValue)\ntag \(name)\ntagger \(tagger.encoded)\n\n"
-        return GitObject(type: .tag, payload: Array(header.utf8) + message)
+        return GitObject(
+            type: .tag,
+            payload: Array(header.utf8) + message + (signature ?? [])
+        )
     }
 
     public static func commit(
@@ -43,15 +47,20 @@ public enum GitObjectEncoder {
         parentHexes: [String],
         author: GitSignature,
         committer: GitSignature,
-        message: [UInt8]
+        message: [UInt8],
+        signature: [UInt8]? = nil
     ) -> GitObject {
-        var header = "tree \(treeHex)\n"
+        var header = Array("tree \(treeHex)\n".utf8)
         for parent in parentHexes {
-            header += "parent \(parent)\n"
+            header += Array("parent \(parent)\n".utf8)
         }
-        header += "author \(author.encoded)\n"
-        header += "committer \(committer.encoded)\n\n"
-        return GitObject(type: .commit, payload: Array(header.utf8) + message)
+        header += Array("author \(author.encoded)\n".utf8)
+        header += Array("committer \(committer.encoded)\n".utf8)
+        if let signature {
+            header += multilineHeader(name: "gpgsig", value: signature)
+        }
+        header.append(0x0a)
+        return GitObject(type: .commit, payload: header + message)
     }
 
     public static func tree(entries: [GitTreeEntry]) -> GitObject {
@@ -71,6 +80,27 @@ public enum GitObjectEncoder {
 
     private static func treeSortKey(_ entry: GitTreeEntry) -> [UInt8] {
         entry.name + (entry.mode == .tree ? [0x2f] : [])
+    }
+
+    private static func multilineHeader(
+        name: String,
+        value: [UInt8]
+    ) -> [UInt8] {
+        var lines = value.split(
+            separator: 0x0a,
+            omittingEmptySubsequences: false
+        ).map(Array.init)
+        if lines.last?.isEmpty == true {
+            lines.removeLast()
+        }
+        guard let first = lines.first else { return [] }
+        var result = Array("\(name) ".utf8) + first + [0x0a]
+        for line in lines.dropFirst() {
+            result.append(0x20)
+            result += line
+            result.append(0x0a)
+        }
+        return result
     }
 }
 

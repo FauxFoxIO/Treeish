@@ -143,6 +143,102 @@ public protocol GitCredentialProvider: Sendable {
     func credential(for challenge: GitAuthenticationChallenge) async throws -> GitCredentialDisposition
 }
 
+public enum GitSignatureFormat: String, Sendable, Hashable, Codable {
+    case openPGP
+    case x509
+    case ssh
+}
+
+public struct GitSigningOptions: Sendable, Hashable, Codable {
+    public let keyID: String?
+    public let format: GitSignatureFormat?
+
+    public init(
+        keyID: String? = nil,
+        format: GitSignatureFormat? = nil
+    ) throws {
+        guard keyID?.utf8.count ?? 0 <= 4_096,
+              keyID?.contains("\0") != true,
+              keyID?.contains("\n") != true else {
+            throw TreeishError.invalidSignature
+        }
+        self.keyID = keyID
+        self.format = format
+    }
+}
+
+public enum GitSignedObjectType: String, Sendable, Hashable, Codable {
+    case commit
+    case tag
+}
+
+public struct GitObjectSignature: Sendable, Hashable, Codable {
+    public let format: GitSignatureFormat
+    public let bytes: [UInt8]
+
+    public init(format: GitSignatureFormat, bytes: [UInt8]) throws {
+        guard !bytes.isEmpty,
+              bytes.count <= 16 * 1024 * 1024,
+              !bytes.contains(0) else {
+            throw TreeishError.invalidSignature
+        }
+        self.format = format
+        self.bytes = bytes
+    }
+}
+
+public struct GitSigningChallenge: Sendable, Hashable {
+    public let objectType: GitSignedObjectType
+    public let objectFormat: ObjectHashAlgorithm
+    public let payload: [UInt8]
+    public let options: GitSigningOptions
+
+    public init(
+        objectType: GitSignedObjectType,
+        objectFormat: ObjectHashAlgorithm,
+        payload: [UInt8],
+        options: GitSigningOptions
+    ) {
+        self.objectType = objectType
+        self.objectFormat = objectFormat
+        self.payload = payload
+        self.options = options
+    }
+}
+
+public protocol GitObjectSigner: Sendable {
+    func sign(_ challenge: GitSigningChallenge) async throws -> GitObjectSignature
+}
+
+public struct GitSignedObject: Sendable, Hashable, Codable {
+    public let objectID: ObjectID
+    public let objectType: GitSignedObjectType
+    public let signedPayload: [UInt8]
+    public let signature: GitObjectSignature
+
+    public init(
+        objectID: ObjectID,
+        objectType: GitSignedObjectType,
+        signedPayload: [UInt8],
+        signature: GitObjectSignature
+    ) {
+        self.objectID = objectID
+        self.objectType = objectType
+        self.signedPayload = signedPayload
+        self.signature = signature
+    }
+}
+
+public enum GitSignatureVerification: Sendable, Hashable, Codable {
+    case valid(signer: String?)
+    case invalid(reason: String?)
+    case unknownSigner(String?)
+}
+
+public protocol GitObjectSignatureVerifier: Sendable {
+    func verify(_ object: GitSignedObject) async throws -> GitSignatureVerification
+}
+
 /// The connection details derived from an SSH remote.
 ///
 /// `repositoryPath` is passed to the selected Git service as an opaque path. An
@@ -203,15 +299,21 @@ public struct RepositoryServices: Sendable {
     public var credentials: (any GitCredentialProvider)?
     public var httpTransport: (any SmartHTTPTransport)?
     public var sshTransport: (any SSHGitTransport)?
+    public var objectSigner: (any GitObjectSigner)?
+    public var signatureVerifier: (any GitObjectSignatureVerifier)?
 
     public init(
         credentials: (any GitCredentialProvider)? = nil,
         httpTransport: (any SmartHTTPTransport)? = nil,
-        sshTransport: (any SSHGitTransport)? = nil
+        sshTransport: (any SSHGitTransport)? = nil,
+        objectSigner: (any GitObjectSigner)? = nil,
+        signatureVerifier: (any GitObjectSignatureVerifier)? = nil
     ) {
         self.credentials = credentials
         self.httpTransport = httpTransport
         self.sshTransport = sshTransport
+        self.objectSigner = objectSigner
+        self.signatureVerifier = signatureVerifier
     }
 }
 

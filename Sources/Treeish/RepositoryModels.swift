@@ -83,6 +83,7 @@ public struct CommitRequest: Sendable, Hashable {
     public let author: Signature
     public let committer: Signature
     public let message: [UInt8]
+    public let signing: GitSigningOptions?
 
     public init(
         tree: ObjectID,
@@ -90,7 +91,8 @@ public struct CommitRequest: Sendable, Hashable {
         expectedHead: ObjectID? = nil,
         author: Signature,
         committer: Signature,
-        message: [UInt8]
+        message: [UInt8],
+        signing: GitSigningOptions? = nil
     ) {
         self.tree = tree
         self.parents = parents
@@ -98,6 +100,7 @@ public struct CommitRequest: Sendable, Hashable {
         self.author = author
         self.committer = committer
         self.message = message
+        self.signing = signing
     }
 }
 
@@ -157,12 +160,20 @@ public struct TagRequest: Sendable, Hashable {
     public let target: ObjectID
     public let tagger: Signature?
     public let message: [UInt8]?
+    public let signing: GitSigningOptions?
 
-    public init(name: String, target: ObjectID, tagger: Signature? = nil, message: [UInt8]? = nil) {
+    public init(
+        name: String,
+        target: ObjectID,
+        tagger: Signature? = nil,
+        message: [UInt8]? = nil,
+        signing: GitSigningOptions? = nil
+    ) {
         self.name = name
         self.target = target
         self.tagger = tagger
         self.message = message
+        self.signing = signing
     }
 }
 

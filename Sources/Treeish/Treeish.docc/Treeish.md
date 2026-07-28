@@ -62,6 +62,11 @@ typed result.
 - ``RemoteURL``
 - ``GitRemoteTransport``
 - ``RepositoryServices``
+- ``GitObjectSigner``
+- ``GitObjectSignatureVerifier``
+- ``GitSigningOptions``
+- ``GitSignedObject``
+- ``GitSignatureVerification``
 - ``GitCredentialProvider``
 - ``SSHGitTransport``
 - ``SSHGitSession``

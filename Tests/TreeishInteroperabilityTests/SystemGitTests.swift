@@ -2,6 +2,57 @@ import Foundation
 import Testing
 @testable import Treeish
 
+private struct SSHFixtureSigner: GitObjectSigner {
+    let key: URL
+
+    func sign(
+        _ challenge: GitSigningChallenge
+    ) async throws -> GitObjectSignature {
+        let input = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        defer {
+            try? FileManager.default.removeItem(at: input)
+            try? FileManager.default.removeItem(
+                at: input.appendingPathExtension("sig")
+            )
+        }
+        try Data(challenge.payload).write(to: input)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh-keygen")
+        process.arguments = [
+            "-Y", "sign", "-f", key.path, "-n", "git", input.path,
+        ]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw TreeishError.invalidSignature
+        }
+        return try GitObjectSignature(
+            format: .ssh,
+            bytes: Array(
+                Data(
+                    contentsOf: input.appendingPathExtension("sig")
+                )
+            )
+        )
+    }
+}
+
+private struct AcceptingFixtureVerifier: GitObjectSignatureVerifier {
+    func verify(
+        _ object: GitSignedObject
+    ) async throws -> GitSignatureVerification {
+        guard object.signature.format == .ssh,
+              !object.signedPayload.isEmpty else {
+            return .invalid(reason: "fixture expected SSH")
+        }
+        return .valid(signer: "treeish@example.com")
+    }
+}
+
 @Test(arguments: [false, true])
 func treeishReadsLooseAndPackedAlternateObjectDatabases(
     packed: Bool
@@ -1583,6 +1634,170 @@ func checkoutMovesOnlyHeadAndResetLogsResolvedHead(
     #expect(try await repository.resolveRevision("@{-1}") == featureTip)
     #expect(try await repository.resolveRevision("@{upstream}") == mainTip)
     #expect(try await repository.resolveRevision("@{push}") == featureTip)
+}
+
+@Test func systemGitVerifiesTreeishSignedCommitAndTag() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let key = directory.appendingPathComponent("signing-key")
+
+    func process(_ arguments: [String]) throws -> (Int32, String) {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: arguments[0])
+        task.arguments = Array(arguments.dropFirst())
+        let output = Pipe()
+        task.standardOutput = output
+        task.standardError = output
+        try task.run()
+        task.waitUntilExit()
+        return (
+            task.terminationStatus,
+            String(
+                decoding: output.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            )
+        )
+    }
+
+    #expect(try process([
+        "/usr/bin/ssh-keygen", "-q", "-t", "ed25519",
+        "-N", "", "-f", key.path,
+    ]).0 == 0)
+    let publicKey = try String(
+        contentsOf: key.appendingPathExtension("pub"),
+        encoding: .utf8
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    let allowedSigners = directory.appendingPathComponent("allowed-signers")
+    try Data("treeish@example.com \(publicKey)\n".utf8).write(
+        to: allowedSigners
+    )
+
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.initialize(in: root)
+    try Data("signed\n".utf8).write(
+        to: directory.appendingPathComponent("signed.txt")
+    )
+    _ = try await repository.stage(
+        StageRequest(pathspecs: [try GitPathspec("signed.txt")])
+    ).value()
+    let signature = Signature(
+        name: "Treeish",
+        email: "treeish@example.com",
+        secondsSinceEpoch: 1_700_000_000,
+        timeZoneOffsetMinutes: 0
+    )
+    let services = RepositoryServices(
+        objectSigner: SSHFixtureSigner(key: key),
+        signatureVerifier: AcceptingFixtureVerifier()
+    )
+    let tree = try await repository.writeIndexTree().value()
+    let signedRequest = CommitRequest(
+        tree: tree,
+        author: signature,
+        committer: signature,
+        message: Array("signed commit\n".utf8),
+        signing: try GitSigningOptions(format: .ssh)
+    )
+    await #expect(throws: TreeishError.signingUnavailable) {
+        _ = try await repository.commit(signedRequest).value()
+    }
+    #expect(try await repository.snapshot().headObjectID == nil)
+    let commit = try await repository.commit(
+        CommitRequest(
+            tree: tree,
+            author: signature,
+            committer: signature,
+            message: Array("signed commit\n".utf8),
+            signing: try GitSigningOptions(format: .ssh)
+        ),
+        services: services
+    ).value()
+    let tag = try await repository.createTag(
+        TagRequest(
+            name: "signed-tag",
+            target: commit.objectID,
+            tagger: signature,
+            message: Array("signed tag\n".utf8),
+            signing: try GitSigningOptions(format: .ssh)
+        ),
+        services: services
+    ).value()
+
+    func verify(_ command: String, _ identifier: ObjectID) throws {
+        let result = try process([
+            "/usr/bin/git", "-C", directory.path,
+            "-c", "gpg.format=ssh",
+            "-c", "gpg.ssh.allowedSignersFile=\(allowedSigners.path)",
+            command, identifier.description,
+        ])
+        if result.0 != 0 {
+            Issue.record("system Git signature verification failed: \(result.1)")
+        }
+    }
+    try verify("verify-commit", commit.objectID)
+    try verify("verify-tag", tag.current)
+
+    let commitSignatures = try await repository.signatures(
+        for: commit.objectID
+    ).value()
+    let tagSignatures = try await repository.signatures(
+        for: tag.current
+    ).value()
+    #expect(commitSignatures.count == 1)
+    #expect(tagSignatures.count == 1)
+    #expect(commitSignatures[0].signature.format == .ssh)
+    #expect(tagSignatures[0].signature.format == .ssh)
+    #expect(!commitSignatures[0].signedPayload.contains(0))
+    #expect(
+        try await repository.verifySignatures(
+            for: commit.objectID,
+            services: services
+        ).value() == [.valid(signer: "treeish@example.com")]
+    )
+
+    let signingConfiguration = [
+        "/usr/bin/git", "-C", directory.path,
+        "-c", "user.name=System Git",
+        "-c", "user.email=treeish@example.com",
+        "-c", "user.signingkey=\(key.path)",
+        "-c", "gpg.format=ssh",
+    ]
+    #expect(try process(
+        signingConfiguration
+            + ["commit", "--allow-empty", "-S", "-m", "system signed"]
+    ).0 == 0)
+    let systemCommit = try ObjectID(
+        hex: process([
+            "/usr/bin/git", "-C", directory.path, "rev-parse", "HEAD",
+        ]).1.trimmingCharacters(in: .whitespacesAndNewlines)
+    )
+    #expect(try process(
+        signingConfiguration
+            + ["tag", "-s", "system-signed-tag", "-m", "system signed tag"]
+    ).0 == 0)
+    let systemTag = try ObjectID(
+        hex: process([
+            "/usr/bin/git", "-C", directory.path,
+            "rev-parse", "system-signed-tag^{tag}",
+        ]).1.trimmingCharacters(in: .whitespacesAndNewlines)
+    )
+    let reopened = try await Treeish.open(
+        try await Treeish.discover(in: root),
+        roots: [root]
+    )
+    #expect(
+        try await reopened.signatures(for: systemCommit).value()
+            .first?.signature.format == .ssh
+    )
+    #expect(
+        try await reopened.signatures(for: systemTag).value()
+            .first?.signature.format == .ssh
+    )
 }
 
 @Test func treeishTraversesSystemGitDeltaPackAfterGC() async throws {

@@ -159,6 +159,50 @@ public actor Repository {
         }
     }
 
+    public func signatures(
+        for identifier: ObjectID,
+        services: RepositoryServices = .init()
+    ) -> GitOperation<[GitSignedObject]> {
+        let store = objectStore
+        let common = commonDirectory
+        let promisorRemotes = repositoryCapabilities.promisorRemotes
+        return GitOperation(phase: .validating) {
+            guard identifier.algorithm == store.objectFormat else {
+                throw TreeishError.invalidObjectID
+            }
+            let object = try await Repository.readPromisedObject(
+                identifier.bytes,
+                preferredRemotes: promisorRemotes,
+                services: services,
+                store: store,
+                directory: common
+            )
+            return try Repository.extractSignatures(
+                from: object,
+                identifier: identifier
+            )
+        }
+    }
+
+    public func verifySignatures(
+        for identifier: ObjectID,
+        services: RepositoryServices
+    ) -> GitOperation<[GitSignatureVerification]> {
+        let operation = signatures(for: identifier, services: services)
+        return GitOperation(phase: .validating) {
+            guard let verifier = services.signatureVerifier else {
+                throw TreeishError.signingUnavailable
+            }
+            let signed = try await operation.value()
+            var results: [GitSignatureVerification] = []
+            results.reserveCapacity(signed.count)
+            for object in signed {
+                results.append(try await verifier.verify(object))
+            }
+            return results
+        }
+    }
+
     public func stage(_ request: StageRequest) -> GitOperation<IndexUpdate> {
         let store = objectStore
         let indexStore = indexStore
@@ -3717,7 +3761,10 @@ public actor Repository {
         createReference(namespace: "refs/heads", name: name, target: target, reflog: reflog)
     }
 
-    public func createTag(_ request: TagRequest) -> GitOperation<RefUpdateResult> {
+    public func createTag(
+        _ request: TagRequest,
+        services: RepositoryServices = .init()
+    ) -> GitOperation<RefUpdateResult> {
         let store = objectStore
         let directory = commonDirectory
         let access = repositoryCapabilities.access
@@ -3729,20 +3776,51 @@ public actor Repository {
             let reference = try RefName("refs/tags/\(request.name)")
             let finalTarget: ObjectID
             let peeledTarget: ObjectID?
-            if let tagger = request.tagger, let message = request.message {
+            if let tagger = request.tagger, let requestedMessage = request.message {
                 let targetObject = try store.read(identifier: request.target.bytes)
-                let tag = GitObjectEncoder.tag(
+                var message = requestedMessage
+                if request.signing != nil, message.last != 0x0a {
+                    message.append(0x0a)
+                }
+                let unsigned = GitObjectEncoder.tag(
                     objectHex: request.target.description,
                     objectType: targetObject.type,
                     name: request.name,
                     tagger: tagger.storageSignature,
                     message: message
                 )
+                let tag: GitObject
+                if let options = request.signing {
+                    guard let signer = services.objectSigner else {
+                        throw TreeishError.signingUnavailable
+                    }
+                    let signature = try Repository.validatedSignature(
+                        await signer.sign(GitSigningChallenge(
+                            objectType: .tag,
+                            objectFormat: store.objectFormat,
+                            payload: unsigned.payload,
+                            options: options
+                        )),
+                        requestedFormat: options.format
+                    )
+                    tag = GitObjectEncoder.tag(
+                        objectHex: request.target.description,
+                        objectType: targetObject.type,
+                        name: request.name,
+                        tagger: tagger.storageSignature,
+                        message: message,
+                        signature: signature.bytes
+                    )
+                } else {
+                    tag = unsigned
+                }
                 finalTarget = try ObjectID(bytes: store.write(tag))
                 peeledTarget = try Repository.peelTag(
                     request.target,
                     store: store
                 )
+            } else if request.signing != nil {
+                throw TreeishError.invalidSignature
             } else {
                 finalTarget = request.target
                 peeledTarget = nil
@@ -3832,7 +3910,10 @@ public actor Repository {
         }
     }
 
-    public func commit(_ request: CommitRequest) -> GitOperation<CommitResult> {
+    public func commit(
+        _ request: CommitRequest,
+        services: RepositoryServices = .init()
+    ) -> GitOperation<CommitResult> {
         let headDirectory = gitDirectory
         let refsDirectory = commonDirectory
         let store = objectStore
@@ -3853,13 +3934,38 @@ public actor Repository {
             if let expected = request.expectedHead, head.objectID != expected {
                 throw TreeishError.referenceChanged
             }
-            let object = GitObjectEncoder.commit(
+            let unsigned = GitObjectEncoder.commit(
                 treeHex: request.tree.description,
                 parentHexes: request.parents.map(\.description),
                 author: request.author.storageSignature,
                 committer: request.committer.storageSignature,
                 message: request.message
             )
+            let object: GitObject
+            if let options = request.signing {
+                guard let signer = services.objectSigner else {
+                    throw TreeishError.signingUnavailable
+                }
+                let signature = try Repository.validatedSignature(
+                    await signer.sign(GitSigningChallenge(
+                        objectType: .commit,
+                        objectFormat: store.objectFormat,
+                        payload: unsigned.payload,
+                        options: options
+                    )),
+                    requestedFormat: options.format
+                )
+                object = GitObjectEncoder.commit(
+                    treeHex: request.tree.description,
+                    parentHexes: request.parents.map(\.description),
+                    author: request.author.storageSignature,
+                    committer: request.committer.storageSignature,
+                    message: request.message,
+                    signature: signature.bytes
+                )
+            } else {
+                object = unsigned
+            }
             let bytes = try store.write(object)
             let identifier = try ObjectID(bytes: bytes)
             let reflog = ReflogMetadata(
@@ -5845,6 +5951,141 @@ public actor Repository {
             $0.starts(with: Array("object ".utf8))
         }) else { return nil }
         return try ObjectID(hex: String(decoding: line.dropFirst(7), as: UTF8.self)).bytes
+    }
+
+    private static func validatedSignature(
+        _ signature: GitObjectSignature,
+        requestedFormat: GitSignatureFormat?
+    ) throws -> GitObjectSignature {
+        guard requestedFormat == nil || requestedFormat == signature.format else {
+            throw TreeishError.invalidSignature
+        }
+        let marker: [UInt8] = switch signature.format {
+        case .openPGP: Array("-----BEGIN PGP SIGNATURE-----".utf8)
+        case .x509: Array("-----BEGIN SIGNED MESSAGE-----".utf8)
+        case .ssh: Array("-----BEGIN SSH SIGNATURE-----".utf8)
+        }
+        guard signature.bytes.starts(with: marker) else {
+            throw TreeishError.invalidSignature
+        }
+        var bytes = signature.bytes
+        if bytes.last != 0x0a { bytes.append(0x0a) }
+        return try GitObjectSignature(format: signature.format, bytes: bytes)
+    }
+
+    private static func extractSignatures(
+        from object: GitObject,
+        identifier: ObjectID
+    ) throws -> [GitSignedObject] {
+        switch object.type {
+        case .commit:
+            return try extractCommitSignatures(
+                object.payload,
+                identifier: identifier
+            )
+        case .tag:
+            guard let match = signatureMarker(in: object.payload) else {
+                return []
+            }
+            let signature = try GitObjectSignature(
+                format: match.format,
+                bytes: Array(object.payload[match.index...])
+            )
+            return [
+                GitSignedObject(
+                    objectID: identifier,
+                    objectType: .tag,
+                    signedPayload: Array(object.payload[..<match.index]),
+                    signature: signature
+                ),
+            ]
+        default:
+            return []
+        }
+    }
+
+    private static func extractCommitSignatures(
+        _ payload: [UInt8],
+        identifier: ObjectID
+    ) throws -> [GitSignedObject] {
+        guard let separator = payload.firstRange(
+            of: Array("\n\n".utf8)
+        ) else {
+            throw TreeishError.invalidSignature
+        }
+        var results: [GitSignedObject] = []
+        var offset = payload.startIndex
+        while offset < separator.lowerBound {
+            let lineEnd = payload[offset..<separator.lowerBound]
+                .firstIndex(of: 0x0a) ?? separator.lowerBound
+            let line = payload[offset..<lineEnd]
+            let prefix: [UInt8]?
+            if line.starts(with: Array("gpgsig ".utf8)) {
+                prefix = Array("gpgsig ".utf8)
+            } else if line.starts(with: Array("gpgsig-sha256 ".utf8)) {
+                prefix = Array("gpgsig-sha256 ".utf8)
+            } else {
+                prefix = nil
+            }
+            guard let prefix else {
+                offset = min(lineEnd + 1, separator.lowerBound)
+                continue
+            }
+            let headerStart = offset
+            var signature = Array(line.dropFirst(prefix.count))
+            signature.append(0x0a)
+            var headerEnd = min(lineEnd + 1, separator.lowerBound)
+            while headerEnd < separator.lowerBound,
+                  payload[headerEnd] == 0x20 {
+                let continuationEnd = payload[headerEnd..<separator.lowerBound]
+                    .firstIndex(of: 0x0a) ?? separator.lowerBound
+                signature += payload[(headerEnd + 1)..<continuationEnd]
+                signature.append(0x0a)
+                headerEnd = min(
+                    continuationEnd + 1,
+                    separator.lowerBound
+                )
+            }
+            guard let format = signatureFormat(signature) else {
+                throw TreeishError.invalidSignature
+            }
+            let signedPayload =
+                Array(payload[..<headerStart]) + payload[headerEnd...]
+            results.append(GitSignedObject(
+                objectID: identifier,
+                objectType: .commit,
+                signedPayload: signedPayload,
+                signature: try GitObjectSignature(
+                    format: format,
+                    bytes: signature
+                )
+            ))
+            offset = headerEnd
+        }
+        return results
+    }
+
+    private static func signatureMarker(
+        in bytes: [UInt8]
+    ) -> (index: Int, format: GitSignatureFormat)? {
+        let markers: [(GitSignatureFormat, [UInt8])] = [
+            (.openPGP, Array("-----BEGIN PGP SIGNATURE-----".utf8)),
+            (.x509, Array("-----BEGIN SIGNED MESSAGE-----".utf8)),
+            (.ssh, Array("-----BEGIN SSH SIGNATURE-----".utf8)),
+        ]
+        return markers.compactMap { format, marker in
+            bytes.firstRange(of: marker).map {
+                (index: $0.lowerBound, format: format)
+            }
+        }.min { $0.index < $1.index }
+    }
+
+    private static func signatureFormat(
+        _ bytes: [UInt8]
+    ) -> GitSignatureFormat? {
+        signatureMarker(in: bytes).flatMap {
+            $0.index == bytes.startIndex ? $0.format : nil
+        }
     }
 
     private static func inspectCapabilities(

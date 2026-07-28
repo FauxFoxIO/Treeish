@@ -28,6 +28,12 @@ effect. ``CheckoutRequest/reflog`` and ``ResetRequest/reflog`` let the host
 supply the identity and message used for the corresponding `HEAD` and branch
 reflogs.
 
+Signed commits use Git's multiline `gpgsig` header and signed annotated tags
+append the canonical armored signature. Treeish constructs and bounds the exact
+payload while ``GitObjectSigner`` and ``GitObjectSignatureVerifier`` let the
+host own OpenPGP, X.509, or SSH keys and trust policy. System Git can verify
+objects produced through this boundary.
+
 Object lookup follows root-contained alternate object databases and classic or
 incremental multi-pack indexes. Revision traversal honors `shallow` boundaries
 and replacement references. Partial-clone configuration is reported through

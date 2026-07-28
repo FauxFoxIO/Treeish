@@ -2,6 +2,74 @@ import Foundation
 import Testing
 @testable import Treeish
 
+@Test func treeishReadsSystemGitReftableStack() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    func git(_ arguments: [String]) throws -> (Int32, String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory.path] + arguments
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "GIT_AUTHOR_NAME": "System Git",
+            "GIT_AUTHOR_EMAIL": "git@example.com",
+            "GIT_COMMITTER_NAME": "System Git",
+            "GIT_COMMITTER_EMAIL": "git@example.com",
+        ], uniquingKeysWith: { _, new in new })
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        return (
+            process.terminationStatus,
+            String(
+                decoding: output.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            )
+        )
+    }
+
+    #expect(try git(["init", "--ref-format=reftable"]).0 == 0)
+    try Data("reftable\n".utf8).write(
+        to: directory.appendingPathComponent("file.txt")
+    )
+    #expect(try git(["add", "file.txt"]).0 == 0)
+    #expect(try git(["commit", "-m", "initial"]).0 == 0)
+    #expect(try git(["branch", "side"]).0 == 0)
+    #expect(try git(["tag", "lightweight"]).0 == 0)
+    #expect(try git(["tag", "-a", "annotated", "-m", "tag"]).0 == 0)
+    #expect(try git(["branch", "-D", "side"]).0 == 0)
+
+    let expectedHead = try ObjectID(
+        hex: git(["rev-parse", "HEAD"]).1
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    )
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.open(
+        try await Treeish.discover(in: root),
+        roots: [root]
+    )
+    let capabilities = await repository.capabilities()
+    #expect(capabilities.refStorage == .reftable)
+    #expect(capabilities.access != .readWrite)
+    let snapshot = try await repository.snapshot()
+    #expect(snapshot.headReference == (try RefName("refs/heads/main")))
+    #expect(snapshot.headObjectID == expectedHead)
+    let references = try await repository.listReferences().value()
+    #expect(references.map(\.name.description) == [
+        "refs/heads/main",
+        "refs/tags/annotated",
+        "refs/tags/lightweight",
+    ])
+    #expect(references.allSatisfy { $0.objectID.algorithm == .sha1 })
+}
+
 @Test func systemGitReadsTreeishLooseObject() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString)

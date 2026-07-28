@@ -14,3 +14,7 @@ Treeish reads and writes both SHA-1 and SHA-256 object-format repositories.
 Object IDs, loose objects, trees, commits, indexes, packs, pack indexes,
 references, reflogs, bundles, and smart-protocol requests use the repository's
 declared object format.
+
+Reftable v1 and v2 stacks are readable, including symbolic references, peeled
+values, and deletion records. Reftable mutation remains disabled until the
+complete append, lock, reflog, and recovery transaction is available.

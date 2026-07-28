@@ -737,12 +737,7 @@ public actor Repository {
             }
             guard !selected.isEmpty else { throw TreeishError.referenceNotFound }
             let wants = Array(Set(selected.map(\.objectID)))
-            let localReferences =
-                try Repository.packedReferences(directory: common)
-                    .merging(
-                        Repository.looseReferences(directory: common),
-                        uniquingKeysWith: { _, loose in loose }
-                    )
+            let localReferences = try Repository.allReferences(directory: common)
             let haves = Array(Set(localReferences.values.map(\.bytes)))
             let body = if let v2Capabilities {
                 try UploadPackV2.fetchRequest(
@@ -2469,8 +2464,7 @@ public actor Repository {
     public func listReferences(prefix: String = "refs/") -> GitOperation<[ReferenceInfo]> {
         let directory = commonDirectory
         return GitOperation(phase: .validating) {
-            var values = try Repository.packedReferences(directory: directory)
-            values.merge(try Repository.looseReferences(directory: directory)) { _, loose in loose }
+            let values = try Repository.allReferences(directory: directory)
             return values.filter { $0.key.description.hasPrefix(prefix) }
                 .map { ReferenceInfo(name: $0.key, objectID: $0.value) }
                 .sorted { $0.name.bytes.lexicographicallyPrecedes($1.name.bytes) }
@@ -2608,6 +2602,21 @@ public actor Repository {
         headDirectory: RootDirectory,
         refsDirectory: RootDirectory
     ) throws -> (reference: RefName?, objectID: ObjectID?) {
+        if try referenceStorage(directory: refsDirectory).format == .reftable {
+            let head = try RefName("HEAD")
+            let value = try readReferenceValue(directory: refsDirectory, name: head)
+            switch value {
+            case .symbolic(let reference):
+                return (
+                    reference,
+                    try? readReference(directory: refsDirectory, name: reference)
+                )
+            case .direct(let objectID, _):
+                return (nil, objectID)
+            case .deletion:
+                return (nil, nil)
+            }
+        }
         let bytes = try headDirectory.read(["HEAD"], limit: 4096)
         guard let text = String(bytes: bytes, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2639,6 +2648,13 @@ public actor Repository {
         directory: RootDirectory,
         name: RefName
     ) throws -> ObjectID {
+        if try referenceStorage(directory: directory).format == .reftable {
+            return try resolveReftableReference(
+                directory: directory,
+                name: name,
+                visited: []
+            )
+        }
         do {
             return try readDirectReference(
                 directory: directory,
@@ -2647,6 +2663,63 @@ public actor Repository {
         } catch RootDirectoryError.notFound {
             return try readPackedReference(directory: directory, name: name)
         }
+    }
+
+    private static func resolveReftableReference(
+        directory: RootDirectory,
+        name: RefName,
+        visited: Set<RefName>
+    ) throws -> ObjectID {
+        guard visited.count < 16, !visited.contains(name) else {
+            throw TreeishError.symbolicReferenceLoop
+        }
+        switch try readReferenceValue(directory: directory, name: name) {
+        case .direct(let identifier, _):
+            return identifier
+        case .symbolic(let target):
+            var next = visited
+            next.insert(name)
+            return try resolveReftableReference(
+                directory: directory,
+                name: target,
+                visited: next
+            )
+        case .deletion:
+            throw TreeishError.referenceNotFound
+        }
+    }
+
+    private static func readReferenceValue(
+        directory: RootDirectory,
+        name: RefName
+    ) throws -> ReftableReferenceValue {
+        let storage = try referenceStorage(directory: directory)
+        guard storage.format == .reftable else {
+            throw TreeishError.malformedReference
+        }
+        let value = try ReftableStack(
+            directory: directory,
+            objectFormat: storage.objectFormat
+        ).reference(name)
+        if case .deletion = value {
+            throw TreeishError.referenceNotFound
+        }
+        return value
+    }
+
+    private static func referenceStorage(
+        directory: RootDirectory
+    ) throws -> (format: RefStorageFormat, objectFormat: ObjectHashAlgorithm) {
+        let configuration = try GitConfiguration.load(from: directory)
+        let storage = configuration.value(
+            section: "extensions",
+            key: "refstorage"
+        ).flatMap { RefStorageFormat(rawValue: $0.lowercased()) } ?? .files
+        let objectFormat = configuration.value(
+            section: "extensions",
+            key: "objectformat"
+        ).flatMap { ObjectHashAlgorithm(rawValue: $0.lowercased()) } ?? .sha1
+        return (storage, objectFormat)
     }
 
     private static func readPackedReference(
@@ -2710,6 +2783,41 @@ public actor Repository {
             values[name] = identifier
         }
         return values
+    }
+
+    private static func allReferences(
+        directory: RootDirectory
+    ) throws -> [RefName: ObjectID] {
+        let storage = try referenceStorage(directory: directory)
+        if storage.format == .reftable {
+            let records = try ReftableStack(
+                directory: directory,
+                objectFormat: storage.objectFormat
+            ).references()
+            var values: [RefName: ObjectID] = [:]
+            for (name, value) in records {
+                guard name.description.hasPrefix("refs/") else { continue }
+                switch value {
+                case .direct(let identifier, _):
+                    values[name] = identifier
+                case .symbolic:
+                    if let identifier = try? resolveReftableReference(
+                        directory: directory,
+                        name: name,
+                        visited: []
+                    ) {
+                        values[name] = identifier
+                    }
+                case .deletion:
+                    break
+                }
+            }
+            return values
+        }
+        return try packedReferences(directory: directory).merging(
+            looseReferences(directory: directory),
+            uniquingKeysWith: { _, loose in loose }
+        )
     }
 
     private static func removePackedReference(
@@ -3485,7 +3593,7 @@ public actor Repository {
                 if let value = RefStorageFormat(rawValue: normalizedValue) {
                     refStorage = value
                 }
-                understood = normalizedValue == RefStorageFormat.files.rawValue
+                understood = RefStorageFormat(rawValue: normalizedValue) != nil
             case "noop":
                 understood = true
             default:

@@ -2029,3 +2029,93 @@ func systemGitRecognizesTreeishLinkedWorktree(
     #expect(try git(["status", "--porcelain=v1"]).1.isEmpty)
     #expect(try git(["fsck", "--strict"]).0 == 0)
 }
+
+@Test func treeishReportsSystemGitSubmoduleStates() async throws {
+    let parent = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    let child = parent.appendingPathComponent("child-source")
+    let superproject = parent.appendingPathComponent("superproject")
+    try FileManager.default.createDirectory(
+        at: child,
+        withIntermediateDirectories: true
+    )
+    try FileManager.default.createDirectory(
+        at: superproject,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: parent) }
+
+    func git(_ directory: URL, _ arguments: [String]) throws -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory.path] + arguments
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "GIT_AUTHOR_NAME": "System Git",
+            "GIT_AUTHOR_EMAIL": "git@example.com",
+            "GIT_COMMITTER_NAME": "System Git",
+            "GIT_COMMITTER_EMAIL": "git@example.com",
+        ], uniquingKeysWith: { _, new in new })
+        try process.run()
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
+
+    #expect(try git(child, ["init"]) == 0)
+    try Data("child\n".utf8).write(
+        to: child.appendingPathComponent("child.txt")
+    )
+    #expect(try git(child, ["add", "child.txt"]) == 0)
+    #expect(try git(child, ["commit", "-m", "child"]) == 0)
+    #expect(try git(superproject, ["init"]) == 0)
+    #expect(try git(superproject, [
+        "-c", "protocol.file.allow=always",
+        "submodule", "add", child.path, "modules/child",
+    ]) == 0)
+    #expect(try git(superproject, ["commit", "-am", "submodule"]) == 0)
+
+    let root = try await TreeishRoot.localDirectory(at: parent)
+    let repository = try await Treeish.open(
+        try await Treeish.discover(
+            in: root,
+            from: try GitPath("superproject")
+        ),
+        roots: [root]
+    )
+    var statuses = try await repository.submodules().value()
+    #expect(statuses.count == 1)
+    #expect(statuses.first?.configuration?.name == "modules/child")
+    #expect(statuses.first?.path == (try GitPath("modules/child")))
+    #expect(statuses.first?.state == .clean)
+    #expect(statuses.first?.expectedCommit == statuses.first?.checkedOutCommit)
+
+    let checkout = superproject.appendingPathComponent("modules/child")
+    try Data("modified\n".utf8).write(
+        to: checkout.appendingPathComponent("child.txt")
+    )
+    statuses = try await repository.submodules().value()
+    #expect(statuses.first?.state == .modified)
+    #expect(
+        try await repository.status().value().entries.contains {
+            $0.path == (try? GitPath("modules/child")) &&
+                $0.worktreeChange == .modified
+        }
+    )
+
+    #expect(try git(checkout, ["add", "child.txt"]) == 0)
+    #expect(try git(checkout, ["commit", "-m", "different"]) == 0)
+    statuses = try await repository.submodules().value()
+    #expect(statuses.first?.state == .differentCommit)
+    #expect(
+        try await repository.status().value().entries.contains {
+            $0.path == (try? GitPath("modules/child")) &&
+                $0.worktreeChange == .modified
+        }
+    )
+
+    try FileManager.default.removeItem(
+        at: checkout.appendingPathComponent(".git")
+    )
+    statuses = try await repository.submodules().value()
+    #expect(statuses.first?.state == .uninitialized)
+    #expect(try await repository.status().value().isClean)
+}

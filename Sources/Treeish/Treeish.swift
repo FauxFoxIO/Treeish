@@ -340,6 +340,17 @@ public enum Treeish {
         worktree: [String],
         gitDirectory: [String]
     ) throws -> RepositoryLocation {
+        guard try root.directory.exists(gitDirectory + ["commondir"]) else {
+            return RepositoryLocation(
+                worktreePath: try gitPath(worktree),
+                gitDirectoryPath: try gitPath(gitDirectory),
+                commonDirectoryPath: try gitPath(gitDirectory),
+                objectDirectoryPath: try gitPath(
+                    gitDirectory + ["objects"]
+                ),
+                isBare: false
+            )
+        }
         let commonData = try root.directory.read(
             gitDirectory + ["commondir"],
             limit: 64 * 1024

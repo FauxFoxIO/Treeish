@@ -446,6 +446,62 @@ public struct StatusOptions: Sendable, Hashable, Codable {
     }
 }
 
+public struct SubmoduleConfiguration: Sendable, Hashable, Codable {
+    public let name: String
+    public let path: GitPath
+    public let url: String?
+    public let branch: String?
+    public let update: String?
+    public let ignore: String?
+
+    public init(
+        name: String,
+        path: GitPath,
+        url: String?,
+        branch: String?,
+        update: String?,
+        ignore: String?
+    ) {
+        self.name = name
+        self.path = path
+        self.url = url
+        self.branch = branch
+        self.update = update
+        self.ignore = ignore
+    }
+}
+
+public enum SubmoduleState: String, Sendable, Hashable, Codable {
+    case uninitialized
+    case clean
+    case modified
+    case differentCommit
+    case missingGitlink
+    case unconfigured
+}
+
+public struct SubmoduleStatus: Sendable, Hashable, Codable {
+    public let configuration: SubmoduleConfiguration?
+    public let path: GitPath
+    public let expectedCommit: ObjectID?
+    public let checkedOutCommit: ObjectID?
+    public let state: SubmoduleState
+
+    public init(
+        configuration: SubmoduleConfiguration?,
+        path: GitPath,
+        expectedCommit: ObjectID?,
+        checkedOutCommit: ObjectID?,
+        state: SubmoduleState
+    ) {
+        self.configuration = configuration
+        self.path = path
+        self.expectedCommit = expectedCommit
+        self.checkedOutCommit = checkedOutCommit
+        self.state = state
+    }
+}
+
 public enum StatusChangeKind: String, Sendable, Hashable, Codable {
     case added
     case modified

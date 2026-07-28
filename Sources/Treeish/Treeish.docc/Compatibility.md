@@ -62,3 +62,10 @@ worktrees. Per-directory attributes apply from parent to child and repository
 clean/smudge conversion is applied during staging, status, checkout, and
 restore; active external filters and working-tree encodings are rejected
 instead of silently writing incorrect bytes.
+
+``Repository/submodules()`` combines bounded `.gitmodules` configuration,
+stage-zero gitlinks, and nested repository inspection to report uninitialized,
+clean, dirty, different-commit, missing-gitlink, and unconfigured states.
+Superproject status treats gitlink directories atomically and reports nested
+changes without leaking their files as untracked paths. Repository discovery
+supports both linked-worktree and standard submodule `.git` indirection.

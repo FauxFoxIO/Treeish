@@ -270,6 +270,8 @@ public actor Repository {
         let headDirectory = gitDirectory
         let refsDirectory = commonDirectory
         let store = objectStore
+        let root = root
+        let worktreePath = identity.location.worktreePath
         return GitOperation(phase: .indexing) {
             guard let worktree else {
                 return Status(entries: [])
@@ -352,6 +354,37 @@ public actor Repository {
                 )
                 let fileType = attributes[.type] as? FileAttributeType
                 if entry.mode == 0o160000, fileType == .typeDirectory {
+                    if let worktreePath {
+                        let fullPath = try Repository.join(
+                            worktreePath,
+                            path
+                        )
+                        let location = try await Treeish.discover(
+                            in: root,
+                            from: fullPath
+                        )
+                        if location.worktreePath == fullPath {
+                            let nested = try await Treeish.open(
+                                location,
+                                roots: [root]
+                            )
+                            let expected = try ObjectID(
+                                algorithm: index.objectFormat,
+                                bytes: entry.objectID
+                            )
+                            let nestedSnapshot = try await nested.snapshot()
+                            let nestedStatus = await nested.status()
+                            let nestedIsClean = try await nestedStatus
+                                .value().isClean
+                            if nestedSnapshot.headObjectID != expected ||
+                                !nestedIsClean {
+                                changes[
+                                    bytes,
+                                    default: (nil, nil)
+                                ].worktree = .modified
+                            }
+                        }
+                    }
                     continue
                 }
                 let isSymbolicLink = fileType == .typeSymbolicLink
@@ -377,7 +410,15 @@ public actor Repository {
             }
             if options.includeUntracked || options.includeIgnored {
                 let all = try Repository.enumerateFiles(in: worktree)
+                let gitlinkPrefixes = stageZero.values
+                    .filter { $0.mode == 0o160000 }
+                    .map { $0.path + [0x2f] }
                 for path in all where stageZero[path.bytes] == nil {
+                    if gitlinkPrefixes.contains(where: {
+                        path.bytes.starts(with: $0)
+                    }) {
+                        continue
+                    }
                     let ignored = rules.isIgnored(path)
                     if ignored, options.includeIgnored {
                         changes[path.bytes, default: (nil, nil)].worktree = .ignored
@@ -400,6 +441,126 @@ public actor Repository {
                     $0.path.bytes.lexicographicallyPrecedes($1.path.bytes)
                 }
             )
+        }
+    }
+
+    public func submodules() -> GitOperation<[SubmoduleStatus]> {
+        let root = root
+        let worktree = worktree
+        let worktreePath = identity.location.worktreePath
+        let indexStore = indexStore
+        let objectFormat = repositoryCapabilities.objectFormat
+        return GitOperation(phase: .indexing) {
+            guard let worktree, let worktreePath else {
+                return []
+            }
+            let configurations = try Repository.submoduleConfigurations(
+                worktree: worktree
+            )
+            let byPath = Dictionary(
+                uniqueKeysWithValues: configurations.map {
+                    ($0.path.bytes, $0)
+                }
+            )
+            let index = try indexStore.read()
+            let gitlinks = Dictionary(
+                uniqueKeysWithValues: try index.entries
+                    .filter { $0.stage == 0 && $0.mode == 0o160000 }
+                    .map {
+                        (
+                            $0.path,
+                            try ObjectID(
+                                algorithm: objectFormat,
+                                bytes: $0.objectID
+                            )
+                        )
+                    }
+            )
+            var paths = Set(byPath.keys)
+            paths.formUnion(gitlinks.keys)
+            var result: [SubmoduleStatus] = []
+            for bytes in paths.sorted(by: {
+                $0.lexicographicallyPrecedes($1)
+            }) {
+                try Task.checkCancellation()
+                let path = try GitPath(bytes: bytes)
+                let configuration = byPath[bytes]
+                let expected = gitlinks[bytes]
+                guard configuration != nil else {
+                    result.append(SubmoduleStatus(
+                        configuration: nil,
+                        path: path,
+                        expectedCommit: expected,
+                        checkedOutCommit: nil,
+                        state: .unconfigured
+                    ))
+                    continue
+                }
+                guard expected != nil else {
+                    result.append(SubmoduleStatus(
+                        configuration: configuration,
+                        path: path,
+                        expectedCommit: nil,
+                        checkedOutCommit: nil,
+                        state: .missingGitlink
+                    ))
+                    continue
+                }
+                let fullPath = try Repository.join(
+                    worktreePath,
+                    path
+                )
+                guard try root.directory.exists(fullPath.components) else {
+                    result.append(SubmoduleStatus(
+                        configuration: configuration,
+                        path: path,
+                        expectedCommit: expected,
+                        checkedOutCommit: nil,
+                        state: .uninitialized
+                    ))
+                    continue
+                }
+                do {
+                    let location = try await Treeish.discover(
+                        in: root,
+                        from: fullPath
+                    )
+                    guard location.worktreePath == fullPath else {
+                        throw TreeishError.repositoryNotFound
+                    }
+                    let nested = try await Treeish.open(
+                        location,
+                        roots: [root]
+                    )
+                    let snapshot = try await nested.snapshot()
+                    let checkedOut = snapshot.headObjectID
+                    let dirty = try await nested.status().value().isClean == false
+                    let state: SubmoduleState
+                    if checkedOut != expected {
+                        state = .differentCommit
+                    } else if dirty {
+                        state = .modified
+                    } else {
+                        state = .clean
+                    }
+                    result.append(SubmoduleStatus(
+                        configuration: configuration,
+                        path: path,
+                        expectedCommit: expected,
+                        checkedOutCommit: checkedOut,
+                        state: state
+                    ))
+                } catch TreeishError.repositoryNotFound {
+                    result.append(SubmoduleStatus(
+                        configuration: configuration,
+                        path: path,
+                        expectedCommit: expected,
+                        checkedOutCommit: nil,
+                        state: .uninitialized
+                    ))
+                }
+            }
+            return result
         }
     }
 
@@ -4387,6 +4548,62 @@ public actor Repository {
             modificationNanoseconds: 0,
             stage: stage
         )
+    }
+
+    private static func submoduleConfigurations(
+        worktree: RootDirectory
+    ) throws -> [SubmoduleConfiguration] {
+        guard try worktree.exists([".gitmodules"]) else {
+            return []
+        }
+        let bytes = try worktree.read(
+            [".gitmodules"],
+            limit: 16 * 1024 * 1024
+        )
+        let document = try GitConfiguration(bytes: bytes)
+        var names: [String] = []
+        var fields: [String: [String: String]] = [:]
+        for entry in document.entries
+        where entry.section.caseInsensitiveCompare("submodule") == .orderedSame {
+            guard let name = entry.subsection, !name.isEmpty else {
+                throw TreeishError.invalidPath
+            }
+            if fields[name] == nil {
+                names.append(name)
+                fields[name] = [:]
+            }
+            fields[name]?[entry.key.lowercased()] = entry.value
+        }
+        var seenPaths: Set<[UInt8]> = []
+        return try names.map { name in
+            guard let values = fields[name],
+                  let rawPath = values["path"] else {
+                throw TreeishError.invalidPath
+            }
+            let path = try GitPath(rawPath)
+            guard !path.bytes.isEmpty,
+                  seenPaths.insert(path.bytes).inserted else {
+                throw TreeishError.invalidPath
+            }
+            return SubmoduleConfiguration(
+                name: name,
+                path: path,
+                url: values["url"],
+                branch: values["branch"],
+                update: values["update"],
+                ignore: values["ignore"]
+            )
+        }
+    }
+
+    private static func join(
+        _ parent: GitPath,
+        _ child: GitPath
+    ) throws -> GitPath {
+        guard !parent.bytes.isEmpty else {
+            return child
+        }
+        return try GitPath(bytes: parent.bytes + [0x2f] + child.bytes)
     }
 
     private static func worktreeStatus(

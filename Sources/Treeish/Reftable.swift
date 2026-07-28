@@ -39,6 +39,26 @@ struct ReftableUpdate: Sendable, Hashable {
     let value: ReftableReferenceValue
     let expected: ReftableExpectedValue
     let reflog: ReflogMetadata?
+    let reflogObjects: ReftableLogObjects?
+
+    init(
+        name: RefName,
+        value: ReftableReferenceValue,
+        expected: ReftableExpectedValue,
+        reflog: ReflogMetadata?,
+        reflogObjects: ReftableLogObjects? = nil
+    ) {
+        self.name = name
+        self.value = value
+        self.expected = expected
+        self.reflog = reflog
+        self.reflogObjects = reflogObjects
+    }
+}
+
+struct ReftableLogObjects: Sendable, Hashable {
+    let previous: ObjectID
+    let current: ObjectID
 }
 
 struct ReftableStack: Sendable {
@@ -149,7 +169,8 @@ struct ReftableStack: Sendable {
                 name: update.name,
                 value: update.value,
                 expected: .direct(prior),
-                reflog: update.reflog
+                reflog: update.reflog,
+                reflogObjects: update.reflogObjects
             )
         }
         let updateIndex = try nextUpdateIndex(in: names)
@@ -907,17 +928,26 @@ private struct ReftableWriter {
             let zero = [UInt8](repeating: 0, count: objectFormat.byteCount)
             let old: [UInt8]
             let new: [UInt8]
-            switch (update.expected, update.value) {
-            case (.direct(let identifier), _):
-                old = identifier.bytes
-            default:
-                old = zero
-            }
-            switch update.value {
-            case .direct(let identifier, _):
-                new = identifier.bytes
-            case .deletion, .symbolic:
-                new = zero
+            if let objects = update.reflogObjects {
+                guard objects.previous.algorithm == objectFormat,
+                      objects.current.algorithm == objectFormat else {
+                    throw ReftableError.hashMismatch
+                }
+                old = objects.previous.bytes
+                new = objects.current.bytes
+            } else {
+                switch (update.expected, update.value) {
+                case (.direct(let identifier), _):
+                    old = identifier.bytes
+                default:
+                    old = zero
+                }
+                switch update.value {
+                case .direct(let identifier, _):
+                    new = identifier.bytes
+                case .deletion, .symbolic:
+                    new = zero
+                }
             }
             body.append(contentsOf: old)
             body.append(contentsOf: new)

@@ -3635,6 +3635,17 @@ public actor Repository {
                     message: "commit: \(String(decoding: request.message, as: UTF8.self).split(separator: "\n").first.map(String.init) ?? "")"
                 )
             )
+            try Repository.appendHeadReflog(
+                headDirectory: headDirectory,
+                refsDirectory: refsDirectory,
+                reference: reference,
+                previous: head.objectID,
+                current: identifier,
+                metadata: ReflogMetadata(
+                    signature: request.committer,
+                    message: "commit: \(String(decoding: request.message, as: UTF8.self).split(separator: "\n").first.map(String.init) ?? "")"
+                )
+            )
             return CommitResult(
                 objectID: identifier,
                 updatedReference: reference
@@ -3962,6 +3973,49 @@ public actor Repository {
         try directory.appendAtomically(
             Array(line.utf8),
             to: ["logs"] + name.pathComponents
+        )
+    }
+
+    private static func appendHeadReflog(
+        headDirectory: RootDirectory,
+        refsDirectory: RootDirectory,
+        reference: RefName,
+        previous: ObjectID?,
+        current: ObjectID,
+        metadata: ReflogMetadata
+    ) throws {
+        let storage = try referenceStorage(directory: refsDirectory)
+        if storage.format == .reftable {
+            let zero = try ObjectID(
+                algorithm: storage.objectFormat,
+                bytes: [UInt8](
+                    repeating: 0,
+                    count: storage.objectFormat.byteCount
+                )
+            )
+            try ReftableStack(
+                directory: headDirectory,
+                objectFormat: storage.objectFormat
+            ).append([
+                ReftableUpdate(
+                    name: try RefName("HEAD"),
+                    value: .symbolic(reference),
+                    expected: .any,
+                    reflog: metadata,
+                    reflogObjects: ReftableLogObjects(
+                        previous: previous ?? zero,
+                        current: current
+                    )
+                ),
+            ])
+            return
+        }
+        try appendReflog(
+            directory: headDirectory,
+            name: try RefName("HEAD"),
+            previous: previous,
+            current: current,
+            metadata: metadata
         )
     }
 

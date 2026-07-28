@@ -529,6 +529,11 @@ func systemGitReadsAndMutatesTreeishReftableRepository(
     }
     #expect(try git(["fsck", "--strict"]).0 == 0)
     #expect(try git(["rev-parse", "HEAD"]).1 == "\(commit)\n")
+    #expect(
+        try git(["reflog", "show", "--format=%gs", "HEAD"]).1
+            == "commit: treeish reftable\n"
+    )
+    #expect(try await repository.headReflog().first?.current == commit)
     #expect(try git(["rev-parse", "treeish-tag"]).1 == "\(commit)\n")
     #expect(try git(["show-ref", "--verify", "refs/heads/temporary"]).0 != 0)
 

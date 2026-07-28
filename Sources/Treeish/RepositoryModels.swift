@@ -1054,6 +1054,31 @@ public struct ConflictEntry: Sendable, Hashable, Codable {
     }
 }
 
+public enum RepositoryOperationStateKind: String, Sendable, Hashable, Codable {
+    case merge
+    case cherryPick
+    case revert
+    case rebase
+    case foreignRebase
+    case sequencer
+}
+
+public struct RepositoryOperationState: Sendable, Hashable, Codable {
+    public let kind: RepositoryOperationStateKind
+    public let relatedCommit: ObjectID?
+    public let conflicts: [ConflictEntry]
+
+    public init(
+        kind: RepositoryOperationStateKind,
+        relatedCommit: ObjectID?,
+        conflicts: [ConflictEntry]
+    ) {
+        self.kind = kind
+        self.relatedCommit = relatedCommit
+        self.conflicts = conflicts
+    }
+}
+
 public struct WorktreeRequest: Sendable, Hashable {
     public let destination: GitPath
     public let start: ObjectID

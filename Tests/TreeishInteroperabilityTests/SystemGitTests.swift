@@ -2973,6 +2973,20 @@ func treeishStashUsesSupportedReferenceStorage(
     #expect(conflicts[0].ancestor != nil)
     #expect(conflicts[0].ours != nil)
     #expect(conflicts[0].theirs != nil)
+    let operation = try await repository.operationState().value()
+    #expect(operation?.kind == .revert)
+    #expect(operation?.relatedCommit == reverted)
+    #expect(operation?.conflicts == conflicts)
+    await #expect(throws: TreeishError.recoveryRequired(
+        "revert is already in progress"
+    )) {
+        _ = try await repository.checkout(
+            CheckoutRequest(
+                commit: head,
+                reference: try RefName("refs/heads/main")
+            )
+        ).value()
+    }
     #expect(FileManager.default.fileExists(
         atPath: directory.appendingPathComponent(".git/REVERT_HEAD").path
     ))
@@ -3012,7 +3026,72 @@ func treeishStashUsesSupportedReferenceStorage(
     #expect(finalHead != nil)
     #expect(finalHead != head)
     #expect(try await reopened.status().value().isClean)
+    #expect(try await reopened.operationState().value() == nil)
     #expect(try Data(contentsOf: file) == Data("resolved\n".utf8))
+}
+
+@Test func treeishDetectsAndProtectsSystemGitRebaseState() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let file = directory.appendingPathComponent("file.txt")
+    func git(_ arguments: [String]) throws -> (Int32, String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory.path] + arguments
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "GIT_AUTHOR_NAME": "System Git",
+            "GIT_AUTHOR_EMAIL": "git@example.com",
+            "GIT_COMMITTER_NAME": "System Git",
+            "GIT_COMMITTER_EMAIL": "git@example.com",
+        ], uniquingKeysWith: { _, new in new })
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        return (
+            process.terminationStatus,
+            String(
+                decoding: output.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            )
+        )
+    }
+    #expect(try git(["init", "-q"]).0 == 0)
+    try Data("base\n".utf8).write(to: file)
+    #expect(try git(["add", "file.txt"]).0 == 0)
+    #expect(try git(["commit", "-qm", "base"]).0 == 0)
+    #expect(try git(["switch", "-qc", "topic"]).0 == 0)
+    try Data("topic\n".utf8).write(to: file)
+    #expect(try git(["commit", "-qam", "topic"]).0 == 0)
+    #expect(try git(["switch", "-q", "main"]).0 == 0)
+    try Data("main\n".utf8).write(to: file)
+    #expect(try git(["commit", "-qam", "main"]).0 == 0)
+    let main = try ObjectID(
+        hex: git(["rev-parse", "HEAD"]).1
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    )
+    #expect(try git(["switch", "-q", "topic"]).0 == 0)
+    #expect(try git(["rebase", "main"]).0 != 0)
+
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.open(
+        try await Treeish.discover(in: root),
+        roots: [root]
+    )
+    let operation = try await repository.operationState().value()
+    #expect(operation?.kind == .foreignRebase)
+    #expect(operation?.conflicts.count == 1)
+    await #expect(throws: TreeishError.recoveryRequired(
+        "foreign rebase is already in progress"
+    )) {
+        _ = try await repository.reset(
+            ResetRequest(commit: main, mode: .hard)
+        ).value()
+    }
+    #expect(try git(["rebase", "--abort"]).0 == 0)
 }
 
 @Test func systemGitReadsTreeishTypedMultiCommitRebase() async throws {

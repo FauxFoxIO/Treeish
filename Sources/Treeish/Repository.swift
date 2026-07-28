@@ -932,30 +932,77 @@ public actor Repository {
         let store = objectStore
         return GitOperation(phase: .indexing) {
             let index = try Repository.readIndex(indexStore, store: store)
-            let grouped = Dictionary(grouping: index.entries.filter {
-                $0.stage != 0
-            }, by: \.path)
-            return try grouped.map { path, entries in
-                func side(_ stage: UInt8) throws -> ConflictStageEntry? {
-                    guard let entry = entries.first(where: {
-                        $0.stage == stage
-                    }) else {
-                        return nil
-                    }
-                    return ConflictStageEntry(
-                        mode: entry.mode,
-                        objectID: try ObjectID(bytes: entry.objectID)
-                    )
+            return try Repository.conflictEntries(index)
+        }
+    }
+
+    public func operationState() -> GitOperation<RepositoryOperationState?> {
+        let indexStore = indexStore
+        let store = objectStore
+        let headDirectory = gitDirectory
+        return GitOperation(phase: .indexing) {
+            let index = try Repository.readIndex(indexStore, store: store)
+            let conflicts = try Repository.conflictEntries(index)
+            func object(_ name: String) throws -> ObjectID? {
+                guard try headDirectory.exists([name]) else {
+                    return nil
                 }
-                return ConflictEntry(
-                    path: try GitPath(bytes: path),
-                    ancestor: try side(1),
-                    ours: try side(2),
-                    theirs: try side(3)
-                )
-            }.sorted {
-                $0.path.bytes.lexicographicallyPrecedes($1.path.bytes)
+                let value = String(
+                    decoding: try headDirectory.read([name], limit: 4096),
+                    as: UTF8.self
+                ).split(whereSeparator: \.isWhitespace).first.map(String.init)
+                guard let value else {
+                    throw TreeishError.malformedReference
+                }
+                return try ObjectID(hex: value)
             }
+            if let related = try object("MERGE_HEAD") {
+                return RepositoryOperationState(
+                    kind: .merge,
+                    relatedCommit: related,
+                    conflicts: conflicts
+                )
+            }
+            if let related = try object("CHERRY_PICK_HEAD") {
+                return RepositoryOperationState(
+                    kind: .cherryPick,
+                    relatedCommit: related,
+                    conflicts: conflicts
+                )
+            }
+            if let related = try object("REVERT_HEAD") {
+                return RepositoryOperationState(
+                    kind: .revert,
+                    relatedCommit: related,
+                    conflicts: conflicts
+                )
+            }
+            if try headDirectory.exists(["rebase-treeish"]) {
+                let state = try Repository.readRebaseState(
+                    from: headDirectory
+                )
+                return RepositoryOperationState(
+                    kind: .rebase,
+                    relatedCommit: state.current,
+                    conflicts: conflicts
+                )
+            }
+            if try headDirectory.exists(["rebase-merge"]) ||
+                headDirectory.exists(["rebase-apply"]) {
+                return RepositoryOperationState(
+                    kind: .foreignRebase,
+                    relatedCommit: try object("REBASE_HEAD"),
+                    conflicts: conflicts
+                )
+            }
+            if try headDirectory.exists(["sequencer"]) {
+                return RepositoryOperationState(
+                    kind: .sequencer,
+                    relatedCommit: nil,
+                    conflicts: conflicts
+                )
+            }
+            return nil
         }
     }
 
@@ -2376,6 +2423,7 @@ public actor Repository {
                   request.commit.algorithm == store.objectFormat else {
                 throw TreeishError.repositoryNotFound
             }
+            try Repository.ensureNoInProgressOperation(in: headDirectory)
             let commitObject = try await Repository.readPromisedObject(
                 request.commit.bytes,
                 preferredRemotes: promisorRemotes,
@@ -2558,6 +2606,7 @@ public actor Repository {
                   request.commit.algorithm == store.objectFormat else {
                 throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
             }
+            try Repository.ensureNoInProgressOperation(in: headDirectory)
             let object = try store.read(identifier: request.commit.bytes)
             let commit = try CommitRecord(identifier: request.commit.bytes, object: object)
             let target = try Repository.flattenTree(identifier: commit.tree, prefix: [], store: store)
@@ -2985,6 +3034,7 @@ public actor Repository {
                   request.other.algorithm == store.objectFormat else {
                 throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
             }
+            try Repository.ensureNoInProgressOperation(in: headDirectory)
             let head = try Repository.readHead(
                 headDirectory: headDirectory,
                 refsDirectory: refsDirectory
@@ -3228,6 +3278,7 @@ public actor Repository {
                   request.commit.algorithm == store.objectFormat else {
                 throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
             }
+            try Repository.ensureNoInProgressOperation(in: headDirectory)
             let head = try Repository.readHead(
                 headDirectory: headDirectory,
                 refsDirectory: refsDirectory
@@ -3403,6 +3454,7 @@ public actor Repository {
                   request.commit.algorithm == store.objectFormat else {
                 throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
             }
+            try Repository.ensureNoInProgressOperation(in: headDirectory)
             let head = try Repository.readHead(
                 headDirectory: headDirectory,
                 refsDirectory: refsDirectory
@@ -3605,6 +3657,7 @@ public actor Repository {
                   }) else {
                 throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
             }
+            try Repository.ensureNoInProgressOperation(in: headDirectory)
             let head = try Repository.readHead(
                 headDirectory: headDirectory,
                 refsDirectory: refsDirectory
@@ -3761,6 +3814,7 @@ public actor Repository {
             guard case .readWrite = access, let worktree else {
                 throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
             }
+            try Repository.ensureNoInProgressOperation(in: headDirectory)
             let head = try Repository.readHead(
                 headDirectory: headDirectory,
                 refsDirectory: refsDirectory
@@ -3921,6 +3975,7 @@ public actor Repository {
                   stash.algorithm == store.objectFormat else {
                 throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
             }
+            try Repository.ensureNoInProgressOperation(in: headDirectory)
             let stashRecord = try CommitRecord(
                 identifier: stash.bytes,
                 object: store.read(identifier: stash.bytes)
@@ -4972,6 +5027,7 @@ public actor Repository {
                     access.reason ?? .rootIsReadOnly
                 )
             }
+            try Repository.ensureNoInProgressOperation(in: headDirectory)
             let head = try Repository.readHead(
                 headDirectory: headDirectory,
                 refsDirectory: refsDirectory
@@ -7407,6 +7463,56 @@ public actor Repository {
             if FileManager.default.fileExists(atPath: url.path) {
                 try FileManager.default.removeItem(at: url)
             }
+        }
+    }
+
+    private static func ensureNoInProgressOperation(
+        in directory: RootDirectory
+    ) throws {
+        let markers: [([String], String)] = [
+            (["MERGE_HEAD"], "merge"),
+            (["CHERRY_PICK_HEAD"], "cherry-pick"),
+            (["REVERT_HEAD"], "revert"),
+            (["rebase-treeish"], "rebase"),
+            (["rebase-merge"], "foreign rebase"),
+            (["rebase-apply"], "foreign rebase"),
+            (["sequencer"], "sequencer"),
+        ]
+        if let marker = try markers.first(where: {
+            try directory.exists($0.0)
+        }) {
+            throw TreeishError.recoveryRequired(
+                "\(marker.1) is already in progress"
+            )
+        }
+    }
+
+    private static func conflictEntries(
+        _ index: GitIndex
+    ) throws -> [ConflictEntry] {
+        let grouped = Dictionary(grouping: index.entries.filter {
+            $0.stage != 0
+        }, by: \.path)
+        return try grouped.map { path, entries in
+            func side(_ stage: UInt8) throws -> ConflictStageEntry? {
+                guard let entry = entries.first(where: {
+                    $0.stage == stage
+                }) else {
+                    return nil
+                }
+                return ConflictStageEntry(
+                    mode: entry.mode,
+                    objectID: try ObjectID(bytes: entry.objectID)
+                )
+            }
+            return ConflictEntry(
+                path: try GitPath(bytes: path),
+                ancestor: try side(1),
+                ours: try side(2),
+                theirs: try side(3)
+            )
+        }.sorted {
+            $0.path.bytes.lexicographicallyPrecedes($1.path.bytes)
         }
     }
 

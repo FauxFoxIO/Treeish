@@ -57,6 +57,13 @@ application onto a clean current workspace, and preserves conflict stages.
 This surface intentionally stashes tracked changes only; untracked and ignored
 files remain in place.
 
+``Repository/operationState()`` reports canonical merge, cherry-pick, revert,
+Treeish rebase, system-Git rebase, and sequencer state together with exact
+conflict stages. Starting another commit, checkout, reset, merge, cherry-pick,
+revert, rebase, or stash mutation while one of these operations is active
+fails with `recoveryRequired`; callers must continue or abort the existing
+operation instead of overwriting its recovery metadata.
+
 ``Repository/checkIntegrity(_:)`` validates canonical loose and packed objects,
 commit/tree/tag connectivity and types, file or reftable references, and
 optional reflog roots without mutating the repository. It classifies

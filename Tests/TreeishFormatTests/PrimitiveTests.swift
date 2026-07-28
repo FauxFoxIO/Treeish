@@ -321,6 +321,32 @@ import Testing
     )
 }
 
+@Test func sparseIndexExtensionRoundTripsAndUnknownRequiredExtensionFails() throws {
+    let entry = try GitIndexEntry(
+        path: Array("excluded/".utf8),
+        objectID: [UInt8](repeating: 0x33, count: 20),
+        mode: 0o40000,
+        size: 0,
+        modificationSeconds: 0,
+        modificationNanoseconds: 0,
+        skipWorktree: true
+    )
+    let sparse = GitIndex(
+        version: 3,
+        isSparse: true,
+        entries: [entry]
+    )
+    #expect(try GitIndex.decode(sparse.encode()) == sparse)
+
+    var required = Array(GitIndex().encode().dropLast(20))
+    required += Array("link".utf8)
+    required += [0, 0, 0, 0]
+    required += SHA1.hash(required)
+    #expect(throws: GitIndexError.unsupportedExtension("link")) {
+        _ = try GitIndex.decode(required)
+    }
+}
+
 @Test func receivePackRequestCarriesCompareAndSwapAndPack() throws {
     let old = [UInt8](repeating: 0x11, count: 20)
     let new = [UInt8](repeating: 0x22, count: 20)

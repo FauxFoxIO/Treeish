@@ -1851,7 +1851,11 @@ func systemGitRecognizesTreeishLinkedWorktree(
         hex: git(["rev-parse", "HEAD"]).1
             .trimmingCharacters(in: .whitespacesAndNewlines)
     )
-    #expect(try git(["sparse-checkout", "set", "included"]).0 == 0)
+    #expect(
+        try git([
+            "sparse-checkout", "set", "--sparse-index", "included",
+        ]).0 == 0
+    )
     #expect(
         !FileManager.default.fileExists(
             atPath: directory.appendingPathComponent("excluded/file.txt").path
@@ -1863,6 +1867,8 @@ func systemGitRecognizesTreeishLinkedWorktree(
         try await Treeish.discover(in: root),
         roots: [root]
     )
+    #expect(await repository.capabilities().access == .readWrite)
+    #expect(await repository.capabilities().index.canRead)
     #expect(try await repository.status().value().isClean)
     let result = try await repository.checkout(
         CheckoutRequest(

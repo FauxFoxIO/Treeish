@@ -57,11 +57,13 @@ public struct GitIndexEntry: Sendable, Hashable {
 public struct GitIndex: Sendable, Hashable {
     public let version: UInt32
     public let objectFormat: GitHashAlgorithm
+    public let isSparse: Bool
     public var entries: [GitIndexEntry]
 
     public init(
         version: UInt32 = 2,
         objectFormat: GitHashAlgorithm = .sha1,
+        isSparse: Bool = false,
         entries: [GitIndexEntry] = []
     ) {
         precondition((2...4).contains(version))
@@ -70,6 +72,7 @@ public struct GitIndex: Sendable, Hashable {
         })
         self.version = version
         self.objectFormat = objectFormat
+        self.isSparse = isSparse
         self.entries = entries.sorted {
             if $0.path == $1.path { return $0.stage < $1.stage }
             return $0.path.lexicographicallyPrecedes($1.path)
@@ -171,6 +174,7 @@ public struct GitIndex: Sendable, Hashable {
             )
             previousPath = path
         }
+        var isSparse = false
         while reader.remainingCount > 0 {
             guard reader.remainingCount >= 8 else { throw GitIndexError.corrupt }
             let signature = Array(try reader.read(count: 4))
@@ -178,7 +182,14 @@ public struct GitIndex: Sendable, Hashable {
             guard UInt64(size) <= UInt64(reader.remainingCount) else {
                 throw GitIndexError.corrupt
             }
-            _ = try reader.read(count: Int(size))
+            let payload = try reader.read(count: Int(size))
+            if signature == Array("sdir".utf8) {
+                guard payload.isEmpty else {
+                    throw GitIndexError.corrupt
+                }
+                isSparse = true
+                continue
+            }
             if let first = signature.first, first >= 0x61, first <= 0x7a {
                 throw GitIndexError.unsupportedExtension(
                     String(decoding: signature, as: UTF8.self)
@@ -188,6 +199,7 @@ public struct GitIndex: Sendable, Hashable {
         return GitIndex(
             version: version,
             objectFormat: objectFormat,
+            isSparse: isSparse,
             entries: entries
         )
     }
@@ -244,6 +256,10 @@ public struct GitIndex: Sendable, Hashable {
                 }
             }
             previousPath = entry.path
+        }
+        if isSparse {
+            writer.append(contentsOf: "sdir".utf8)
+            writer.appendUInt32BE(0)
         }
         return writer.bytes + objectFormat.hash(writer.bytes)
     }

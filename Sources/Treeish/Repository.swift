@@ -178,7 +178,10 @@ public actor Repository {
                 worktree: worktree,
                 commonDirectory: commonDirectory
             )
-            var index = try indexStore.read()
+            var index = try Repository.readIndex(
+                indexStore,
+                store: store
+            )
             let existing = Dictionary(
                 uniqueKeysWithValues: index.entries
                     .filter { $0.stage == 0 }
@@ -276,7 +279,10 @@ public actor Repository {
             guard let worktree else {
                 return Status(entries: [])
             }
-            let index = try indexStore.read()
+            let index = try Repository.readIndex(
+                indexStore,
+                store: store
+            )
             let rules = try WorkingTreeRules(
                 worktree: worktree,
                 commonDirectory: refsDirectory
@@ -449,6 +455,7 @@ public actor Repository {
         let worktree = worktree
         let worktreePath = identity.location.worktreePath
         let indexStore = indexStore
+        let store = objectStore
         let objectFormat = repositoryCapabilities.objectFormat
         return GitOperation(phase: .indexing) {
             guard let worktree, let worktreePath else {
@@ -462,7 +469,10 @@ public actor Repository {
                     ($0.path.bytes, $0)
                 }
             )
-            let index = try indexStore.read()
+            let index = try Repository.readIndex(
+                indexStore,
+                store: store
+            )
             let gitlinks = Dictionary(
                 uniqueKeysWithValues: try index.entries
                     .filter { $0.stage == 0 && $0.mode == 0o160000 }
@@ -810,7 +820,10 @@ public actor Repository {
                     access.reason ?? .rootIsReadOnly
                 )
             }
-            let index = try indexStore.read()
+            let index = try Repository.readIndex(
+                indexStore,
+                store: store
+            )
             guard index.entries.allSatisfy({ $0.stage == 0 }) else {
                 throw GitIndexError.corrupt
             }
@@ -1777,7 +1790,10 @@ public actor Repository {
                     directory: refsDirectory
                 )
             }
-            let currentIndex = try indexStore.read()
+            let currentIndex = try Repository.readIndex(
+                indexStore,
+                store: store
+            )
             let tracked = Set(currentIndex.entries.filter { $0.stage == 0 }.map(\.path))
             let targetPaths = Set(includedTarget.map(\.path))
             if !request.force {
@@ -1925,7 +1941,10 @@ public actor Repository {
                 headDirectory: headDirectory,
                 refsDirectory: refsDirectory
             )
-            let currentIndex = try indexStore.read()
+            let currentIndex = try Repository.readIndex(
+                indexStore,
+                store: store
+            )
             func publishReference() throws {
                 if let reference = head.reference {
                     try Repository.publishReference(
@@ -2031,7 +2050,10 @@ public actor Repository {
                 prefix: [],
                 store: store
             ).map { ($0.path, $0) })
-            var index = try indexStore.read()
+            var index = try Repository.readIndex(
+                indexStore,
+                store: store
+            )
             let rules = try WorkingTreeRules(
                 worktree: worktree,
                 commonDirectory: refsDirectory
@@ -2127,7 +2149,10 @@ public actor Repository {
                 throw TreeishError.repositoryNotFound
             }
             let patch = try UnifiedPatch(bytes: request.patch)
-            var index = try indexStore.read()
+            var index = try Repository.readIndex(
+                indexStore,
+                store: store
+            )
             let rules: WorkingTreeRules?
             if let worktree {
                 rules = try WorkingTreeRules(
@@ -2341,7 +2366,10 @@ public actor Repository {
             guard let ours = head.objectID, let headReference = head.reference else {
                 throw TreeishError.malformedReference
             }
-            let currentIndex = try indexStore.read()
+            let currentIndex = try Repository.readIndex(
+                indexStore,
+                store: store
+            )
             let dirty = try Repository.worktreeStatus(
                 index: currentIndex,
                 worktree: worktree
@@ -2472,7 +2500,10 @@ public actor Repository {
             guard let ours = head.objectID, let reference = head.reference else {
                 throw TreeishError.malformedReference
             }
-            let index = try indexStore.read()
+            let index = try Repository.readIndex(
+                indexStore,
+                store: store
+            )
             guard index.entries.allSatisfy({ $0.stage == 0 }) else {
                 throw TreeishError.recoveryRequired("merge conflicts remain unresolved")
             }
@@ -2568,7 +2599,10 @@ public actor Repository {
             guard let ours = head.objectID, let reference = head.reference else {
                 throw TreeishError.malformedReference
             }
-            let currentIndex = try indexStore.read()
+            let currentIndex = try Repository.readIndex(
+                indexStore,
+                store: store
+            )
             guard try Repository.worktreeStatus(index: currentIndex, worktree: worktree).isEmpty else {
                 throw TreeishError.recoveryRequired("cherry-pick requires a clean worktree")
             }
@@ -2654,7 +2688,10 @@ public actor Repository {
             guard let parent = head.objectID, let reference = head.reference else {
                 throw TreeishError.malformedReference
             }
-            let index = try indexStore.read()
+            let index = try Repository.readIndex(
+                indexStore,
+                store: store
+            )
             guard index.entries.allSatisfy({ $0.stage == 0 }) else {
                 throw TreeishError.recoveryRequired("cherry-pick conflicts remain unresolved")
             }
@@ -2736,7 +2773,10 @@ public actor Repository {
             guard let original = head.objectID, let reference = head.reference else {
                 throw TreeishError.malformedReference
             }
-            guard try Repository.worktreeStatus(index: indexStore.read(), worktree: worktree).isEmpty else {
+            guard try Repository.worktreeStatus(
+                index: Repository.readIndex(indexStore, store: store),
+                worktree: worktree
+            ).isEmpty else {
                 throw TreeishError.recoveryRequired("rebase requires a clean worktree")
             }
             let ontoRecord = try CommitRecord(
@@ -2792,7 +2832,10 @@ public actor Repository {
             guard let current = state.current else {
                 throw TreeishError.recoveryRequired("rebase has no stopped commit")
             }
-            let index = try indexStore.read()
+            let index = try Repository.readIndex(
+                indexStore,
+                store: store
+            )
             guard index.entries.allSatisfy({ $0.stage == 0 }) else {
                 throw TreeishError.recoveryRequired("rebase conflicts remain unresolved")
             }
@@ -2862,6 +2905,7 @@ public actor Repository {
         let worktree = worktree
         let headDirectory = gitDirectory
         let refsDirectory = commonDirectory
+        let store = objectStore
         let objectFormat = repositoryCapabilities.objectFormat
         return GitOperation(phase: .indexing) {
             guard let worktree else { throw TreeishError.repositoryNotFound }
@@ -2869,7 +2913,10 @@ public actor Repository {
                 headDirectory: headDirectory,
                 refsDirectory: refsDirectory
             )
-            let indexBytes = try indexStore.read().encode()
+            let indexBytes = try Repository.readIndex(
+                indexStore,
+                store: store
+            ).encode()
             let paths = try Repository.enumerateFiles(in: worktree)
             var entries: [WorkspaceStateEntry] = []
             var blobs: [[UInt8]: WorkspaceStateBlob] = [:]
@@ -4779,15 +4826,64 @@ public actor Repository {
         stage: UInt8,
         store: RepositoryObjectStore
     ) throws -> GitIndexEntry {
-        let object = try store.read(identifier: value.objectID)
+        let size: UInt32
+        if value.mode == 0o160000 {
+            size = 0
+        } else {
+            let object = try store.read(identifier: value.objectID)
+            size = UInt32(min(object.payload.count, Int(UInt32.max)))
+        }
         return try GitIndexEntry(
             path: value.path,
             objectID: value.objectID,
             mode: value.mode,
-            size: UInt32(min(object.payload.count, Int(UInt32.max))),
+            size: size,
             modificationSeconds: 0,
             modificationNanoseconds: 0,
             stage: stage
+        )
+    }
+
+    private static func readIndex(
+        _ indexStore: GitIndexStore,
+        store: RepositoryObjectStore
+    ) throws -> GitIndex {
+        let index = try indexStore.read()
+        guard index.isSparse else {
+            return index
+        }
+        var entries = index.entries.filter { $0.mode != 0o40000 }
+        for sparseEntry in index.entries where sparseEntry.mode == 0o40000 {
+            guard sparseEntry.stage == 0,
+                  sparseEntry.skipWorktree,
+                  sparseEntry.path.last == 0x2f else {
+                throw GitIndexError.corrupt
+            }
+            let prefix = Array(sparseEntry.path.dropLast())
+            let flattened = try flattenTree(
+                identifier: sparseEntry.objectID,
+                prefix: prefix,
+                store: store
+            )
+            entries += try flattened.map {
+                try GitIndexEntry(
+                    path: $0.path,
+                    objectID: $0.objectID,
+                    mode: $0.mode,
+                    size: 0,
+                    modificationSeconds: 0,
+                    modificationNanoseconds: 0,
+                    skipWorktree: true
+                )
+            }
+        }
+        guard Set(entries.map(\.path)).count == entries.count else {
+            throw GitIndexError.corrupt
+        }
+        return GitIndex(
+            version: max(index.version, 3),
+            objectFormat: index.objectFormat,
+            entries: entries
         )
     }
 
@@ -4981,7 +5077,7 @@ public actor Repository {
         worktree: RootDirectory,
         store: RepositoryObjectStore
     ) throws {
-        let current = try indexStore.read()
+        let current = try readIndex(indexStore, store: store)
         let target = try flattenTree(identifier: tree, prefix: [], store: store)
         let targetPaths = Set(target.map(\.path))
         for entry in current.entries where !targetPaths.contains(entry.path) {
@@ -5092,7 +5188,10 @@ public actor Repository {
                 worktree: worktree,
                 store: store
             )
-            let currentIndex = try indexStore.read()
+            let currentIndex = try readIndex(
+                indexStore,
+                store: store
+            )
             let index = GitIndex(
                 version: currentIndex.version,
                 objectFormat: currentIndex.objectFormat,

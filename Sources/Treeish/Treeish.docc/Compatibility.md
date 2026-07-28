@@ -79,3 +79,9 @@ partially initialized checkout when initialization fails. Clone accepts an
 existing empty destination, matching the prerequisite used by submodule
 placeholders. ``CheckoutRequest/force`` is the explicit destructive-worktree
 opt-in used by forced updates.
+
+Sparse indexes carrying the required `sdir` extension are expanded through
+their tree entries before structured operations inspect or rewrite them.
+Treeish writes a canonical full index after mutation, which system Git may
+compact again. Other unknown lowercase required index extensions, including
+split-index `link`, keep index mutation disabled rather than being discarded.

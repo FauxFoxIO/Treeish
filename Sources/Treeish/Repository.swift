@@ -163,6 +163,7 @@ public actor Repository {
         let store = objectStore
         let indexStore = indexStore
         let worktree = worktree
+        let commonDirectory = commonDirectory
         let access = repositoryCapabilities.access
         return GitOperation(phase: .updatingIndex) {
             guard case .readWrite = access else {
@@ -173,7 +174,10 @@ public actor Repository {
             guard let worktree else {
                 throw TreeishError.repositoryNotFound
             }
-            let rules = try WorkingTreeRules(worktree: worktree)
+            let rules = try WorkingTreeRules(
+                worktree: worktree,
+                commonDirectory: commonDirectory
+            )
             var index = try indexStore.read()
             let existing = Dictionary(
                 uniqueKeysWithValues: index.entries
@@ -271,7 +275,10 @@ public actor Repository {
                 return Status(entries: [])
             }
             let index = try indexStore.read()
-            let rules = try WorkingTreeRules(worktree: worktree)
+            let rules = try WorkingTreeRules(
+                worktree: worktree,
+                commonDirectory: refsDirectory
+            )
             let stageZero = Dictionary(uniqueKeysWithValues: index.entries
                 .filter { $0.stage == 0 }
                 .map { ($0.path, $0) })
@@ -1357,6 +1364,10 @@ public actor Repository {
                 gitDirectory: headDirectory,
                 commonDirectory: refsDirectory
             )
+            let workingTreeRules = try WorkingTreeRules(
+                worktree: worktree,
+                commonDirectory: refsDirectory
+            )
             let includedTarget = try target.filter {
                 sparse.includes(try GitPath(bytes: $0.path))
             }
@@ -1392,7 +1403,11 @@ public actor Repository {
                     continue
                 }
                 let bytes = try Repository.worktreePayload(url: url)
-                let canonical = Array("blob \(bytes.count)\0".utf8) + bytes
+                let cleaned = entry.mode == 0o120000
+                    ? bytes
+                    : try workingTreeRules.clean(bytes, path: path)
+                let canonical =
+                    Array("blob \(cleaned.count)\0".utf8) + cleaned
                 guard store.objectFormat.hash(canonical) == entry.objectID else {
                     throw TreeishError.worktreeCollision(path)
                 }
@@ -1425,7 +1440,8 @@ public actor Repository {
                     try Repository.materializeFlatEntry(
                         entry,
                         worktree: worktree,
-                        store: store
+                        store: store,
+                        rules: workingTreeRules
                     )
                 }
                 let entries = try target.map { value -> GitIndexEntry in
@@ -1614,6 +1630,10 @@ public actor Repository {
                 store: store
             ).map { ($0.path, $0) })
             var index = try indexStore.read()
+            let rules = try WorkingTreeRules(
+                worktree: worktree,
+                commonDirectory: refsDirectory
+            )
             var candidateBytes = Set(source.keys)
             candidateBytes.formUnion(index.entries.map(\.path))
             let candidates = try candidateBytes.map(GitPath.init(bytes:))
@@ -1646,7 +1666,10 @@ public actor Repository {
                                 withDestinationPath: String(decoding: object.payload, as: UTF8.self)
                             )
                         } else {
-                            try worktree.writeAtomically(object.payload, to: path.components)
+                            try worktree.writeAtomically(
+                                rules.smudge(object.payload, path: path),
+                                to: path.components
+                            )
                             try FileManager.default.setAttributes(
                                 [.posixPermissions: value.mode == 0o100755 ? 0o755 : 0o644],
                                 ofItemAtPath: url.path
@@ -1705,7 +1728,10 @@ public actor Repository {
             var index = try indexStore.read()
             let rules: WorkingTreeRules?
             if let worktree {
-                rules = try WorkingTreeRules(worktree: worktree)
+                rules = try WorkingTreeRules(
+                    worktree: worktree,
+                    commonDirectory: commonDirectory
+                )
             } else {
                 rules = nil
             }
@@ -4253,7 +4279,8 @@ public actor Repository {
     private static func materializeFlatEntry(
         _ entry: FlatTreeEntry,
         worktree: RootDirectory,
-        store: RepositoryObjectStore
+        store: RepositoryObjectStore,
+        rules: WorkingTreeRules? = nil
     ) throws {
         let path = try GitPath(bytes: entry.path)
         let url = try worktree.url(for: path.components, followFinalSymlink: false)
@@ -4278,7 +4305,10 @@ public actor Repository {
                 withDestinationPath: String(decoding: object.payload, as: UTF8.self)
             )
         } else {
-            try worktree.writeAtomically(object.payload, to: path.components)
+            try worktree.writeAtomically(
+                rules?.smudge(object.payload, path: path) ?? object.payload,
+                to: path.components
+            )
             try FileManager.default.setAttributes(
                 [.posixPermissions: entry.mode == 0o100755 ? 0o755 : 0o644],
                 ofItemAtPath: url.path

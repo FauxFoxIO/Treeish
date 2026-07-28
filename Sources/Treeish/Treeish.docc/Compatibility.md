@@ -54,3 +54,11 @@ index entries retain `skip-worktree`, status does not report their intentional
 absence as deletion, and staging rejects them unless
 ``StageRequest/includeSparsePaths`` explicitly opts into Git's `--sparse`
 behavior.
+
+Ignore and attribute resolution reads repository-level `info/exclude` and
+`info/attributes` through the common Git directory, including from linked
+worktrees. Per-directory attributes apply from parent to child and repository
+`info/attributes` has highest precedence. Standard `text` and `eol=lf|crlf`
+clean/smudge conversion is applied during staging, status, checkout, and
+restore; active external filters and working-tree encodings are rejected
+instead of silently writing incorrect bytes.

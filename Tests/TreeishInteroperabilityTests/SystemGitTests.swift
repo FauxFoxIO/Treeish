@@ -850,6 +850,45 @@ func systemGitRecognizesTreeishLinkedWorktree(
         try Data(contentsOf: parent.appendingPathComponent("worker/file.txt"))
             == Data("linked\n".utf8)
     )
+    try Data("worker-only.tmp\n".utf8).write(
+        to: main.appendingPathComponent(".git/info/exclude")
+    )
+    try Data("ignored\n".utf8).write(
+        to: parent.appendingPathComponent("worker/worker-only.tmp")
+    )
+    let linkedRepository = try await Treeish.open(
+        try await Treeish.discover(
+            in: root,
+            from: try GitPath("worker")
+        ),
+        roots: [root]
+    )
+    let linkedStatus = try await linkedRepository.status().value()
+    #expect(
+        !linkedStatus.entries.contains {
+            $0.path == (try? GitPath("worker-only.tmp"))
+        }
+    )
+    try Data("file.txt filter=crypt\n".utf8).write(
+        to: main.appendingPathComponent(".git/info/attributes")
+    )
+    try Data("changed\n".utf8).write(
+        to: parent.appendingPathComponent("worker/file.txt")
+    )
+    await #expect(throws: TreeishError.unsupportedContentConversion(
+        try GitPath("file.txt"),
+        "filter=crypt"
+    )) {
+        _ = try await linkedRepository.stage(
+            StageRequest(pathspecs: [try GitPathspec("file.txt")])
+        ).value()
+    }
+    try Data("linked\n".utf8).write(
+        to: parent.appendingPathComponent("worker/file.txt")
+    )
+    try FileManager.default.removeItem(
+        at: parent.appendingPathComponent("worker/worker-only.tmp")
+    )
     #expect(try await repository.listLinkedWorktrees().value().contains {
         $0.identifier == linked.identifier && $0.path == linked.path
     })
@@ -1396,7 +1435,9 @@ func systemGitRecognizesTreeishLinkedWorktree(
     try Data("build/*\n!build/keep.txt\n".utf8).write(
         to: directory.appendingPathComponent(".gitignore")
     )
-    try Data("*.txt text eol=lf\nsecret.bin filter=crypt\n".utf8).write(
+    try Data(
+        "*.txt text eol=lf\ncrlf.txt text eol=crlf\nsecret.bin filter=crypt\n".utf8
+    ).write(
         to: directory.appendingPathComponent(".gitattributes")
     )
     try Data("drop\n".utf8).write(to: directory.appendingPathComponent("build/drop.txt"))
@@ -1404,11 +1445,27 @@ func systemGitRecognizesTreeishLinkedWorktree(
     try Data("line one\r\nline two\r\n".utf8).write(
         to: directory.appendingPathComponent("content.txt")
     )
+    try Data("preserve\r\n".utf8).write(
+        to: directory.appendingPathComponent("override.txt")
+    )
+    try Data("checkout\r\n".utf8).write(
+        to: directory.appendingPathComponent("crlf.txt")
+    )
+    try Data("ignored by info\n".utf8).write(
+        to: directory.appendingPathComponent("info-only.tmp")
+    )
     try Data("secret".utf8).write(to: directory.appendingPathComponent("secret.bin"))
     let root = try await TreeishRoot.localDirectory(at: directory)
     let repository = try await Treeish.initialize(in: root)
+    try Data("info-only.tmp\n".utf8).write(
+        to: directory.appendingPathComponent(".git/info/exclude")
+    )
+    try Data("override.txt -text !eol\n".utf8).write(
+        to: directory.appendingPathComponent(".git/info/attributes")
+    )
     let status = try await repository.status().value()
     #expect(!status.entries.contains { $0.path == (try? GitPath("build/drop.txt")) })
+    #expect(!status.entries.contains { $0.path == (try? GitPath("info-only.tmp")) })
     #expect(status.entries.contains { $0.path == (try? GitPath("build/keep.txt")) })
     await #expect(throws: TreeishError.self) {
         _ = try await repository.stage(
@@ -1426,6 +1483,8 @@ func systemGitRecognizesTreeishLinkedWorktree(
             try GitPathspec(".gitattributes"),
             try GitPathspec("build/keep.txt"),
             try GitPathspec("content.txt"),
+            try GitPathspec("crlf.txt"),
+            try GitPathspec("override.txt"),
         ])
     ).value()
     let tree = try await repository.writeIndexTree().value()
@@ -1435,7 +1494,7 @@ func systemGitRecognizesTreeishLinkedWorktree(
         secondsSinceEpoch: 1_700_000_000,
         timeZoneOffsetMinutes: 0
     )
-    _ = try await repository.commit(
+    let commit = try await repository.commit(
         CommitRequest(
             tree: tree,
             author: signature,
@@ -1462,6 +1521,37 @@ func systemGitRecognizesTreeishLinkedWorktree(
         output.fileHandleForReading.readDataToEndOfFile() ==
             Data("line one\nline two\n".utf8)
     )
+    let override = Process()
+    override.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+    override.arguments = ["-C", directory.path, "show", "HEAD:override.txt"]
+    let overrideOutput = Pipe()
+    override.standardOutput = overrideOutput
+    try override.run()
+    override.waitUntilExit()
+    #expect(override.terminationStatus == 0)
+    #expect(
+        overrideOutput.fileHandleForReading.readDataToEndOfFile() ==
+            Data("preserve\r\n".utf8)
+    )
+    try FileManager.default.removeItem(
+        at: directory.appendingPathComponent("crlf.txt")
+    )
+    _ = try await repository.checkout(
+        CheckoutRequest(
+            commit: commit.objectID,
+            reference: try RefName("refs/heads/main")
+        )
+    ).value()
+    #expect(
+        try Data(contentsOf: directory.appendingPathComponent("crlf.txt"))
+            == Data("checkout\r\n".utf8)
+    )
+    #expect(try await repository.status().value().entries == [
+        StatusEntry(
+            path: try GitPath("secret.bin"),
+            worktreeChange: .untracked
+        ),
+    ])
 }
 
 @Test func treeishBundleImportPublishesCanonicalPack() async throws {

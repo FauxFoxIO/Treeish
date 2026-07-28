@@ -12,12 +12,25 @@ struct WorkingTreeRules {
         let attributes: [String]
     }
 
+    private struct ResolvedAttributes {
+        var textMode: Bool?
+        var eol: String?
+        var filter: String?
+        var workingTreeEncoding: String?
+    }
+
     private let ignores: [IgnoreRule]
     private let attributes: [AttributeRule]
 
-    init(worktree: RootDirectory) throws {
+    init(
+        worktree: RootDirectory,
+        commonDirectory: RootDirectory
+    ) throws {
         var parsedIgnores: [IgnoreRule] = []
-        if let bytes = try? worktree.read([".git", "info", "exclude"], limit: 4 * 1024 * 1024),
+        if let bytes = try? commonDirectory.read(
+            ["info", "exclude"],
+            limit: 4 * 1024 * 1024
+        ),
            let text = String(bytes: bytes, encoding: .utf8) {
             parsedIgnores += try Self.ignoreRules(text: text, base: "")
         }
@@ -29,14 +42,17 @@ struct WorkingTreeRules {
         }
         ignores = parsedIgnores
         var parsedAttributes: [AttributeRule] = []
-        if let bytes = try? worktree.read([".git", "info", "attributes"], limit: 4 * 1024 * 1024),
-           let text = String(bytes: bytes, encoding: .utf8) {
-            parsedAttributes += try Self.attributeRules(text: text, base: "")
-        }
         for file in ruleFiles where file.name == ".gitattributes" {
             let bytes = try worktree.read(file.components, limit: 4 * 1024 * 1024)
             guard let text = String(bytes: bytes, encoding: .utf8) else { continue }
             parsedAttributes += try Self.attributeRules(text: text, base: file.base)
+        }
+        if let bytes = try? commonDirectory.read(
+            ["info", "attributes"],
+            limit: 4 * 1024 * 1024
+        ),
+           let text = String(bytes: bytes, encoding: .utf8) {
+            parsedAttributes += try Self.attributeRules(text: text, base: "")
         }
         attributes = parsedAttributes
     }
@@ -119,22 +135,14 @@ struct WorkingTreeRules {
     }
 
     func clean(_ payload: [UInt8], path: GitPath) throws -> [UInt8] {
-        let value = path.displayString
-        var textMode: Bool?
-        var eol: String?
-        for rule in attributes where rule.expression.matches(value) {
-            for attribute in rule.attributes {
-                if attribute == "text" || attribute == "text=auto" { textMode = true }
-                else if attribute == "-text" || attribute == "binary" { textMode = false }
-                else if attribute.hasPrefix("eol=") { eol = String(attribute.dropFirst(4)) }
-                else if attribute.hasPrefix("filter=") ||
-                            attribute.hasPrefix("working-tree-encoding=") {
-                    throw TreeishError.unsupportedContentConversion(path, attribute)
-                }
-            }
+        let resolved = resolvedAttributes(for: path)
+        try validateSupportedConversions(resolved, path: path)
+        guard resolved.textMode == true || resolved.eol != nil else {
+            return payload
         }
-        guard textMode == true || eol != nil else { return payload }
-        if textMode == true, payload.contains(0) { return payload }
+        if resolved.textMode == true, payload.contains(0) {
+            return payload
+        }
         var normalized: [UInt8] = []
         normalized.reserveCapacity(payload.count)
         var index = 0
@@ -149,6 +157,91 @@ struct WorkingTreeRules {
             }
         }
         return normalized
+    }
+
+    func smudge(_ payload: [UInt8], path: GitPath) throws -> [UInt8] {
+        let resolved = resolvedAttributes(for: path)
+        try validateSupportedConversions(resolved, path: path)
+        guard resolved.textMode != false else {
+            return payload
+        }
+        guard let eol = resolved.eol else {
+            return payload
+        }
+        guard eol == "lf" || eol == "crlf" else {
+            throw TreeishError.unsupportedContentConversion(
+                path,
+                "eol=\(eol)"
+            )
+        }
+        guard eol == "crlf", !payload.contains(0) else {
+            return payload
+        }
+        var converted: [UInt8] = []
+        converted.reserveCapacity(payload.count)
+        var previous: UInt8?
+        for byte in payload {
+            if byte == 0x0a, previous != 0x0d {
+                converted.append(0x0d)
+            }
+            converted.append(byte)
+            previous = byte
+        }
+        return converted
+    }
+
+    private func validateSupportedConversions(
+        _ resolved: ResolvedAttributes,
+        path: GitPath
+    ) throws {
+        if let filter = resolved.filter {
+            throw TreeishError.unsupportedContentConversion(
+                path,
+                "filter=\(filter)"
+            )
+        }
+        if let encoding = resolved.workingTreeEncoding {
+            throw TreeishError.unsupportedContentConversion(
+                path,
+                "working-tree-encoding=\(encoding)"
+            )
+        }
+    }
+
+    private func resolvedAttributes(for path: GitPath) -> ResolvedAttributes {
+        let value = path.displayString
+        var result = ResolvedAttributes()
+        for rule in attributes where rule.expression.matches(value) {
+            for attribute in rule.attributes {
+                switch attribute {
+                case "text", "text=auto":
+                    result.textMode = true
+                case "-text", "binary":
+                    result.textMode = false
+                case "!text":
+                    result.textMode = nil
+                case "-eol", "!eol":
+                    result.eol = nil
+                case "-filter", "!filter":
+                    result.filter = nil
+                case "filter":
+                    result.filter = "set"
+                case "-working-tree-encoding", "!working-tree-encoding":
+                    result.workingTreeEncoding = nil
+                default:
+                    if attribute.hasPrefix("eol=") {
+                        result.eol = String(attribute.dropFirst(4))
+                    } else if attribute.hasPrefix("filter=") {
+                        result.filter = String(attribute.dropFirst(7))
+                    } else if attribute.hasPrefix("working-tree-encoding=") {
+                        result.workingTreeEncoding = String(
+                            attribute.dropFirst(22)
+                        )
+                    }
+                }
+            }
+        }
+        return result
     }
 
     private static func expression(

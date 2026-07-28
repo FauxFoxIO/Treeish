@@ -287,7 +287,7 @@ decisions for the host app.
   v1/v2 stacks, atomic updates, tombstones, and reflogs; and
 - index versions 2–4, extended entry flags, optional index extensions,
   executable files, symbolic links, sparse-checkout patterns, ignore rules,
-  and attributes.
+  repository and linked-worktree exclude rules, and text/EOL attributes.
 
 ### Everyday Git
 

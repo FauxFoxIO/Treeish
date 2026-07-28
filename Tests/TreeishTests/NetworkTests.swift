@@ -577,7 +577,7 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
         + PacketLineEncoder.encode(
             .data(
                 Array(
-                    "\(zero) capabilities^{}\0report-status atomic ofs-delta\n".utf8
+                    "\(zero) capabilities^{}\0report-status atomic push-options ofs-delta\n".utf8
                 )
             )
         )
@@ -617,7 +617,9 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
                     source: try RefName("refs/heads/main"),
                     destination: try RefName("refs/heads/main")
                 ),
-            ]
+            ],
+            requiresAtomic: true,
+            options: ["ci.skip"]
         ),
         services: RepositoryServices(httpTransport: transport)
     ).value()
@@ -629,7 +631,60 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
     #expect(String(decoding: body.prefix(200), as: UTF8.self).contains(
         "\(zero) \(commit.objectID.description) refs/heads/main"
     ))
+    #expect(String(decoding: body, as: UTF8.self).contains("push-options"))
+    #expect(String(decoding: body, as: UTF8.self).contains("ci.skip"))
     #expect(body.containsSubsequence(Array("PACK".utf8)))
+
+    let deletionAdvertisement = try PacketLineEncoder.encode(
+        .data(
+            Array(
+                "\(commit.objectID.description) refs/heads/main\0report-status delete-refs\n".utf8
+            )
+        )
+    ) + PacketLineEncoder.encode(.flush)
+    let deletionStatus =
+        try PacketLineEncoder.encode(.data(Array("unpack ok\n".utf8)))
+        + PacketLineEncoder.encode(
+            .data(Array("ok refs/heads/main\n".utf8))
+        )
+        + PacketLineEncoder.encode(.flush)
+    let deletionTransport = ScriptedSmartHTTPTransport(responses: [
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type":
+                    "application/x-git-receive-pack-advertisement",
+            ],
+            body: deletionAdvertisement,
+            finalURL: remote.url.appendingPathComponent("info/refs")
+        ),
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type": "application/x-git-receive-pack-result",
+            ],
+            body: deletionStatus,
+            finalURL: remote.url.appendingPathComponent("git-receive-pack")
+        ),
+    ])
+    let deletion = try await repository.push(
+        try PushRequest(
+            remote: remote,
+            refspecs: [
+                PushRefspec(
+                    source: nil,
+                    destination: try RefName("refs/heads/main")
+                ),
+            ]
+        ),
+        services: RepositoryServices(httpTransport: deletionTransport)
+    ).value()
+    #expect(deletion.references.first?.current == nil)
+    #expect(deletion.references.first?.disposition == .accepted)
+    let deletionRequests = await deletionTransport.requests
+    #expect(
+        !deletionRequests[1].body.containsSubsequence(Array("PACK".utf8))
+    )
 }
 
 @Test func pushUsesStatefulSSHReceivePackSession() async throws {

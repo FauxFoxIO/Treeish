@@ -351,6 +351,18 @@ import Testing
     #expect(result.statuses == [.accepted(Array("refs/heads/main".utf8))])
 }
 
+@Test func receivePackSupportsServersWithoutStatusReports() throws {
+    let reference = Array("refs/heads/main".utf8)
+    let result = try ReceivePackV0.parseResponse(
+        [],
+        sideband: false,
+        requiresStatus: false,
+        expectedReferences: [reference]
+    )
+    #expect(result.unpacked)
+    #expect(result.statuses == [.accepted(reference)])
+}
+
 @Test func uploadPackV2NegotiatesRefsAndPackfileSections() throws {
     let capabilities = try UploadPackV2.parseCapabilities([
         .data(Array("version 2\n".utf8)),
@@ -440,11 +452,18 @@ import Testing
     let request = try ReceivePackV0.request(
         commands: [first, deletion],
         pack: Array("PACK".utf8),
-        advertisedCapabilities: ["report-status", "atomic"]
+        requiresAtomic: true,
+        pushOptions: ["ci.skip", "deployment=staging"],
+        advertisedCapabilities: [
+            "report-status", "atomic", "push-options",
+        ]
     )
     let text = String(decoding: request, as: UTF8.self)
     #expect(text.contains("refs/heads/main"))
     #expect(text.contains("refs/heads/old"))
     #expect(text.contains("atomic"))
+    #expect(text.contains("push-options"))
+    #expect(text.contains("ci.skip"))
+    #expect(text.contains("deployment=staging"))
     #expect(text.contains(String(repeating: "0", count: 40)))
 }

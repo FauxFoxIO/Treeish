@@ -39,14 +39,37 @@ public enum ReceivePackV0 {
     public static func request(
         commands: [ReceivePackCommand],
         pack: [UInt8],
+        requiresAtomic: Bool = false,
+        pushOptions: [String] = [],
         objectFormat: GitHashAlgorithm = .sha1,
         advertisedCapabilities: Set<String>
     ) throws -> [UInt8] {
         guard !commands.isEmpty else { throw ReceivePackError.invalidCommand }
-        var supported = [
-            "report-status-v2", "report-status", "side-band-64k", "ofs-delta",
-            "atomic",
-        ]
+        var supported = ["side-band-64k", "ofs-delta"]
+        if advertisedCapabilities.contains("report-status-v2") {
+            supported.append("report-status-v2")
+        } else if advertisedCapabilities.contains("report-status") {
+            supported.append("report-status")
+        }
+        if requiresAtomic {
+            guard advertisedCapabilities.contains("atomic") else {
+                throw ReceivePackError.invalidCommand
+            }
+            supported.append("atomic")
+        }
+        if !pushOptions.isEmpty {
+            guard advertisedCapabilities.contains("push-options"),
+                  pushOptions.count <= 1_024,
+                  pushOptions.allSatisfy({
+                      !$0.isEmpty
+                          && $0.utf8.count <= 65_516
+                          && !$0.contains("\0")
+                          && !$0.contains("\n")
+                  }) else {
+                throw ReceivePackError.invalidCommand
+            }
+            supported.append("push-options")
+        }
         let objectCapability = "object-format=\(objectFormat.rawValue)"
         if advertisedCapabilities.contains(objectCapability) {
             supported.append(objectCapability)
@@ -64,13 +87,23 @@ public enum ReceivePackV0 {
             output += try PacketLineEncoder.encode(.data(Array(line.utf8)))
         }
         output += try PacketLineEncoder.encode(.flush)
+        for option in pushOptions {
+            output += try PacketLineEncoder.encode(
+                .data(Array(option.utf8))
+            )
+        }
+        if !pushOptions.isEmpty {
+            output += try PacketLineEncoder.encode(.flush)
+        }
         output += pack
         return output
     }
 
     public static func parseResponse(
         _ bytes: [UInt8],
-        sideband: Bool
+        sideband: Bool,
+        requiresStatus: Bool = true,
+        expectedReferences: [[UInt8]] = []
     ) throws -> ReceivePackResult {
         var decoder = PacketLineDecoder()
         let outer = try decoder.append(bytes)
@@ -92,6 +125,14 @@ public enum ReceivePackV0 {
         var statusDecoder = PacketLineDecoder()
         let packets = try statusDecoder.append(statusBytes)
         try statusDecoder.finish()
+        if !requiresStatus {
+            return ReceivePackResult(
+                unpacked: true,
+                statuses: expectedReferences.map {
+                    .accepted($0)
+                }
+            )
+        }
         var unpacked = false
         var statuses: [ReceivePackRefStatus] = []
         for packet in packets {

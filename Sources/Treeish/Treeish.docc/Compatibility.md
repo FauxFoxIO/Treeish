@@ -35,3 +35,9 @@ its recoverable worktree transaction.
 ``FetchRequest/depth`` and ``CloneRequest/depth`` negotiate commit depth over
 protocol v0 or v2. Server `shallow` and `unshallow` responses update the
 standard shallow-boundary file before fetched references are published.
+
+Receive-pack selects `report-status-v2` ahead of `report-status`, requests
+`atomic` only for atomic pushes, frames standard push options, and refuses
+reference deletion unless the server advertises `delete-refs`. Deletion-only
+pushes omit the packfile; creates and updates always carry a pack, including a
+canonical empty pack when the remote already has every required object.

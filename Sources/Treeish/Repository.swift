@@ -1037,9 +1037,14 @@ public actor Repository {
             try decoder.finish()
             let advertisement = try UploadPackV0.parseAdvertisement(packets)
             if request.requiresAtomic,
-               request.refspecs.count > 1,
                !advertisement.capabilities.contains("atomic") {
                 throw TreeishError.unsupportedRepositoryFormat("remote does not support atomic push")
+            }
+            if !request.options.isEmpty,
+               !advertisement.capabilities.contains("push-options") {
+                throw TreeishError.unsupportedRepositoryFormat(
+                    "remote does not support push options"
+                )
             }
             var commands: [ReceivePackCommand] = []
             var desired: [RefName: ObjectID?] = [:]
@@ -1055,6 +1060,12 @@ public actor Repository {
                 )
                 let newValue = try refspec.source.map {
                     try Repository.readReference(directory: localDirectory, name: $0)
+                }
+                if newValue == nil,
+                   !advertisement.capabilities.contains("delete-refs") {
+                    throw TreeishError.unsupportedRepositoryFormat(
+                        "remote does not support deleting references"
+                    )
                 }
                 if !refspec.force, let old = advertised?.objectID, let newValue {
                     let graph = CommitGraph(source: RepositoryCommitSource(store: store))
@@ -1081,12 +1092,24 @@ public actor Repository {
                     name: refspec.destination.bytes
                 ))
             }
-            let archive = try PackWriter.write(objectsByID.values.sorted {
-                $0.identifier.lexicographicallyPrecedes($1.identifier)
-            }, objectFormat: store.objectFormat)
+            let pack: [UInt8]
+            if request.refspecs.contains(where: { $0.source != nil }) {
+                pack = try PackWriter.write(
+                    objectsByID.values.sorted {
+                        $0.identifier.lexicographicallyPrecedes(
+                            $1.identifier
+                        )
+                    },
+                    objectFormat: store.objectFormat
+                ).pack
+            } else {
+                pack = []
+            }
             let body = try ReceivePackV0.request(
                 commands: commands,
-                pack: archive.pack,
+                pack: pack,
+                requiresAtomic: request.requiresAtomic,
+                pushOptions: request.options,
                 objectFormat: store.objectFormat,
                 advertisedCapabilities: advertisement.capabilities
             )
@@ -1114,10 +1137,31 @@ public actor Repository {
                 )
             }
             let usesSideband = advertisement.capabilities.contains("side-band-64k")
-            let result = try ReceivePackV0.parseResponse(
-                resultBody,
-                sideband: usesSideband
-            )
+            let hasStatus = advertisement.capabilities.contains(
+                "report-status-v2"
+            ) || advertisement.capabilities.contains("report-status")
+            let result: ReceivePackResult
+            do {
+                result = try ReceivePackV0.parseResponse(
+                    resultBody,
+                    sideband: usesSideband,
+                    requiresStatus: hasStatus,
+                    expectedReferences: request.refspecs.map {
+                        $0.destination.bytes
+                    }
+                )
+            } catch let ReceivePackError.unpackFailed(reason) {
+                throw ReceivePackError.unpackFailed(reason)
+            } catch {
+                let reconciliation = PushReconciliation(
+                    expectedReferences: desired
+                )
+                let encoded = (try? JSONEncoder().encode(reconciliation))
+                    .map { String(decoding: $0, as: UTF8.self) } ?? "{}"
+                throw TreeishError.indeterminateRemoteResult(
+                    "receive-pack status invalid; reconcile by fetching refs: \(encoded)"
+                )
+            }
             var references: [PushRefResult] = []
             for refspec in request.refspecs {
                 guard let status = result.statuses.first(where: { value in

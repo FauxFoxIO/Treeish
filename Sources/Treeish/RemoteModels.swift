@@ -345,16 +345,28 @@ public struct PushRequest: Sendable, Hashable {
     public let remote: RemoteURL
     public let refspecs: [PushRefspec]
     public let requiresAtomic: Bool
+    public let options: [String]
 
     public init(
         remote: RemoteURL,
         refspecs: [PushRefspec],
-        requiresAtomic: Bool = false
+        requiresAtomic: Bool = false,
+        options: [String] = []
     ) throws {
-        guard !refspecs.isEmpty else { throw TreeishError.invalidRefName }
+        guard !refspecs.isEmpty,
+              options.count <= 1_024,
+              options.allSatisfy({
+                  !$0.isEmpty
+                      && $0.utf8.count <= 65_516
+                      && !$0.contains("\0")
+                      && !$0.contains("\n")
+              }) else {
+            throw TreeishError.invalidRefName
+        }
         self.remote = remote
         self.refspecs = refspecs
         self.requiresAtomic = requiresAtomic
+        self.options = options
     }
 
     public init(
@@ -370,6 +382,7 @@ public struct PushRequest: Sendable, Hashable {
             force: force
         )]
         requiresAtomic = false
+        options = []
     }
 }
 

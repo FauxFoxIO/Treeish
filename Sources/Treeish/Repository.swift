@@ -14,6 +14,12 @@ private struct IntegrityEdge: Sendable {
     let expected: GitObjectType?
 }
 
+private struct RepositoryDiffSnapshotEntry: Sendable {
+    let mode: UInt32
+    let objectID: [UInt8]
+    let payload: [UInt8]?
+}
+
 public actor Repository {
     public nonisolated let identity: RepositoryIdentity
 
@@ -921,6 +927,38 @@ public actor Repository {
         }
     }
 
+    public func conflicts() -> GitOperation<[ConflictEntry]> {
+        let indexStore = indexStore
+        let store = objectStore
+        return GitOperation(phase: .indexing) {
+            let index = try Repository.readIndex(indexStore, store: store)
+            let grouped = Dictionary(grouping: index.entries.filter {
+                $0.stage != 0
+            }, by: \.path)
+            return try grouped.map { path, entries in
+                func side(_ stage: UInt8) throws -> ConflictStageEntry? {
+                    guard let entry = entries.first(where: {
+                        $0.stage == stage
+                    }) else {
+                        return nil
+                    }
+                    return ConflictStageEntry(
+                        mode: entry.mode,
+                        objectID: try ObjectID(bytes: entry.objectID)
+                    )
+                }
+                return ConflictEntry(
+                    path: try GitPath(bytes: path),
+                    ancestor: try side(1),
+                    ours: try side(2),
+                    theirs: try side(3)
+                )
+            }.sorted {
+                $0.path.bytes.lexicographicallyPrecedes($1.path.bytes)
+            }
+        }
+    }
+
     public func submodules() -> GitOperation<[SubmoduleStatus]> {
         let root = root
         let worktree = worktree
@@ -1420,6 +1458,119 @@ public actor Repository {
                     }
                 })
             }
+        }
+    }
+
+    public func diff(
+        _ request: RepositoryDiffRequest = .init()
+    ) -> GitOperation<RepositoryDiff> {
+        let store = objectStore
+        let indexStore = indexStore
+        let worktree = worktree
+        let headDirectory = gitDirectory
+        let refsDirectory = commonDirectory
+        return GitOperation(phase: .counting) {
+            guard request.maximumFiles > 0,
+                  request.maximumMatrixCellsPerFile > 0 else {
+                throw TreeishError.recoveryRequired("invalid diff resource limit")
+            }
+            let old = try Repository.diffSnapshot(
+                request.old,
+                store: store,
+                indexStore: indexStore,
+                worktree: worktree,
+                headDirectory: headDirectory,
+                refsDirectory: refsDirectory
+            )
+            let new = try Repository.diffSnapshot(
+                request.new,
+                store: store,
+                indexStore: indexStore,
+                worktree: worktree,
+                headDirectory: headDirectory,
+                refsDirectory: refsDirectory
+            )
+            let allPaths = try Set(old.keys).union(new.keys).map {
+                try GitPath(bytes: $0)
+            }
+            let selected = GitPathspec.select(
+                allPaths,
+                using: request.pathspecs
+            ).sorted {
+                $0.bytes.lexicographicallyPrecedes($1.bytes)
+            }
+            guard selected.count <= request.maximumFiles else {
+                throw TreeishError.recoveryRequired("diff file limit exceeded")
+            }
+            var files: [RepositoryFileDiff] = []
+            files.reserveCapacity(selected.count)
+            for path in selected {
+                try Task.checkCancellation()
+                let left = old[path.bytes]
+                let right = new[path.bytes]
+                if left?.mode == right?.mode,
+                   left?.objectID == right?.objectID {
+                    continue
+                }
+                let kind: RepositoryFileDiffKind
+                switch (left, right) {
+                case (nil, .some):
+                    kind = .added
+                case (.some, nil):
+                    kind = .deleted
+                case (.some(let left), .some(let right))
+                    where left.mode != right.mode:
+                    kind = .typeChanged
+                case (.some, .some):
+                    kind = .modified
+                case (nil, nil):
+                    continue
+                }
+                let oldBytes = try Repository.diffPayload(
+                    left,
+                    store: store
+                )
+                let newBytes = try Repository.diffPayload(
+                    right,
+                    store: store
+                )
+                let content: BlobDiff
+                switch try DiffEngine.diff(
+                    old: oldBytes,
+                    new: newBytes,
+                    maximumMatrixCells: request.maximumMatrixCellsPerFile
+                ) {
+                case .identical:
+                    content = .identical
+                case .binary(let oldBytes, let newBytes):
+                    content = .binary(
+                        oldBytes: oldBytes,
+                        newBytes: newBytes
+                    )
+                case .text(let lines):
+                    content = .text(lines.map {
+                        switch $0 {
+                        case .context(let bytes): .context(bytes)
+                        case .deletion(let bytes): .deletion(bytes)
+                        case .insertion(let bytes): .insertion(bytes)
+                        }
+                    })
+                }
+                files.append(RepositoryFileDiff(
+                    path: path,
+                    kind: kind,
+                    oldMode: left?.mode,
+                    newMode: right?.mode,
+                    oldObjectID: try left.map {
+                        try ObjectID(bytes: $0.objectID)
+                    },
+                    newObjectID: try right.map {
+                        try ObjectID(bytes: $0.objectID)
+                    },
+                    content: content
+                ))
+            }
+            return RepositoryDiff(files: files)
         }
     }
 
@@ -6191,6 +6342,180 @@ public actor Repository {
             return Array(try FileManager.default.destinationOfSymbolicLink(atPath: url.path).utf8)
         }
         return Array(try Data(contentsOf: url))
+    }
+
+    private static func diffSnapshot(
+        _ target: RepositoryDiffTarget,
+        store: RepositoryObjectStore,
+        indexStore: GitIndexStore,
+        worktree: RootDirectory?,
+        headDirectory: RootDirectory,
+        refsDirectory: RootDirectory
+    ) throws -> [[UInt8]: RepositoryDiffSnapshotEntry] {
+        switch target {
+        case .head:
+            let head = try readHead(
+                headDirectory: headDirectory,
+                refsDirectory: refsDirectory
+            )
+            guard let identifier = head.objectID else {
+                return [:]
+            }
+            return try diffTreeSnapshot(
+                treeish: identifier,
+                store: store
+            )
+        case .object(let identifier):
+            guard identifier.algorithm == store.objectFormat else {
+                throw TreeishError.invalidObjectID
+            }
+            return try diffTreeSnapshot(
+                treeish: identifier,
+                store: store
+            )
+        case .index:
+            let index = try readIndex(indexStore, store: store)
+            guard index.entries.allSatisfy({ $0.stage == 0 }) else {
+                throw TreeishError.recoveryRequired(
+                    "diff target contains unresolved conflicts"
+                )
+            }
+            return Dictionary(uniqueKeysWithValues: index.entries.map {
+                (
+                    $0.path,
+                    RepositoryDiffSnapshotEntry(
+                        mode: $0.mode,
+                        objectID: $0.objectID,
+                        payload: nil
+                    )
+                )
+            })
+        case .worktree:
+            guard let worktree else {
+                throw TreeishError.repositoryNotFound
+            }
+            let index = try readIndex(indexStore, store: store)
+            guard index.entries.allSatisfy({ $0.stage == 0 }) else {
+                throw TreeishError.recoveryRequired(
+                    "diff target contains unresolved conflicts"
+                )
+            }
+            let rules = try WorkingTreeRules(
+                worktree: worktree,
+                commonDirectory: refsDirectory
+            )
+            var result: [[UInt8]: RepositoryDiffSnapshotEntry] = [:]
+            for entry in index.entries {
+                try Task.checkCancellation()
+                let path = try GitPath(bytes: entry.path)
+                guard try worktree.exists(path.components) else {
+                    continue
+                }
+                if entry.mode == 0o160000 {
+                    result[entry.path] = RepositoryDiffSnapshotEntry(
+                        mode: entry.mode,
+                        objectID: entry.objectID,
+                        payload: nil
+                    )
+                    continue
+                }
+                let url = try worktree.url(
+                    for: path.components,
+                    followFinalSymlink: false
+                )
+                let attributes = try FileManager.default.attributesOfItem(
+                    atPath: url.path
+                )
+                let type = attributes[.type] as? FileAttributeType
+                guard type != .typeDirectory else {
+                    result[entry.path] = RepositoryDiffSnapshotEntry(
+                        mode: 0o040000,
+                        objectID: entry.objectID,
+                        payload: []
+                    )
+                    continue
+                }
+                let raw = try worktreePayload(url: url)
+                let payload = type == .typeSymbolicLink
+                    ? raw
+                    : try rules.clean(raw, path: path)
+                let permissions = (attributes[.posixPermissions] as? NSNumber)?
+                    .uint16Value ?? 0o644
+                let mode: UInt32 = type == .typeSymbolicLink
+                    ? 0o120000
+                    : (permissions & 0o111 == 0 ? 0o100644 : 0o100755)
+                result[entry.path] = RepositoryDiffSnapshotEntry(
+                    mode: mode,
+                    objectID: store.objectFormat.hash(
+                        Array("blob \(payload.count)\0".utf8) + payload
+                    ),
+                    payload: payload
+                )
+            }
+            return result
+        }
+    }
+
+    private static func diffTreeSnapshot(
+        treeish: ObjectID,
+        store: RepositoryObjectStore
+    ) throws -> [[UInt8]: RepositoryDiffSnapshotEntry] {
+        var identifier = treeish.bytes
+        var tags: Set<[UInt8]> = []
+        while true {
+            guard tags.count < 16, tags.insert(identifier).inserted else {
+                throw TreeishError.recoveryRequired(
+                    "tree-ish tag chain limit exceeded"
+                )
+            }
+            let object = try store.read(identifier: identifier)
+            switch object.type {
+            case .commit:
+                identifier = try CommitRecord(
+                    identifier: identifier,
+                    object: object
+                ).tree
+            case .tag:
+                guard let target = try tagTarget(object.payload) else {
+                    throw GitObjectError.invalidHeader
+                }
+                identifier = target
+            case .tree:
+                return Dictionary(uniqueKeysWithValues: try flattenTree(
+                    identifier: identifier,
+                    prefix: [],
+                    store: store
+                ).map {
+                    (
+                        $0.path,
+                        RepositoryDiffSnapshotEntry(
+                            mode: $0.mode,
+                            objectID: $0.objectID,
+                            payload: nil
+                        )
+                    )
+                })
+            case .blob:
+                throw GitObjectError.invalidHeader
+            }
+        }
+    }
+
+    private static func diffPayload(
+        _ entry: RepositoryDiffSnapshotEntry?,
+        store: RepositoryObjectStore
+    ) throws -> [UInt8] {
+        guard let entry else {
+            return []
+        }
+        if let payload = entry.payload {
+            return payload
+        }
+        if entry.mode == 0o160000 {
+            let identifier = try ObjectID(bytes: entry.objectID)
+            return Array("Subproject commit \(identifier.description)\n".utf8)
+        }
+        return try store.read(identifier: entry.objectID).payload
     }
 
     private static func sameTreeEntry(

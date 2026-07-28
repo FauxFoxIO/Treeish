@@ -2599,6 +2599,88 @@ func checkoutMovesOnlyHeadAndResetLogsResolvedHead(
     )
 }
 
+@Test func treeishStructuredDiffMatchesSystemGitTrackedChanges() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let modified = directory.appendingPathComponent("modified.txt")
+    let deleted = directory.appendingPathComponent("deleted.txt")
+    let untracked = directory.appendingPathComponent("untracked.txt")
+    try Data("one\ntwo\n".utf8).write(to: modified)
+    try Data("deleted\n".utf8).write(to: deleted)
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.initialize(in: root)
+    _ = try await repository.stage(StageRequest(pathspecs: [
+        try GitPathspec("modified.txt"),
+        try GitPathspec("deleted.txt"),
+    ])).value()
+    let signature = Signature(
+        name: "Treeish",
+        email: "treeish@example.com",
+        secondsSinceEpoch: 1_700_000_000,
+        timeZoneOffsetMinutes: 0
+    )
+    let base = try await repository.commit(CommitRequest(
+        tree: try await repository.writeIndexTree().value(),
+        author: signature,
+        committer: signature,
+        message: Array("base\n".utf8)
+    )).value().objectID
+
+    try Data("one\nTWO\n".utf8).write(to: modified)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: modified.path
+    )
+    try FileManager.default.removeItem(at: deleted)
+    try Data("not part of git diff\n".utf8).write(to: untracked)
+
+    let worktreeDiff = try await repository.diff().value()
+    #expect(worktreeDiff.files.map(\.path.displayString) == [
+        "deleted.txt", "modified.txt",
+    ])
+    #expect(worktreeDiff.files[0].kind == .deleted)
+    #expect(worktreeDiff.files[1].kind == .typeChanged)
+    #expect(worktreeDiff.files[1].oldMode == 0o100644)
+    #expect(worktreeDiff.files[1].newMode == 0o100755)
+    guard case .text(let lines) = worktreeDiff.files[1].content else {
+        Issue.record("expected text diff")
+        return
+    }
+    #expect(lines.contains(.deletion(Array("two\n".utf8))))
+    #expect(lines.contains(.insertion(Array("TWO\n".utf8))))
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+    process.arguments = ["-C", directory.path, "diff", "--name-status"]
+    let output = Pipe()
+    process.standardOutput = output
+    process.standardError = output
+    try process.run()
+    process.waitUntilExit()
+    let names = String(
+        decoding: output.fileHandleForReading.readDataToEndOfFile(),
+        as: UTF8.self
+    ).split(separator: "\n").map(String.init)
+    #expect(process.terminationStatus == 0)
+    #expect(names == ["D\tdeleted.txt", "M\tmodified.txt"])
+
+    _ = try await repository.stage(StageRequest(pathspecs: [
+        try GitPathspec("modified.txt"),
+        try GitPathspec("deleted.txt"),
+    ])).value()
+    let staged = try await repository.diff(RepositoryDiffRequest(
+        old: .object(base),
+        new: .index,
+        pathspecs: [try GitPathspec("modified.txt")]
+    )).value()
+    #expect(staged.files.count == 1)
+    let modifiedPath = try GitPath("modified.txt")
+    #expect(staged.files[0].path == modifiedPath)
+    #expect(staged.files[0].kind == .typeChanged)
+}
+
 @Test func systemGitReadsTreeishRevertAndCleanWorktree() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString)
@@ -2714,6 +2796,13 @@ func checkoutMovesOnlyHeadAndResetLogsResolvedHead(
     }
     #expect(paths == [try GitPath("file.txt")])
     #expect(try await repository.status().value().entries.first?.indexChange == .unmerged)
+    let conflicts = try await repository.conflicts().value()
+    #expect(conflicts.count == 1)
+    let conflictPath = try GitPath("file.txt")
+    #expect(conflicts[0].path == conflictPath)
+    #expect(conflicts[0].ancestor != nil)
+    #expect(conflicts[0].ours != nil)
+    #expect(conflicts[0].theirs != nil)
     #expect(FileManager.default.fileExists(
         atPath: directory.appendingPathComponent(".git/REVERT_HEAD").path
     ))

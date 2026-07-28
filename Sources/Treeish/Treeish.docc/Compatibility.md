@@ -40,6 +40,14 @@ merge commits, and creates a single-parent revert commit. Conflicts use the
 standard `REVERT_HEAD`, `MERGE_MSG`, and staged index entries, so system Git
 and Treeish can inspect, continue, or abort the operation interchangeably.
 
+``Repository/diff(_:)`` returns byte-aware structured file and content changes
+between `HEAD`, the index, the worktree, or any commit, tree, or annotated tag.
+It applies pathspec and allocation bounds, excludes untracked files from the
+worktree target like `git diff`, honors clean conversion, preserves file modes,
+and reports gitlinks as canonical subproject-commit content. An index with
+unresolved stages is not flattened into a misleading diff;
+``Repository/conflicts()`` exposes its exact ancestor, ours, and theirs entries.
+
 ``Repository/checkIntegrity(_:)`` validates canonical loose and packed objects,
 commit/tree/tag connectivity and types, file or reftable references, and
 optional reflog roots without mutating the repository. It classifies

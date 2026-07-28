@@ -910,6 +910,107 @@ public enum BlobDiff: Sendable, Hashable {
     case text([BlobDiffLine])
 }
 
+public enum RepositoryDiffTarget: Sendable, Hashable, Codable {
+    case head
+    case index
+    case worktree
+    case object(ObjectID)
+}
+
+public struct RepositoryDiffRequest: Sendable, Hashable, Codable {
+    public let old: RepositoryDiffTarget
+    public let new: RepositoryDiffTarget
+    public let pathspecs: [GitPathspec]
+    public let maximumFiles: Int
+    public let maximumMatrixCellsPerFile: Int
+
+    public init(
+        old: RepositoryDiffTarget = .index,
+        new: RepositoryDiffTarget = .worktree,
+        pathspecs: [GitPathspec] = [],
+        maximumFiles: Int = 100_000,
+        maximumMatrixCellsPerFile: Int = 4_000_000
+    ) {
+        self.old = old
+        self.new = new
+        self.pathspecs = pathspecs
+        self.maximumFiles = maximumFiles
+        self.maximumMatrixCellsPerFile = maximumMatrixCellsPerFile
+    }
+}
+
+public enum RepositoryFileDiffKind: String, Sendable, Hashable, Codable {
+    case added
+    case modified
+    case deleted
+    case typeChanged
+}
+
+public struct RepositoryFileDiff: Sendable, Hashable {
+    public let path: GitPath
+    public let kind: RepositoryFileDiffKind
+    public let oldMode: UInt32?
+    public let newMode: UInt32?
+    public let oldObjectID: ObjectID?
+    public let newObjectID: ObjectID?
+    public let content: BlobDiff
+
+    public init(
+        path: GitPath,
+        kind: RepositoryFileDiffKind,
+        oldMode: UInt32?,
+        newMode: UInt32?,
+        oldObjectID: ObjectID?,
+        newObjectID: ObjectID?,
+        content: BlobDiff
+    ) {
+        self.path = path
+        self.kind = kind
+        self.oldMode = oldMode
+        self.newMode = newMode
+        self.oldObjectID = oldObjectID
+        self.newObjectID = newObjectID
+        self.content = content
+    }
+}
+
+public struct RepositoryDiff: Sendable, Hashable {
+    public let files: [RepositoryFileDiff]
+
+    public init(files: [RepositoryFileDiff]) {
+        self.files = files
+    }
+}
+
+public struct ConflictStageEntry: Sendable, Hashable, Codable {
+    public let mode: UInt32
+    public let objectID: ObjectID
+
+    public init(mode: UInt32, objectID: ObjectID) {
+        self.mode = mode
+        self.objectID = objectID
+    }
+}
+
+public struct ConflictEntry: Sendable, Hashable, Codable {
+    public let path: GitPath
+    public let ancestor: ConflictStageEntry?
+    public let ours: ConflictStageEntry?
+    public let theirs: ConflictStageEntry?
+
+    public init(
+        path: GitPath,
+        ancestor: ConflictStageEntry?,
+        ours: ConflictStageEntry?,
+        theirs: ConflictStageEntry?
+    ) {
+        self.path = path
+        self.ancestor = ancestor
+        self.ours = ours
+        self.theirs = theirs
+    }
+}
+
 public struct WorktreeRequest: Sendable, Hashable {
     public let destination: GitPath
     public let start: ObjectID

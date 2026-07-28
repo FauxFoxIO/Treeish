@@ -34,6 +34,7 @@ public enum RefStorageFormat: String, Sendable, Hashable, Codable {
 
 public enum RepositoryOperationCapability: String, Sendable, Hashable, Codable {
     case readObjects
+    case checkIntegrity
     case writeObjects
     case readRefs
     case updateRefs

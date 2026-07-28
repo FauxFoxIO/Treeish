@@ -75,6 +75,69 @@ final class RepositoryObjectStore: @unchecked Sendable {
         return try readUnreplaced(identifier: resolved)
     }
 
+    func readRaw(identifier: [UInt8]) throws -> GitObject {
+        try readUnreplaced(identifier: identifier)
+    }
+
+    func allIdentifiers(limit: Int = 10_000_000) throws -> Set<[UInt8]> {
+        guard limit >= 0 else { throw ZlibError.resourceLimitExceeded }
+        var identifiers: Set<[UInt8]> = []
+        for objectDirectory in objectDirectories {
+            let root = try objectDirectory.url(for: [])
+            let entries = (try? FileManager.default.contentsOfDirectory(
+                at: root,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            )) ?? []
+            for fanout in entries {
+                let prefix = fanout.lastPathComponent.lowercased()
+                guard prefix.count == 2,
+                      prefix.allSatisfy(\.isHexDigit),
+                      (try? fanout.resourceValues(
+                        forKeys: [.isDirectoryKey]
+                      ).isDirectory) == true else {
+                    continue
+                }
+                let objects = (try? FileManager.default.contentsOfDirectory(
+                    at: fanout,
+                    includingPropertiesForKeys: [.isRegularFileKey],
+                    options: [.skipsHiddenFiles]
+                )) ?? []
+                for object in objects {
+                    let suffix = object.lastPathComponent.lowercased()
+                    let hexadecimal = prefix + suffix
+                    guard hexadecimal.count == objectFormat.byteCount * 2,
+                          hexadecimal.allSatisfy(\.isHexDigit),
+                          let identifier = decodeHex(hexadecimal) else {
+                        continue
+                    }
+                    identifiers.insert(identifier)
+                    guard identifiers.count <= limit else {
+                        throw ZlibError.resourceLimitExceeded
+                    }
+                }
+            }
+            let packDirectory = try objectDirectory.url(for: ["pack"])
+            let packs = (try? FileManager.default.contentsOfDirectory(
+                at: packDirectory,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            )) ?? []
+            for url in packs where url.pathExtension == "pack" {
+                for entry in try loadPack(
+                    url: url,
+                    objectDirectory: objectDirectory
+                ).objects {
+                    identifiers.insert(entry.identifier)
+                    guard identifiers.count <= limit else {
+                        throw ZlibError.resourceLimitExceeded
+                    }
+                }
+            }
+        }
+        return identifiers
+    }
+
     func setReplacement(
         for original: [UInt8],
         to replacement: [UInt8]?
@@ -136,6 +199,10 @@ final class RepositoryObjectStore: @unchecked Sendable {
         lock.withLock {
             shallowIdentifiers = identifiers
         }
+    }
+
+    func isShallow(_ identifier: [UInt8]) -> Bool {
+        lock.withLock { shallowIdentifiers.contains(identifier) }
     }
 
     func resolvePrefix(_ hexadecimal: String) throws -> [UInt8]? {

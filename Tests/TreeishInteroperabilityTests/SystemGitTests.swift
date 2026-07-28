@@ -599,6 +599,127 @@ func systemGitReadsAndMutatesTreeishReftableRepository(
     #expect(try await reopened.snapshot().headObjectID != commit)
 }
 
+@Test(arguments: ObjectHashAlgorithm.allCases)
+func integrityCheckMatchesSystemGitConnectivity(
+    objectFormat: ObjectHashAlgorithm
+) async throws {
+    for refStorage in [RefStorageFormat.files, .reftable] {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let root = try await TreeishRoot.localDirectory(at: directory)
+        let repository = try await Treeish.initialize(
+            in: root,
+            options: RepositoryInitialization(
+                objectFormat: objectFormat,
+                refStorage: refStorage
+            )
+        )
+        let file = directory.appendingPathComponent("integrity.txt")
+        try Data("reachable\n".utf8).write(to: file)
+        _ = try await repository.stage(
+            StageRequest(pathspecs: [try GitPathspec("integrity.txt")])
+        ).value()
+        let signature = Signature(
+            name: "Treeish",
+            email: "treeish@example.com",
+            secondsSinceEpoch: 1_700_000_000,
+            timeZoneOffsetMinutes: 0
+        )
+        let commit = try await repository.commit(
+            CommitRequest(
+                tree: try await repository.writeIndexTree().value(),
+                author: signature,
+                committer: signature,
+                message: Array("integrity\n".utf8)
+            )
+        ).value().objectID
+        let dangling = try await repository.writeObject(
+            type: .blob,
+            payload: Array("dangling\n".utf8)
+        ).value()
+
+        let report = try await repository.checkIntegrity(
+            RepositoryIntegrityOptions(includeReflogs: false)
+        ).value()
+        #expect(report.isValid)
+        #expect(report.unreachableObjects == [dangling])
+        #expect(report.danglingObjects == [dangling])
+        #expect(try await repository.checkIntegrity().value().isValid)
+
+        func git(_ arguments: [String]) throws -> (Int32, String) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            process.arguments = ["-C", directory.path] + arguments
+            let output = Pipe()
+            process.standardOutput = output
+            process.standardError = output
+            try process.run()
+            process.waitUntilExit()
+            return (
+                process.terminationStatus,
+                String(
+                    decoding: output.fileHandleForReading.readDataToEndOfFile(),
+                    as: UTF8.self
+                )
+            )
+        }
+        let gitReport = try git(["fsck", "--no-reflogs", "--unreachable"])
+        #expect(gitReport.0 == 0)
+        #expect(gitReport.1.contains(dangling.description))
+
+        let danglingPath = directory
+            .appendingPathComponent(".git/objects")
+            .appendingPathComponent(String(dangling.description.prefix(2)))
+            .appendingPathComponent(String(dangling.description.dropFirst(2)))
+        let canonicalLooseObject = try Data(contentsOf: danglingPath)
+        try Data("not a zlib stream".utf8).write(to: danglingPath)
+        let corrupt = try await repository.checkIntegrity(
+            RepositoryIntegrityOptions(includeReflogs: false)
+        ).value()
+        #expect(!corrupt.isValid)
+        #expect(corrupt.issues.contains {
+            $0.kind == .corruptObject && $0.objectID == dangling
+        })
+        try canonicalLooseObject.write(to: danglingPath)
+
+        if refStorage == .files {
+            let alias = try RefName("refs/heads/integrity-alias")
+            let aliasPath = directory.appendingPathComponent(
+                ".git/refs/heads/integrity-alias"
+            )
+            try Data("ref: refs/heads/main\n".utf8).write(to: aliasPath)
+            #expect(try await repository.resolveReference(alias) == commit)
+            #expect(try await repository.checkIntegrity().value().isValid)
+            try Data("not-an-object\n".utf8).write(to: aliasPath)
+            let invalidReference = try await repository.checkIntegrity().value()
+            #expect(!invalidReference.isValid)
+            #expect(invalidReference.issues.contains {
+                $0.kind == .invalidReference && $0.reference == alias
+            })
+            try FileManager.default.removeItem(at: aliasPath)
+        }
+
+        let commitPath = directory
+            .appendingPathComponent(".git/objects")
+            .appendingPathComponent(String(commit.description.prefix(2)))
+            .appendingPathComponent(String(commit.description.dropFirst(2)))
+        try FileManager.default.removeItem(at: commitPath)
+        let missing = try await repository.checkIntegrity(
+            RepositoryIntegrityOptions(includeReflogs: false)
+        ).value()
+        #expect(!missing.isValid)
+        #expect(missing.issues.contains {
+            $0.kind == .missingObject && $0.objectID == commit
+        })
+        #expect(try git(["fsck", "--no-reflogs"]).0 != 0)
+    }
+}
+
 @Test func systemGitReadsTreeishLooseObject() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString)

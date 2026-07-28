@@ -299,6 +299,9 @@ decisions for the host app.
 - branches, lightweight and annotated tags, and linked worktrees;
 - host-backed OpenPGP, X.509, and SSH commit/tag signing with canonical Git
   payload extraction and verification challenges;
+- bounded repository integrity checks covering loose and packed object
+  checksums, commit/tree/tag connectivity, reference and reflog roots,
+  promised-object gaps, and unreachable/dangling classification;
 - `.gitmodules` parsing, gitlink-aware status, and bounded native submodule
   initialization and exact-commit updates;
 - revision expressions, numbered/date/prior-checkout reflog selectors,

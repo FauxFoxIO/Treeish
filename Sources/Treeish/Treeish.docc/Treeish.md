@@ -41,6 +41,9 @@ typed result.
 - ``StatusOptions``
 - ``ReflogEntry``
 - ``ReflogMetadata``
+- ``RepositoryIntegrityOptions``
+- ``RepositoryIntegrityReport``
+- ``RepositoryIntegrityIssue``
 
 ### Operations
 

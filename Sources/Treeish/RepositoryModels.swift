@@ -206,6 +206,87 @@ public struct ReflogEntry: Sendable, Hashable, Codable {
     }
 }
 
+public enum RepositoryIntegrityIssueKind: String, Sendable, Hashable, Codable {
+    case corruptObject
+    case malformedObject
+    case missingObject
+    case missingPromisedObject
+    case objectTypeMismatch
+    case invalidReference
+}
+
+public enum RepositoryIntegritySeverity: String, Sendable, Hashable, Codable {
+    case warning
+    case error
+}
+
+public struct RepositoryIntegrityIssue: Sendable, Hashable, Codable {
+    public let kind: RepositoryIntegrityIssueKind
+    public let severity: RepositoryIntegritySeverity
+    public let objectID: ObjectID?
+    public let sourceObjectID: ObjectID?
+    public let reference: RefName?
+    public let detail: String
+
+    public init(
+        kind: RepositoryIntegrityIssueKind,
+        severity: RepositoryIntegritySeverity,
+        objectID: ObjectID? = nil,
+        sourceObjectID: ObjectID? = nil,
+        reference: RefName? = nil,
+        detail: String
+    ) {
+        self.kind = kind
+        self.severity = severity
+        self.objectID = objectID
+        self.sourceObjectID = sourceObjectID
+        self.reference = reference
+        self.detail = detail
+    }
+}
+
+public struct RepositoryIntegrityOptions: Sendable, Hashable, Codable {
+    public let includeReflogs: Bool
+    public let classifyUnreachableObjects: Bool
+    public let maximumObjects: Int
+
+    public init(
+        includeReflogs: Bool = true,
+        classifyUnreachableObjects: Bool = true,
+        maximumObjects: Int = 10_000_000
+    ) {
+        self.includeReflogs = includeReflogs
+        self.classifyUnreachableObjects = classifyUnreachableObjects
+        self.maximumObjects = maximumObjects
+    }
+}
+
+public struct RepositoryIntegrityReport: Sendable, Hashable, Codable {
+    public let checkedObjects: Int
+    public let reachableObjects: Int
+    public let unreachableObjects: [ObjectID]
+    public let danglingObjects: [ObjectID]
+    public let issues: [RepositoryIntegrityIssue]
+
+    public init(
+        checkedObjects: Int,
+        reachableObjects: Int,
+        unreachableObjects: [ObjectID],
+        danglingObjects: [ObjectID],
+        issues: [RepositoryIntegrityIssue]
+    ) {
+        self.checkedObjects = checkedObjects
+        self.reachableObjects = reachableObjects
+        self.unreachableObjects = unreachableObjects
+        self.danglingObjects = danglingObjects
+        self.issues = issues
+    }
+
+    public var isValid: Bool {
+        !issues.contains { $0.severity == .error }
+    }
+}
+
 public struct CheckoutRequest: Sendable, Hashable, Codable {
     public let commit: ObjectID
     public let reference: RefName?

@@ -34,6 +34,13 @@ payload while ``GitObjectSigner`` and ``GitObjectSignatureVerifier`` let the
 host own OpenPGP, X.509, or SSH keys and trust policy. System Git can verify
 objects produced through this boundary.
 
+``Repository/checkIntegrity(_:)`` validates canonical loose and packed objects,
+commit/tree/tag connectivity and types, file or reftable references, and
+optional reflog roots without mutating the repository. It classifies
+unreachable and dangling objects, treats absent promisor objects as warnings,
+and does not require gitlink targets to exist in the superproject object
+database.
+
 Object lookup follows root-contained alternate object databases and classic or
 incremental multi-pack indexes. Revision traversal honors `shallow` boundaries
 and replacement references. Partial-clone configuration is reported through

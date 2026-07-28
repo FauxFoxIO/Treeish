@@ -9,6 +9,11 @@ import TreeishObjects
 import TreeishPacks
 import TreeishProtocol
 
+private struct IntegrityEdge: Sendable {
+    let target: [UInt8]
+    let expected: GitObjectType?
+}
+
 public actor Repository {
     public nonisolated let identity: RepositoryIdentity
 
@@ -200,6 +205,209 @@ public actor Repository {
                 results.append(try await verifier.verify(object))
             }
             return results
+        }
+    }
+
+    public func checkIntegrity(
+        _ options: RepositoryIntegrityOptions = .init()
+    ) -> GitOperation<RepositoryIntegrityReport> {
+        let store = objectStore
+        let common = commonDirectory
+        let headDirectory = gitDirectory
+        let limits = resourceLimits
+        let hasPromisor = !repositoryCapabilities.promisorRemotes.isEmpty
+        return GitOperation(phase: .validating) {
+            guard options.maximumObjects > 0 else {
+                throw TreeishError.recoveryRequired(
+                    "integrity object limit must be positive"
+                )
+            }
+            let identifiers: Set<[UInt8]>
+            do {
+                identifiers = try store.allIdentifiers(
+                    limit: options.maximumObjects
+                )
+            } catch {
+                return RepositoryIntegrityReport(
+                    checkedObjects: 0,
+                    reachableObjects: 0,
+                    unreachableObjects: [],
+                    danglingObjects: [],
+                    issues: [
+                        RepositoryIntegrityIssue(
+                            kind: .corruptObject,
+                            severity: .error,
+                            detail: "object storage could not be enumerated: \(error)"
+                        ),
+                    ]
+                )
+            }
+
+            var objects: [[UInt8]: GitObject] = [:]
+            var edges: [[UInt8]: [IntegrityEdge]] = [:]
+            var issues: [RepositoryIntegrityIssue] = []
+            for identifier in identifiers.sorted(by: {
+                $0.lexicographicallyPrecedes($1)
+            }) {
+                try Task.checkCancellation()
+                let objectID = try ObjectID(bytes: identifier)
+                do {
+                    let object = try store.readRaw(identifier: identifier)
+                    objects[identifier] = object
+                    do {
+                        edges[identifier] = try Repository.integrityEdges(
+                            object,
+                            identifier: identifier,
+                            objectFormat: store.objectFormat,
+                            shallow: store.isShallow(identifier)
+                        )
+                    } catch {
+                        issues.append(RepositoryIntegrityIssue(
+                            kind: .malformedObject,
+                            severity: .error,
+                            objectID: objectID,
+                            detail: "object payload is malformed: \(error)"
+                        ))
+                    }
+                } catch {
+                    issues.append(RepositoryIntegrityIssue(
+                        kind: .corruptObject,
+                        severity: .error,
+                        objectID: objectID,
+                        detail: "object storage failed canonical validation: \(error)"
+                    ))
+                }
+            }
+
+            let references: [RefName: ObjectID]
+            do {
+                references = try Repository.allReferences(directory: common)
+            } catch {
+                references = [:]
+                issues.append(RepositoryIntegrityIssue(
+                    kind: .invalidReference,
+                    severity: .error,
+                    detail: "reference storage is malformed: \(error)"
+                ))
+            }
+            issues += try Repository.referenceIntegrityIssues(
+                directory: common,
+                objectFormat: store.objectFormat
+            )
+            var roots = Set(references.values.map(\.bytes))
+            do {
+                if let head = try Repository.readHead(
+                    headDirectory: headDirectory,
+                    refsDirectory: common
+                ).objectID {
+                    roots.insert(head.bytes)
+                }
+            } catch {
+                issues.append(RepositoryIntegrityIssue(
+                    kind: .invalidReference,
+                    severity: .error,
+                    detail: "HEAD is malformed: \(error)"
+                ))
+            }
+            if options.includeReflogs {
+                do {
+                    roots.formUnion(try Repository.reflogObjectIDs(
+                        headDirectory: headDirectory,
+                        commonDirectory: common,
+                        limits: limits
+                    ))
+                } catch {
+                    issues.append(RepositoryIntegrityIssue(
+                        kind: .invalidReference,
+                        severity: .error,
+                        detail: "reflog storage is malformed: \(error)"
+                    ))
+                }
+            }
+
+            for (reference, objectID) in references
+            where objects[objectID.bytes] == nil {
+                issues.append(RepositoryIntegrityIssue(
+                    kind: hasPromisor
+                        ? .missingPromisedObject
+                        : .missingObject,
+                    severity: hasPromisor ? .warning : .error,
+                    objectID: objectID,
+                    reference: reference,
+                    detail: "reference target is not present locally"
+                ))
+            }
+
+            var reachable: Set<[UInt8]> = []
+            var pending = Array(roots)
+            var reportedMissing: Set<[UInt8]> = []
+            var reportedTypes: Set<String> = []
+            while let identifier = pending.popLast() {
+                guard reachable.count < options.maximumObjects else {
+                    throw TreeishError.recoveryRequired(
+                        "integrity reachability limit exceeded"
+                    )
+                }
+                guard reachable.insert(identifier).inserted else { continue }
+                guard objects[identifier] != nil else {
+                    if reportedMissing.insert(identifier).inserted,
+                       let objectID = try? ObjectID(bytes: identifier) {
+                        issues.append(RepositoryIntegrityIssue(
+                            kind: hasPromisor
+                                ? .missingPromisedObject
+                                : .missingObject,
+                            severity: hasPromisor ? .warning : .error,
+                            objectID: objectID,
+                            detail: "reachable object is not present locally"
+                        ))
+                    }
+                    continue
+                }
+                for edge in edges[identifier] ?? [] {
+                    if let expected = edge.expected,
+                       let actual = objects[edge.target]?.type,
+                       actual != expected {
+                        let key = "\(identifier)-\(edge.target)-\(expected.rawValue)"
+                        if reportedTypes.insert(key).inserted {
+                            issues.append(RepositoryIntegrityIssue(
+                                kind: .objectTypeMismatch,
+                                severity: .error,
+                                objectID: try? ObjectID(bytes: edge.target),
+                                sourceObjectID: try? ObjectID(bytes: identifier),
+                                detail: "expected \(expected.rawValue), found \(actual.rawValue)"
+                            ))
+                        }
+                    }
+                    pending.append(edge.target)
+                }
+            }
+            reachable.formIntersection(identifiers)
+
+            let unreachableBytes = options.classifyUnreachableObjects
+                ? identifiers.subtracting(reachable)
+                : []
+            let incoming = Set(edges.values.flatMap {
+                $0.map(\.target)
+            })
+            let danglingBytes = unreachableBytes.filter {
+                !incoming.contains($0)
+            }
+            func objectIDs<S: Sequence>(_ values: S) throws -> [ObjectID]
+            where S.Element == [UInt8] {
+                try values.map(ObjectID.init(bytes:)).sorted {
+                    $0.bytes.lexicographicallyPrecedes($1.bytes)
+                }
+            }
+            return RepositoryIntegrityReport(
+                checkedObjects: objects.count,
+                reachableObjects: reachable.count,
+                unreachableObjects: try objectIDs(unreachableBytes),
+                danglingObjects: try objectIDs(danglingBytes),
+                issues: issues.sorted {
+                    ($0.objectID?.description ?? "") <
+                        ($1.objectID?.description ?? "")
+                }
+            )
         }
     }
 
@@ -4066,14 +4274,43 @@ public actor Repository {
                 visited: []
             )
         }
+        return try resolveFilesReference(
+            directory: directory,
+            name: name,
+            visited: []
+        )
+    }
+
+    private static func resolveFilesReference(
+        directory: RootDirectory,
+        name: RefName,
+        visited: Set<RefName>
+    ) throws -> ObjectID {
+        guard visited.count < 16, !visited.contains(name) else {
+            throw TreeishError.symbolicReferenceLoop
+        }
+        let bytes: [UInt8]
         do {
-            return try readDirectReference(
-                directory: directory,
-                components: name.pathComponents
-            )
+            bytes = try directory.read(name.pathComponents, limit: 4096)
         } catch RootDirectoryError.notFound {
             return try readPackedReference(directory: directory, name: name)
         }
+        guard let text = String(bytes: bytes, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        else {
+            throw TreeishError.malformedReference
+        }
+        guard text.hasPrefix("ref: ") else {
+            return try ObjectID(hex: text)
+        }
+        let target = try RefName(String(text.dropFirst(5)))
+        var next = visited
+        next.insert(name)
+        return try resolveFilesReference(
+            directory: directory,
+            name: target,
+            visited: next
+        )
     }
 
     private static func resolveReftableReference(
@@ -4187,9 +4424,9 @@ public actor Repository {
             guard candidate.hasPrefix(basePath + "/") else { continue }
             let relative = String(candidate.dropFirst(basePath.count + 1))
             guard let name = try? RefName("refs/\(relative)"),
-                  let identifier = try? readDirectReference(
+                  let identifier = try? readReference(
                     directory: directory,
-                    components: name.pathComponents
+                    name: name
                   ) else { continue }
             values[name] = identifier
         }
@@ -4229,6 +4466,105 @@ public actor Repository {
             looseReferences(directory: directory),
             uniquingKeysWith: { _, loose in loose }
         )
+    }
+
+    private static func referenceIntegrityIssues(
+        directory: RootDirectory,
+        objectFormat: ObjectHashAlgorithm
+    ) throws -> [RepositoryIntegrityIssue] {
+        guard try referenceStorage(directory: directory).format == .files else {
+            return []
+        }
+        var issues: [RepositoryIntegrityIssue] = []
+        let packed: [UInt8]
+        do {
+            packed = try directory.read(
+                ["packed-refs"],
+                limit: 64 * 1024 * 1024
+            )
+        } catch RootDirectoryError.notFound {
+            packed = []
+        }
+        for line in packed.split(separator: 0x0a) {
+            guard !line.isEmpty, line.first != 0x23 else { continue }
+            if line.first == 0x5e {
+                let peeled = try? ObjectID(
+                    hex: String(decoding: line.dropFirst(), as: UTF8.self)
+                )
+                if peeled?.algorithm != objectFormat {
+                    issues.append(RepositoryIntegrityIssue(
+                        kind: .invalidReference,
+                        severity: .error,
+                        detail: "packed-refs contains a malformed peeled object"
+                    ))
+                }
+                continue
+            }
+            let fields = line.split(
+                separator: 0x20,
+                maxSplits: 1,
+                omittingEmptySubsequences: false
+            )
+            let name = fields.count == 2
+                ? try? RefName(validating: Array(fields[1]))
+                : nil
+            let identifier = fields.count == 2
+                ? try? ObjectID(
+                    hex: String(decoding: fields[0], as: UTF8.self)
+                )
+                : nil
+            if name == nil || identifier?.algorithm != objectFormat {
+                issues.append(RepositoryIntegrityIssue(
+                    kind: .invalidReference,
+                    severity: .error,
+                    reference: name,
+                    detail: "packed-refs contains a malformed reference"
+                ))
+            }
+        }
+
+        let refsURL = try directory.url(for: ["refs"])
+        guard let enumerator = FileManager.default.enumerator(
+            at: refsURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return issues
+        }
+        for case let url as URL in enumerator {
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey])
+            guard values.isRegularFile == true else { continue }
+            let components = try directory.relativeComponents(for: url)
+            let name = try? RefName(validating: Array(
+                components.joined(separator: "/").utf8
+            ))
+            guard let name else {
+                issues.append(RepositoryIntegrityIssue(
+                    kind: .invalidReference,
+                    severity: .error,
+                    detail: "refs contains an invalid reference name"
+                ))
+                continue
+            }
+            do {
+                let identifier = try resolveFilesReference(
+                    directory: directory,
+                    name: name,
+                    visited: []
+                )
+                guard identifier.algorithm == objectFormat else {
+                    throw TreeishError.malformedReference
+                }
+            } catch {
+                issues.append(RepositoryIntegrityIssue(
+                    kind: .invalidReference,
+                    severity: .error,
+                    reference: name,
+                    detail: "loose reference is malformed: \(error)"
+                ))
+            }
+        }
+        return issues
     }
 
     private static func replacementObjects(
@@ -5042,6 +5378,189 @@ public actor Repository {
                 break
             }
         }
+        return result
+    }
+
+    private static func integrityEdges(
+        _ object: GitObject,
+        identifier: [UInt8],
+        objectFormat: ObjectHashAlgorithm,
+        shallow: Bool
+    ) throws -> [IntegrityEdge] {
+        switch object.type {
+        case .blob:
+            return []
+        case .commit:
+            let record = try CommitRecord(
+                identifier: identifier,
+                object: object
+            )
+            var result = [
+                IntegrityEdge(target: record.tree, expected: .tree),
+            ]
+            if !shallow {
+                result += record.parents.map {
+                    IntegrityEdge(target: $0, expected: .commit)
+                }
+            }
+            return result
+        case .tree:
+            var entries: [GitTreeEntry] = []
+            var cursor = 0
+            while cursor < object.payload.count {
+                guard let space = object.payload[cursor...].firstIndex(of: 0x20),
+                      space > cursor,
+                      let nul = object.payload[space...].firstIndex(of: 0),
+                      nul > space + 1,
+                      let mode = GitFileMode(rawValue: String(
+                        decoding: object.payload[cursor..<space],
+                        as: UTF8.self
+                      )),
+                      nul + 1 + objectFormat.byteCount <= object.payload.count
+                else {
+                    throw GitObjectError.invalidHeader
+                }
+                let target = Array(
+                    object.payload[
+                        (nul + 1)..<(nul + 1 + objectFormat.byteCount)
+                    ]
+                )
+                entries.append(try GitTreeEntry(
+                    mode: mode,
+                    name: Array(object.payload[(space + 1)..<nul]),
+                    objectID: target
+                ))
+                cursor = nul + 1 + objectFormat.byteCount
+            }
+            guard GitObjectEncoder.tree(entries: entries).payload == object.payload else {
+                throw GitObjectError.invalidHeader
+            }
+            return entries.compactMap { entry in
+                let expected: GitObjectType?
+                switch entry.mode {
+                case .tree:
+                    expected = .tree
+                case .regular, .executable, .symbolicLink:
+                    expected = .blob
+                case .gitlink:
+                    return nil
+                }
+                return IntegrityEdge(
+                    target: entry.objectID,
+                    expected: expected
+                )
+            }
+        case .tag:
+            guard let separator = object.payload.firstRange(
+                of: Array("\n\n".utf8)
+            ) else {
+                throw GitObjectError.invalidHeader
+            }
+            var target: [UInt8]?
+            var expected: GitObjectType?
+            for header in object.payload[..<separator.lowerBound]
+                .split(separator: 0x0a) {
+                if header.starts(with: Array("object ".utf8)) {
+                    guard target == nil else {
+                        throw GitObjectError.invalidHeader
+                    }
+                    let objectID = try ObjectID(
+                        hex: String(decoding: header.dropFirst(7), as: UTF8.self)
+                    )
+                    guard objectID.algorithm == objectFormat else {
+                        throw GitObjectError.invalidHeader
+                    }
+                    target = objectID.bytes
+                } else if header.starts(with: Array("type ".utf8)) {
+                    guard expected == nil,
+                          let value = GitObjectType(rawValue: String(
+                            decoding: header.dropFirst(5),
+                            as: UTF8.self
+                          ))
+                    else {
+                        throw GitObjectError.invalidHeader
+                    }
+                    expected = value
+                }
+            }
+            guard let target, let expected else {
+                throw GitObjectError.invalidHeader
+            }
+            return [IntegrityEdge(target: target, expected: expected)]
+        }
+    }
+
+    private static func reflogObjectIDs(
+        headDirectory: RootDirectory,
+        commonDirectory: RootDirectory,
+        limits: TreeishResourceLimits
+    ) throws -> Set<[UInt8]> {
+        let storage = try referenceStorage(directory: commonDirectory)
+        if storage.format == .reftable {
+            return Set(try ReftableStack(
+                directory: commonDirectory,
+                objectFormat: storage.objectFormat
+            ).reflogRecords().compactMap(\.entry).flatMap {
+                [$0.previous.bytes, $0.current.bytes]
+            }.filter { identifier in
+                !identifier.allSatisfy { $0 == 0 }
+            })
+        }
+
+        var result: Set<[UInt8]> = []
+        var examinedFiles: Set<String> = []
+        func collect(
+            from directory: RootDirectory,
+            beneath components: [String]
+        ) throws {
+            let base: URL
+            do {
+                base = try directory.url(for: components)
+            } catch RootDirectoryError.notFound {
+                return
+            }
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(
+                atPath: base.path,
+                isDirectory: &isDirectory
+            ) else {
+                return
+            }
+            let urls: [URL]
+            if isDirectory.boolValue {
+                guard let enumerator = FileManager.default.enumerator(
+                    at: base,
+                    includingPropertiesForKeys: [.isRegularFileKey],
+                    options: [.skipsHiddenFiles]
+                ) else {
+                    return
+                }
+                urls = enumerator.compactMap { $0 as? URL }
+            } else {
+                urls = [base]
+            }
+            for url in urls {
+                let values = try url.resourceValues(forKeys: [.isRegularFileKey])
+                guard values.isRegularFile == true else { continue }
+                let canonical = url.standardizedFileURL.path
+                guard examinedFiles.insert(canonical).inserted else { continue }
+                let relative = try directory.relativeComponents(for: url)
+                let bytes = try directory.read(
+                    relative,
+                    limit: limits.maximumConfigBytes
+                )
+                for line in bytes.split(separator: 0x0a) {
+                    let entry = try parseReflogLine(Array(line))
+                    for identifier in [entry.previous.bytes, entry.current.bytes]
+                    where !identifier.allSatisfy({ $0 == 0 }) {
+                        result.insert(identifier)
+                    }
+                }
+            }
+        }
+        try collect(from: commonDirectory, beneath: ["logs", "refs"])
+        try collect(from: commonDirectory, beneath: ["logs", "HEAD"])
+        try collect(from: headDirectory, beneath: ["logs", "HEAD"])
         return result
     }
 
@@ -6180,7 +6699,7 @@ public actor Repository {
             .readOnly(reason: $0.reason)
         } ?? .readWrite
         var operations: Set<RepositoryOperationCapability> = [
-            .readObjects, .readRefs,
+            .readObjects, .checkIntegrity, .readRefs,
         ]
         if case .readWrite = access {
             operations.formUnion([

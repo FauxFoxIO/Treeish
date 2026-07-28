@@ -108,6 +108,12 @@ struct ReftableStack: Sendable {
     }
 
     func reflog(_ name: RefName) throws -> [ReflogEntry] {
+        try reflogRecords()
+            .filter { $0.name == name }
+            .compactMap(\.entry)
+    }
+
+    func reflogRecords() throws -> [ReftableLogRecord] {
         let tables = try tableNames()
         var records: [ReftableLogRecord] = []
         for table in tables.reversed() {
@@ -119,14 +125,12 @@ struct ReftableStack: Sendable {
                 bytes: bytes,
                 expectedObjectFormat: objectFormat,
                 maximumRecords: Self.maximumRecordsPerTable
-            ).logRecords().filter { $0.name == name }
+            ).logRecords()
             guard records.count <= Self.maximumRecordsPerTable else {
                 throw ReftableError.resourceLimitExceeded
             }
         }
-        return records
-            .sorted { $0.updateIndex > $1.updateIndex }
-            .compactMap(\.entry)
+        return records.sorted { $0.updateIndex > $1.updateIndex }
     }
 
     func append(_ updates: [ReftableUpdate]) throws {

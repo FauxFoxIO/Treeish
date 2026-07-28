@@ -588,6 +588,162 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
     )
 }
 
+@Test func pullFetchesConfiguredUpstreamAndFastForwardsWithoutGit() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let file = directory.appendingPathComponent("file.txt")
+    try Data("base\n".utf8).write(to: file)
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.initialize(in: root)
+    let signature = Signature(
+        name: "Treeish",
+        email: "treeish@example.com",
+        secondsSinceEpoch: 1_700_000_000,
+        timeZoneOffsetMinutes: 0
+    )
+    _ = try await repository.stage(
+        StageRequest(pathspecs: [try GitPathspec("file.txt")])
+    ).value()
+    let base = try await repository.commit(CommitRequest(
+        tree: try await repository.writeIndexTree().value(),
+        author: signature,
+        committer: signature,
+        message: Array("base\n".utf8)
+    )).value().objectID
+
+    let remote = try RemoteURL(
+        URL(string: "https://example.test/pull.git")!
+    )
+    for (key, value) in [
+        ("remote.origin.url", remote.url.absoluteString),
+        ("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"),
+        ("branch.main.remote", "origin"),
+        ("branch.main.merge", "refs/heads/main"),
+    ] {
+        _ = try await repository.setConfiguration(
+            GitConfigurationSetRequest(
+                key: try GitConfigurationKey(key),
+                value: value
+            )
+        ).value()
+    }
+    #expect(
+        try await repository.upstreamReference()
+            == RefName("refs/remotes/origin/main")
+    )
+
+    let remoteBlob = GitObject(
+        type: .blob,
+        payload: Array("remote\n".utf8)
+    )
+    let remoteBlobID = SHA1.hash(remoteBlob.canonicalBytes)
+    let remoteTree = GitObjectEncoder.tree(entries: [
+        try GitTreeEntry(
+            mode: .regular,
+            name: Array("file.txt".utf8),
+            objectID: remoteBlobID
+        ),
+    ])
+    let remoteTreeID = SHA1.hash(remoteTree.canonicalBytes)
+    let gitSignature = GitSignature(
+        name: signature.name,
+        email: signature.email,
+        secondsSinceEpoch: signature.secondsSinceEpoch,
+        timeZoneOffsetMinutes: signature.timeZoneOffsetMinutes
+    )
+    let remoteCommit = GitObjectEncoder.commit(
+        treeHex: remoteTreeID.map {
+            String(format: "%02x", $0)
+        }.joined(),
+        parentHexes: [base.description],
+        author: gitSignature,
+        committer: gitSignature,
+        message: Array("remote\n".utf8)
+    )
+    let remoteCommitID = SHA1.hash(remoteCommit.canonicalBytes)
+    let remoteHex = remoteCommitID.map {
+        String(format: "%02x", $0)
+    }.joined()
+    let archive = try PackWriter.write([
+        try PackObject(identifier: remoteBlobID, object: remoteBlob),
+        try PackObject(identifier: remoteTreeID, object: remoteTree),
+        try PackObject(identifier: remoteCommitID, object: remoteCommit),
+    ])
+    let advertisement =
+        try PacketLineEncoder.encode(.data(Array("version 2\n".utf8)))
+        + PacketLineEncoder.encode(.data(Array("ls-refs=unborn\n".utf8)))
+        + PacketLineEncoder.encode(
+            .data(Array("fetch=wait-for-done\n".utf8))
+        )
+        + PacketLineEncoder.encode(
+            .data(Array("object-format=sha1\n".utf8))
+        )
+        + PacketLineEncoder.encode(.flush)
+    let references = try PacketLineEncoder.encode(
+        .data(Array(
+            "\(remoteHex) HEAD symref-target:refs/heads/main\n".utf8
+        ))
+    ) + PacketLineEncoder.encode(
+        .data(Array("\(remoteHex) refs/heads/main\n".utf8))
+    ) + PacketLineEncoder.encode(.flush)
+    let fetch =
+        try PacketLineEncoder.encode(.data(Array("packfile\n".utf8)))
+        + PacketLineEncoder.encode(.data([1] + archive.pack))
+        + PacketLineEncoder.encode(.flush)
+    let transport = ScriptedSmartHTTPTransport(responses: [
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type":
+                    "application/x-git-upload-pack-advertisement",
+            ],
+            body: advertisement,
+            finalURL: remote.url.appendingPathComponent("info/refs")
+        ),
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type": "application/x-git-upload-pack-result",
+            ],
+            body: references,
+            finalURL: remote.url.appendingPathComponent("git-upload-pack")
+        ),
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type": "application/x-git-upload-pack-result",
+            ],
+            body: fetch,
+            finalURL: remote.url.appendingPathComponent("git-upload-pack")
+        ),
+    ])
+    let result = try await repository.pull(
+        PullRequest(
+            fetch: try FetchRequest(remote: remote),
+            strategy: .fastForwardOnly,
+            author: signature,
+            committer: signature
+        ),
+        services: RepositoryServices(httpTransport: transport)
+    ).value()
+    guard case .fastForward(let previous, let current) = result.integration else {
+        Issue.record("expected pull to fast-forward")
+        return
+    }
+    #expect(previous == base)
+    #expect(current.description == remoteHex)
+    let upstream = try RefName("refs/remotes/origin/main")
+    #expect(result.upstreamReference == upstream)
+    #expect(try Data(contentsOf: file) == Data("remote\n".utf8))
+    #expect(try await repository.status().value().isClean)
+    #expect(await transport.requests.count == 3)
+}
+
 @Test func fetchUsesInjectedProtocolV2TransportAndPublishesValidatedPack() async throws {
     let blob = GitObject(type: .blob, payload: Array("network\n".utf8))
     let blobID = SHA1.hash(blob.canonicalBytes)

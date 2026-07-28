@@ -84,6 +84,7 @@ typed result.
 - ``SSHRemoteEndpoint``
 - ``SSHGitService``
 - ``FetchRequest``
+- ``PullRequest``
 - ``PushRequest``
 - ``CloneRequest``
 - ``CloneMode``

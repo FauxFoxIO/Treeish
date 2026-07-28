@@ -65,15 +65,18 @@ public struct GitOperation<Result: Sendable>: Sendable {
     public let id: GitOperationID
     public let events: AsyncStream<GitProgressEvent>
     private let task: Task<Result, Error>
+    private let cancellation: @Sendable () -> Void
 
     internal init(
         phase: GitProgressPhase,
+        cancellation: @escaping @Sendable () -> Void = {},
         operation: @escaping @Sendable () async throws -> Result
     ) {
         let identifier = GitOperationID()
         id = identifier
         let (stream, continuation) = AsyncStream<GitProgressEvent>.makeStream()
         events = stream
+        self.cancellation = cancellation
         task = Task {
             continuation.yield(
                 GitProgressEvent(operationID: identifier, phase: phase)
@@ -97,6 +100,33 @@ public struct GitOperation<Result: Sendable>: Sendable {
     }
 
     public func cancel() {
+        cancellation()
         task.cancel()
+    }
+}
+
+final class GitOperationCancellationRelay: @unchecked Sendable {
+    private let lock = NSLock()
+    private var action: (@Sendable () -> Void)?
+    private var isCancelled = false
+
+    func replace(with action: @escaping @Sendable () -> Void) {
+        lock.lock()
+        if isCancelled {
+            lock.unlock()
+            action()
+            return
+        }
+        self.action = action
+        lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        isCancelled = true
+        let action = action
+        self.action = nil
+        lock.unlock()
+        action?()
     }
 }

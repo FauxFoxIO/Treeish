@@ -110,6 +110,11 @@ reference deletion unless the server advertises `delete-refs`. Deletion-only
 pushes omit the packfile; creates and updates always carry a pack, including a
 canonical empty pack when the remote already has every required object.
 
+``Repository/pull(_:services:)`` resolves the current branch's configured
+upstream, fetches through the native transport, and integrates the fetched
+remote-tracking commit by fast-forward-only policy or the native merge engine.
+Cancellation follows whichever fetch or merge phase is active.
+
 ``FetchRequest/refspecs`` accepts exact or single-wildcard mappings with Git's
 leading `+` force and `^` negative forms. ``FetchRequest/prune`` removes only
 destinations covered by positive mappings and protects negative selections.

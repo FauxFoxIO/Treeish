@@ -2189,6 +2189,71 @@ public actor Repository {
         }
     }
 
+    public func pull(
+        _ request: PullRequest,
+        services: RepositoryServices = .init()
+    ) throws -> GitOperation<PullResult> {
+        let upstream = try trackingReference(for: "HEAD", push: false)
+        let fetchOperation = fetch(request.fetch, services: services)
+        let relay = GitOperationCancellationRelay()
+        relay.replace(with: fetchOperation.cancel)
+        let store = objectStore
+        let headDirectory = gitDirectory
+        let refsDirectory = commonDirectory
+        return GitOperation(
+            phase: .negotiation,
+            cancellation: relay.cancel
+        ) {
+            let fetched = try await fetchOperation.value()
+            try Task.checkCancellation()
+            let upstreamID = try Repository.readReference(
+                directory: refsDirectory,
+                name: upstream
+            )
+            let head = try Repository.readHead(
+                headDirectory: headDirectory,
+                refsDirectory: refsDirectory
+            )
+            guard let current = head.objectID else {
+                throw TreeishError.malformedReference
+            }
+            if request.strategy == .fastForwardOnly {
+                let graph = CommitGraph(
+                    source: RepositoryCommitSource(store: store)
+                )
+                let alreadyContainsUpstream = try await graph.isAncestor(
+                    upstreamID.bytes,
+                    of: current.bytes
+                )
+                let canFastForward = try await graph.isAncestor(
+                    current.bytes,
+                    of: upstreamID.bytes
+                )
+                guard alreadyContainsUpstream || canFastForward else {
+                    throw TreeishError.recoveryRequired(
+                        "pull requires a non-fast-forward merge"
+                    )
+                }
+            }
+            try Task.checkCancellation()
+            let mergeOperation = await self.merge(MergeRequest(
+                other: upstreamID,
+                author: request.author,
+                committer: request.committer,
+                message: request.message ?? Array(
+                    "Merge \(upstream.description)\n".utf8
+                )
+            ))
+            relay.replace(with: mergeOperation.cancel)
+            let integration = try await mergeOperation.value()
+            return PullResult(
+                fetch: fetched,
+                upstreamReference: upstream,
+                integration: integration
+            )
+        }
+    }
+
     public func push(
         _ request: PushRequest,
         services: RepositoryServices = .init()
@@ -4202,6 +4267,18 @@ public actor Repository {
 
     public func resolveReference(_ name: RefName) throws -> ObjectID {
         try resolveReference(name, visited: [])
+    }
+
+    public func upstreamReference(
+        for expression: String = "HEAD"
+    ) throws -> RefName {
+        try trackingReference(for: expression, push: false)
+    }
+
+    public func pushReference(
+        for expression: String = "HEAD"
+    ) throws -> RefName {
+        try trackingReference(for: expression, push: true)
     }
 
     public func reflog(
@@ -7932,7 +8009,7 @@ public actor Repository {
             operations.formUnion([
                 .writeConfiguration, .writeObjects, .updateRefs,
                 .createCommit, .stage, .restore, .checkout, .reset,
-                .branchesAndTags, .fetch, .push, .merge, .sequencer,
+                .branchesAndTags, .fetch, .pull, .push, .merge, .sequencer,
                 .stash, .submodules, .bundles, .linkedWorktrees,
             ])
         }

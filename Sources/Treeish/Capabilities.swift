@@ -53,6 +53,7 @@ public enum RepositoryOperationCapability: String, Sendable, Hashable, Codable {
     case reset
     case branchesAndTags
     case fetch
+    case pull
     case push
     case merge
     case sequencer

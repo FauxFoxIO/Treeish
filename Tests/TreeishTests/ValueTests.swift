@@ -131,6 +131,7 @@ import TreeishFileSystem
         .reset,
         .branchesAndTags,
         .fetch,
+        .pull,
         .push,
         .merge,
         .sequencer,
@@ -159,6 +160,26 @@ import TreeishFileSystem
     #expect(!capabilities.operations.contains(.stage))
     #expect(!capabilities.operations.contains(.checkout))
     #expect(!capabilities.operations.contains(.stash))
+}
+
+@Test func operationCancellationRelayFollowsCurrentPhase() async {
+    let relay = GitOperationCancellationRelay()
+    let fetch = Task {
+        try await Task.sleep(for: .seconds(60))
+    }
+    relay.replace(with: fetch.cancel)
+    relay.cancel()
+    await #expect(throws: CancellationError.self) {
+        try await fetch.value
+    }
+
+    let merge = Task {
+        try await Task.sleep(for: .seconds(60))
+    }
+    relay.replace(with: merge.cancel)
+    await #expect(throws: CancellationError.self) {
+        try await merge.value
+    }
 }
 
 @Test func pathspecMagicSelectsIncludesAndExcludesDeterministically() throws {

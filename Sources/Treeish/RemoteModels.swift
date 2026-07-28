@@ -610,6 +610,49 @@ public struct FetchResult: Sendable, Hashable, Codable {
     }
 }
 
+public enum PullIntegrationStrategy: String, Sendable, Hashable, Codable {
+    case fastForwardOnly
+    case merge
+}
+
+public struct PullRequest: Sendable, Hashable {
+    public let fetch: FetchRequest
+    public let strategy: PullIntegrationStrategy
+    public let author: Signature
+    public let committer: Signature
+    public let message: [UInt8]?
+
+    public init(
+        fetch: FetchRequest,
+        strategy: PullIntegrationStrategy = .merge,
+        author: Signature,
+        committer: Signature,
+        message: [UInt8]? = nil
+    ) {
+        self.fetch = fetch
+        self.strategy = strategy
+        self.author = author
+        self.committer = committer
+        self.message = message
+    }
+}
+
+public struct PullResult: Sendable, Hashable, Codable {
+    public let fetch: FetchResult
+    public let upstreamReference: RefName
+    public let integration: MergeResult
+
+    public init(
+        fetch: FetchResult,
+        upstreamReference: RefName,
+        integration: MergeResult
+    ) {
+        self.fetch = fetch
+        self.upstreamReference = upstreamReference
+        self.integration = integration
+    }
+}
+
 public enum CloneMode: String, Sendable, Hashable, Codable {
     case normal
     case bare

@@ -55,7 +55,7 @@ reference storage, root policy, and interrupted transactions.
 | `reset` | `Repository.reset` | Soft, mixed, and hard |
 | `stash` | `createStash`, `stashes`, `applyStash` | Canonical tracked-change stash create/list/apply; untracked capture and drop/pop are not yet supported |
 | `fetch` | `Repository.fetch` | HTTPS/SSH, refspecs, prune, shallow, partial, quarantine |
-| `pull` | `fetch` followed by upstream resolution and `merge` | Supported as explicit host orchestration; no single convenience operation yet |
+| `pull` | `Repository.pull` | Configured upstream fetch followed by fast-forward-only or three-way integration |
 | `push` | `Repository.push` | CAS updates, creates, deletes, atomic batches, push options |
 | `tag` | `createTag`, ref APIs | Lightweight and signed/unsigned annotated tags |
 | `worktree` | linked-worktree create/list/lock/unlock/remove | Exact-commit linked worktrees |

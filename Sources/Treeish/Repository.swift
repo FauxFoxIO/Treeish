@@ -110,7 +110,7 @@ public actor Repository {
     ) -> GitOperation<StoredObject> {
         let store = objectStore
         let common = commonDirectory
-        let promisorRemote = repositoryCapabilities.promisorRemote
+        let promisorRemotes = repositoryCapabilities.promisorRemotes
         return GitOperation(phase: .validating) {
             try Task.checkCancellation()
             guard identifier.algorithm == store.objectFormat else {
@@ -118,22 +118,13 @@ public actor Repository {
                     identifier.algorithm.rawValue
                 )
             }
-            let object: GitObject
-            do {
-                object = try store.read(identifier: identifier.bytes)
-            } catch GitObjectError.objectNotFound {
-                guard let promisorRemote else {
-                    throw GitObjectError.objectNotFound
-                }
-                try await Repository.materializePromisedObject(
-                    identifier,
-                    remoteName: promisorRemote,
-                    services: services,
-                    store: store,
-                    directory: common
-                )
-                object = try store.read(identifier: identifier.bytes)
-            }
+            let object = try await Repository.readPromisedObject(
+                identifier.bytes,
+                preferredRemotes: promisorRemotes,
+                services: services,
+                store: store,
+                directory: common
+            )
             return StoredObject(
                 type: GitObjectKind(storageType: object.type),
                 payload: object.payload
@@ -720,6 +711,14 @@ public actor Repository {
             guard case .readWrite = access else {
                 throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
             }
+            if let filter = request.filter {
+                try Repository.configurePromisorRemote(
+                    name: request.remoteName,
+                    url: request.remote,
+                    filter: filter,
+                    directory: common
+                )
+            }
             let v2Capabilities: UploadPackV2Capabilities?
             let advertisement: UploadPackAdvertisement
             let credential: GitCredential?
@@ -820,6 +819,7 @@ public actor Repository {
                 try UploadPackV2.fetchRequest(
                     wants: wants,
                     haves: haves,
+                    filter: request.filter?.rawValue,
                     objectFormat: store.objectFormat,
                     capabilities: v2Capabilities
                 )
@@ -827,6 +827,7 @@ public actor Repository {
                 try UploadPackV0.fetchRequest(
                     wants: wants,
                     haves: haves,
+                    filter: request.filter?.rawValue,
                     objectFormat: store.objectFormat,
                     capabilities: advertisement.capabilities
                 )
@@ -864,7 +865,8 @@ public actor Repository {
             try Repository.publishPack(
                 pack.objects,
                 objectFormat: store.objectFormat,
-                in: common
+                in: common,
+                promisor: request.filter != nil
             )
             var updates: [RefUpdateResult] = []
             var fetchHead: [UInt8] = []
@@ -1093,12 +1095,16 @@ public actor Repository {
         }
     }
 
-    public func checkout(_ request: CheckoutRequest) -> GitOperation<CheckoutResult> {
+    public func checkout(
+        _ request: CheckoutRequest,
+        services: RepositoryServices = .init()
+    ) -> GitOperation<CheckoutResult> {
         let store = objectStore
         let indexStore = indexStore
         let worktree = worktree
         let headDirectory = gitDirectory
         let refsDirectory = commonDirectory
+        let promisorRemotes = repositoryCapabilities.promisorRemotes
         let limits = resourceLimits
         let access = repositoryCapabilities.access
         let refStorage = repositoryCapabilities.refStorage
@@ -1110,13 +1116,31 @@ public actor Repository {
                   request.commit.algorithm == store.objectFormat else {
                 throw TreeishError.repositoryNotFound
             }
-            let commitObject = try store.read(identifier: request.commit.bytes)
+            let commitObject = try await Repository.readPromisedObject(
+                request.commit.bytes,
+                preferredRemotes: promisorRemotes,
+                services: services,
+                store: store,
+                directory: refsDirectory
+            )
             let commit = try CommitRecord(identifier: request.commit.bytes, object: commitObject)
-            let target = try Repository.flattenTree(
+            let target = try await Repository.flattenPromisedTree(
                 identifier: commit.tree,
                 prefix: [],
-                store: store
+                preferredRemotes: promisorRemotes,
+                services: services,
+                store: store,
+                directory: refsDirectory
             )
+            for entry in target where entry.mode != 0o160000 {
+                _ = try await Repository.readPromisedObject(
+                    entry.objectID,
+                    preferredRemotes: promisorRemotes,
+                    services: services,
+                    store: store,
+                    directory: refsDirectory
+                )
+            }
             let currentIndex = try indexStore.read()
             let tracked = Set(currentIndex.entries.filter { $0.stage == 0 }.map(\.path))
             let targetPaths = Set(target.map(\.path))
@@ -1167,12 +1191,20 @@ public actor Repository {
                     store: store
                 )
                 let entries = try target.map { value -> GitIndexEntry in
-                    let blob = try store.read(identifier: value.objectID)
+                    let size: UInt32
+                    if value.mode == 0o160000 {
+                        size = 0
+                    } else {
+                        let blob = try store.read(identifier: value.objectID)
+                        size = UInt32(
+                            min(blob.payload.count, Int(UInt32.max))
+                        )
+                    }
                     return try GitIndexEntry(
                         path: value.path,
                         objectID: value.objectID,
                         mode: value.mode,
-                        size: UInt32(min(blob.payload.count, Int(UInt32.max))),
+                        size: size,
                         modificationSeconds: 0,
                         modificationNanoseconds: 0
                     )
@@ -3313,14 +3345,135 @@ public actor Repository {
         try publishPack(
             pack.objects,
             objectFormat: store.objectFormat,
-            in: directory
+            in: directory,
+            promisor: true
         )
+    }
+
+    private static func readPromisedObject(
+        _ identifier: [UInt8],
+        preferredRemotes: [String],
+        services: RepositoryServices,
+        store: RepositoryObjectStore,
+        directory: RootDirectory
+    ) async throws -> GitObject {
+        do {
+            return try store.read(identifier: identifier)
+        } catch GitObjectError.objectNotFound {
+            let configured = try GitConfiguration.load(from: directory)
+            let remotes = preferredRemotes.isEmpty
+                ? promisorRemoteNames(configured)
+                : preferredRemotes
+            var lastError: any Error = GitObjectError.objectNotFound
+            for remote in remotes {
+                do {
+                    try await materializePromisedObject(
+                        try ObjectID(
+                            algorithm: store.objectFormat,
+                            bytes: identifier
+                        ),
+                        remoteName: remote,
+                        services: services,
+                        store: store,
+                        directory: directory
+                    )
+                    return try store.read(identifier: identifier)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    lastError = error
+                }
+            }
+            throw lastError
+        }
+    }
+
+    private static func configurePromisorRemote(
+        name: String,
+        url: RemoteURL,
+        filter: GitObjectFilter,
+        directory: RootDirectory
+    ) throws {
+        var configuration = try GitConfiguration(
+            bytes: directory.read(["config"], limit: 16 * 1024 * 1024)
+        )
+        var bytes = try configuration.replacing(
+            section: "core",
+            key: "repositoryformatversion",
+            value: "1"
+        )
+        configuration = try GitConfiguration(bytes: bytes)
+        if configuration.value(
+            section: "extensions",
+            key: "partialclone"
+        ) == nil {
+            bytes = try configuration.replacing(
+                section: "extensions",
+                key: "partialclone",
+                value: name
+            )
+            configuration = try GitConfiguration(bytes: bytes)
+        }
+        bytes = try configuration.replacing(
+            section: "remote",
+            subsection: name,
+            key: "url",
+            value: url.description
+        )
+        configuration = try GitConfiguration(bytes: bytes)
+        bytes = try configuration.replacing(
+            section: "remote",
+            subsection: name,
+            key: "promisor",
+            value: "true"
+        )
+        configuration = try GitConfiguration(bytes: bytes)
+        bytes = try configuration.replacing(
+            section: "remote",
+            subsection: name,
+            key: "partialclonefilter",
+            value: filter.rawValue
+        )
+        try directory.writeAtomically(bytes, to: ["config"])
+    }
+
+    private static func promisorRemoteNames(
+        _ configuration: GitConfiguration
+    ) -> [String] {
+        var candidates: [String] = []
+        for entry in configuration.entries
+        where entry.section.caseInsensitiveCompare("remote") == .orderedSame {
+            guard let name = entry.subsection,
+                  !candidates.contains(name) else {
+                continue
+            }
+            candidates.append(name)
+        }
+        var remotes = candidates.filter { name in
+            guard let value = configuration.value(
+                section: "remote",
+                subsection: name,
+                key: "promisor"
+            )?.lowercased() else {
+                return false
+            }
+            return ["true", "yes", "on", "1"].contains(value)
+        }
+        if let primary = configuration.value(
+            section: "extensions",
+            key: "partialclone"
+        ), !primary.isEmpty {
+            remotes.removeAll { $0 == primary }
+            remotes.append(primary)
+        }
+        return remotes
     }
 
     private static func publishPack(
         _ objects: [ResolvedPackObject],
         objectFormat: ObjectHashAlgorithm,
-        in directory: RootDirectory
+        in directory: RootDirectory,
+        promisor: Bool = false
     ) throws {
         let canonical = try PackWriter.write(
             objects.map {
@@ -3332,9 +3485,19 @@ public actor Repository {
         let token = UUID().uuidString.lowercased()
         let temporaryPack = ["objects", "pack", ".treeish-quarantine-\(token).pack"]
         let temporaryIndex = ["objects", "pack", ".treeish-quarantine-\(token).idx"]
+        let temporaryPromisor = [
+            "objects", "pack", ".treeish-quarantine-\(token).promisor",
+        ]
         try directory.writeAtomically(canonical.pack, to: temporaryPack)
         do {
             try directory.writeAtomically(canonical.index, to: temporaryIndex)
+            if promisor {
+                try directory.writeAtomically([], to: temporaryPromisor)
+                try directory.moveAtomically(
+                    from: temporaryPromisor,
+                    to: ["objects", "pack", "pack-\(checksum).promisor"]
+                )
+            }
             try directory.moveAtomically(
                 from: temporaryPack,
                 to: ["objects", "pack", "pack-\(checksum).pack"]
@@ -3344,7 +3507,9 @@ public actor Repository {
                 to: ["objects", "pack", "pack-\(checksum).idx"]
             )
         } catch {
-            for path in [temporaryPack, temporaryIndex] {
+            for path in [
+                temporaryPack, temporaryIndex, temporaryPromisor,
+            ] {
                 if let url = try? directory.url(for: path, followFinalSymlink: false) {
                     try? FileManager.default.removeItem(at: url)
                 }
@@ -3504,6 +3669,74 @@ public actor Repository {
                 result += try flattenTree(identifier: child, prefix: path, store: store)
             } else {
                 result.append(FlatTreeEntry(path: path, objectID: child, mode: parsedMode))
+            }
+        }
+        return result
+    }
+
+    private static func flattenPromisedTree(
+        identifier: [UInt8],
+        prefix: [UInt8],
+        preferredRemotes: [String],
+        services: RepositoryServices,
+        store: RepositoryObjectStore,
+        directory: RootDirectory
+    ) async throws -> [FlatTreeEntry] {
+        let object = try await readPromisedObject(
+            identifier,
+            preferredRemotes: preferredRemotes,
+            services: services,
+            store: store,
+            directory: directory
+        )
+        guard object.type == .tree else {
+            throw GitObjectError.invalidHeader
+        }
+        var reader = CheckedByteReader(object.payload)
+        var result: [FlatTreeEntry] = []
+        while reader.remainingCount > 0 {
+            var modeBytes: [UInt8] = []
+            while true {
+                let byte = try reader.readByte()
+                if byte == 0x20 { break }
+                modeBytes.append(byte)
+            }
+            var name: [UInt8] = []
+            while true {
+                let byte = try reader.readByte()
+                if byte == 0 { break }
+                name.append(byte)
+            }
+            guard !name.isEmpty,
+                  !name.contains(0x2f),
+                  name != Array(".git".utf8),
+                  let mode = UInt32(
+                      String(decoding: modeBytes, as: UTF8.self),
+                      radix: 8
+                  ) else {
+                throw GitObjectError.invalidHeader
+            }
+            let child = Array(try reader.read(
+                count: store.objectFormat.byteCount
+            ))
+            let path = prefix.isEmpty ? name : prefix + [0x2f] + name
+            if mode == 0o40000 {
+                result += try await flattenPromisedTree(
+                    identifier: child,
+                    prefix: path,
+                    preferredRemotes: preferredRemotes,
+                    services: services,
+                    store: store,
+                    directory: directory
+                )
+            } else {
+                result.append(
+                    FlatTreeEntry(
+                        path: path,
+                        objectID: child,
+                        mode: mode
+                    )
+                )
             }
         }
         return result
@@ -4011,7 +4244,6 @@ public actor Repository {
         }
         var objectFormat = ObjectHashAlgorithm.sha1
         var refStorage = RefStorageFormat.files
-        var promisorRemote: String?
         for (name, value) in configuration.values(in: "extensions") {
             let normalizedName = name.lowercased()
             let normalizedValue = value.lowercased()
@@ -4028,7 +4260,6 @@ public actor Repository {
                 }
                 understood = RefStorageFormat(rawValue: normalizedValue) != nil
             case "partialclone":
-                promisorRemote = value
                 understood = !value.isEmpty
             case "noop":
                 understood = true
@@ -4108,7 +4339,7 @@ public actor Repository {
                 "objects", "pack", "multi-pack-index.d",
                 "multi-pack-index-chain",
             ]),
-            promisorRemote: promisorRemote,
+            promisorRemotes: promisorRemoteNames(configuration),
             index: indexCapabilities,
             repositoryExtensions: extensions,
             operations: operations,
@@ -4235,6 +4466,8 @@ public actor Repository {
             if mode == "40000" || mode == "040000" {
                 try root.createDirectory(path)
                 try materializeTree(identifier: objectID, at: path, root: root, store: store)
+            } else if mode == "160000" {
+                try root.createDirectory(path)
             } else {
                 let object = try store.read(identifier: objectID)
                 guard object.type == .blob else { throw GitObjectError.invalidHeader }

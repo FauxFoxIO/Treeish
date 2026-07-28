@@ -215,15 +215,49 @@ public struct RepositoryServices: Sendable {
     }
 }
 
+/// A canonical Git packfile filter specification.
+public struct GitObjectFilter: Sendable, Hashable, Codable,
+    CustomStringConvertible {
+    public let rawValue: String
+
+    public init(_ rawValue: String) throws {
+        guard !rawValue.isEmpty,
+              rawValue.utf8.count <= 4_096,
+              rawValue.utf8.allSatisfy({ (0x21...0x7e).contains($0) })
+        else {
+            throw TreeishError.invalidPath
+        }
+        self.rawValue = rawValue
+    }
+
+    private init(validated rawValue: String) {
+        self.rawValue = rawValue
+    }
+
+    public static let blobNone = GitObjectFilter(validated: "blob:none")
+
+    public static func blobLimit(_ bytes: UInt64) -> GitObjectFilter {
+        GitObjectFilter(validated: "blob:limit=\(bytes)")
+    }
+
+    public static func treeDepth(_ depth: UInt64) -> GitObjectFilter {
+        GitObjectFilter(validated: "tree:\(depth)")
+    }
+
+    public var description: String { rawValue }
+}
+
 public struct FetchRequest: Sendable, Hashable {
     public let remote: RemoteURL
     public let remoteName: String
     public let refNames: [RefName]
+    public let filter: GitObjectFilter?
 
     public init(
         remote: RemoteURL,
         remoteName: String = "origin",
-        refNames: [RefName] = []
+        refNames: [RefName] = [],
+        filter: GitObjectFilter? = nil
     ) throws {
         guard !remoteName.isEmpty,
               remoteName.allSatisfy({ $0.isLetter || $0.isNumber || "-_.".contains($0) })
@@ -231,6 +265,7 @@ public struct FetchRequest: Sendable, Hashable {
         self.remote = remote
         self.remoteName = remoteName
         self.refNames = refNames
+        self.filter = filter
     }
 }
 
@@ -255,12 +290,14 @@ public struct CloneRequest: Sendable, Hashable {
     public let destination: GitPath
     public let branch: RefName?
     public let remoteName: String
+    public let filter: GitObjectFilter?
 
     public init(
         remote: RemoteURL,
         destination: GitPath,
         branch: RefName? = nil,
-        remoteName: String = "origin"
+        remoteName: String = "origin",
+        filter: GitObjectFilter? = nil
     ) throws {
         guard branch == nil || branch?.description.hasPrefix("refs/heads/") == true,
               !remoteName.isEmpty,
@@ -271,6 +308,7 @@ public struct CloneRequest: Sendable, Hashable {
         self.destination = destination
         self.branch = branch
         self.remoteName = remoteName
+        self.filter = filter
     }
 }
 

@@ -22,6 +22,12 @@ the standard `tables.list.lock` compare-and-swap boundary.
 Object lookup follows root-contained alternate object databases and classic or
 incremental multi-pack indexes. Revision traversal honors `shallow` boundaries
 and replacement references. Partial-clone configuration is reported through
-``RepositoryCapabilities/promisorRemote``; ``Repository/readObject(_:services:)``
+``RepositoryCapabilities/promisorRemotes``; ``Repository/readObject(_:services:)``
 materializes missing promised objects through smart HTTP or host-provided SSH
 and publishes the validated response as a canonical local pack.
+
+``FetchRequest/filter`` and ``CloneRequest/filter`` negotiate Git filter
+specifications only when the server advertises the v0 or v2 `filter`
+capability. Filtered and demand-fetched packs carry standard `.promisor`
+markers. Checkout materializes omitted tree and blob objects before beginning
+its recoverable worktree transaction.

@@ -363,6 +363,11 @@ func treeishUsesSystemGitMultiPackIndexForObjectLookup(
     try git(["config", "remote.origin.url", "https://example.com/repository.git"])
     try git(["config", "remote.origin.promisor", "true"])
     try git(["config", "remote.origin.partialclonefilter", "blob:none"])
+    try git([
+        "config", "remote.cache.url",
+        "https://cache.example.test/repository.git",
+    ])
+    try git(["config", "remote.cache.promisor", "true"])
 
     let root = try await TreeishRoot.localDirectory(at: directory)
     let repository = try await Treeish.open(
@@ -370,7 +375,7 @@ func treeishUsesSystemGitMultiPackIndexForObjectLookup(
         roots: [root]
     )
     let capabilities = await repository.capabilities()
-    #expect(capabilities.promisorRemote == "origin")
+    #expect(capabilities.promisorRemotes == ["cache", "origin"])
     #expect(capabilities.access == .readWrite)
     #expect(try await repository.status().value().isClean)
 }

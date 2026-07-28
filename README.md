@@ -270,6 +270,9 @@ decisions for the host app.
 - root-contained alternate object databases, multi-pack-index v1/v2 lookup,
   shallow history boundaries, replacement objects, and on-demand promisor
   object materialization over smart HTTP or host-provided SSH;
+- protocol v0/v2 partial fetch and clone filters, promisor pack markers,
+  multiple promisor remotes, and checkout-time materialization of omitted
+  trees and blobs;
 - repository formats 0 and 1 when all required extensions are understood,
   normal repositories, and bare repositories;
 - loose, symbolic, and packed references with reflogs, plus bounded reftable

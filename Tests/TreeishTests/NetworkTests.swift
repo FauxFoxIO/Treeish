@@ -120,7 +120,9 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
     let commitHex = commitID.map { String(format: "%02x", $0) }.joined()
     let advertisement = try PacketLineEncoder.encode(.data(Array("version 2\n".utf8)))
         + PacketLineEncoder.encode(.data(Array("ls-refs=unborn\n".utf8)))
-        + PacketLineEncoder.encode(.data(Array("fetch=wait-for-done\n".utf8)))
+        + PacketLineEncoder.encode(
+            .data(Array("fetch=wait-for-done filter\n".utf8))
+        )
         + PacketLineEncoder.encode(.data(Array("object-format=sha1\n".utf8)))
         + PacketLineEncoder.encode(.flush)
     let refs = try PacketLineEncoder.encode(
@@ -158,7 +160,7 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
     let root = try await TreeishRoot.localDirectory(at: directory)
     let repository = try await Treeish.initialize(in: root)
     let result = try await repository.fetch(
-        try FetchRequest(remote: remote),
+        try FetchRequest(remote: remote, filter: .blobNone),
         services: RepositoryServices(
             credentials: GitHubTokenCredentials(token: "secret"),
             httpTransport: transport
@@ -187,6 +189,24 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
     #expect(requests[0].headers["Git-Protocol"] == "version=2")
     #expect(String(decoding: requests[1].body, as: UTF8.self).contains("command=ls-refs"))
     #expect(String(decoding: requests[2].body, as: UTF8.self).contains("command=fetch"))
+    #expect(
+        String(decoding: requests[2].body, as: UTF8.self)
+            .contains("filter blob:none")
+    )
+    let configuration = String(
+        decoding: try root.directory.read(
+            [".git", "config"],
+            limit: 1024 * 1024
+        ),
+        as: UTF8.self
+    )
+    #expect(configuration.contains("partialclone = \"origin\""))
+    #expect(configuration.contains("promisor = \"true\""))
+    #expect(configuration.contains("partialclonefilter = \"blob:none\""))
+    let packFiles = try FileManager.default.contentsOfDirectory(
+        atPath: directory.appendingPathComponent(".git/objects/pack").path
+    )
+    #expect(packFiles.contains { $0.hasSuffix(".promisor") })
 }
 
 @Test func readObjectMaterializesMissingPromisorObject() async throws {
@@ -281,6 +301,120 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
     #expect(
         try await repository.readObject(try ObjectID(bytes: identifier))
             .value().payload == blob.payload
+    )
+}
+
+@Test func checkoutMaterializesFilteredCloneObjects() async throws {
+    let blob = GitObject(
+        type: .blob,
+        payload: Array("checkout promise\n".utf8)
+    )
+    let blobID = SHA1.hash(blob.canonicalBytes)
+    let archive = try PackWriter.write([
+        try PackObject(identifier: blobID, object: blob),
+    ])
+    let advertisement =
+        try PacketLineEncoder.encode(.data(Array("version 2\n".utf8)))
+        + PacketLineEncoder.encode(.data(Array("fetch=filter\n".utf8)))
+        + PacketLineEncoder.encode(.data(Array("object-format=sha1\n".utf8)))
+        + PacketLineEncoder.encode(.flush)
+    let response =
+        try PacketLineEncoder.encode(.data(Array("packfile\n".utf8)))
+        + PacketLineEncoder.encode(.data([1] + archive.pack))
+        + PacketLineEncoder.encode(.flush)
+    let remote = try RemoteURL(
+        URL(string: "https://example.test/filtered.git")!
+    )
+    let transport = ScriptedSmartHTTPTransport(responses: [
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type":
+                    "application/x-git-upload-pack-advertisement",
+            ],
+            body: advertisement,
+            finalURL: remote.url.appendingPathComponent("info/refs")
+        ),
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type": "application/x-git-upload-pack-result",
+            ],
+            body: response,
+            finalURL: remote.url.appendingPathComponent("git-upload-pack")
+        ),
+    ])
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.initialize(in: root)
+    let tree = GitObjectEncoder.tree(entries: [
+        try GitTreeEntry(
+            mode: .regular,
+            name: Array("promised.txt".utf8),
+            objectID: blobID
+        ),
+    ])
+    let treeID = try await repository.writeObject(
+        type: .tree,
+        payload: tree.payload
+    ).value()
+    let signature = GitSignature(
+        name: "Treeish",
+        email: "treeish@example.com",
+        secondsSinceEpoch: 1_700_000_000,
+        timeZoneOffsetMinutes: 0
+    )
+    let commit = GitObjectEncoder.commit(
+        treeHex: treeID.description,
+        parentHexes: [],
+        author: signature,
+        committer: signature,
+        message: Array("filtered checkout\n".utf8)
+    )
+    let commitID = try await repository.writeObject(
+        type: .commit,
+        payload: commit.payload
+    ).value()
+    var configuration = try root.directory.read(
+        [".git", "config"],
+        limit: 1024 * 1024
+    )
+    configuration += Array(
+        """
+
+        [extensions]
+            partialClone = origin
+        [remote "origin"]
+            url = https://example.test/filtered.git
+            promisor = true
+            partialCloneFilter = blob:none
+
+        """.utf8
+    )
+    try root.directory.writeAtomically(
+        configuration,
+        to: [".git", "config"]
+    )
+
+    let result = try await repository.checkout(
+        CheckoutRequest(
+            commit: commitID,
+            reference: try RefName("refs/heads/main")
+        ),
+        services: RepositoryServices(httpTransport: transport)
+    ).value()
+    #expect(result.pathsWritten == 1)
+    #expect(
+        try root.directory.read(
+            ["promised.txt"],
+            limit: 1024
+        ) == blob.payload
     )
 }
 

@@ -355,7 +355,7 @@ import Testing
     let capabilities = try UploadPackV2.parseCapabilities([
         .data(Array("version 2\n".utf8)),
         .data(Array("ls-refs=unborn\n".utf8)),
-        .data(Array("fetch=shallow wait-for-done\n".utf8)),
+        .data(Array("fetch=shallow wait-for-done filter\n".utf8)),
         .data(Array("object-format=sha1\n".utf8)),
         .flush,
     ])
@@ -375,8 +375,13 @@ import Testing
     ])
     #expect(refs.symbolicHead == "refs/heads/main")
     #expect(refs.references.count == 2)
-    let fetch = try UploadPackV2.fetchRequest(wants: [object], capabilities: capabilities)
+    let fetch = try UploadPackV2.fetchRequest(
+        wants: [object],
+        filter: "blob:none",
+        capabilities: capabilities
+    )
     #expect(String(decoding: fetch, as: UTF8.self).contains("command=fetch"))
+    #expect(String(decoding: fetch, as: UTF8.self).contains("filter blob:none"))
     let pack = Array("PACKpayload".utf8)
     #expect(try UploadPackV2.parseFetchResponse([
         .data(Array("acknowledgments\n".utf8)),
@@ -385,6 +390,18 @@ import Testing
         .data([1] + pack),
         .flush,
     ]) == pack)
+}
+
+@Test func uploadPackV0NegotiatesPartialCloneFilter() throws {
+    let object = [UInt8](repeating: 0x34, count: 20)
+    let request = try UploadPackV0.fetchRequest(
+        wants: [object],
+        filter: "blob:limit=1024",
+        capabilities: ["filter", "side-band-64k"]
+    )
+    let text = String(decoding: request, as: UTF8.self)
+    #expect(text.contains(" filter"))
+    #expect(text.contains("filter blob:limit=1024"))
 }
 
 @Test func receivePackEncodesMultipleUpdatesAndDeletionAtomically() throws {

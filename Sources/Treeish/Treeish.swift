@@ -241,7 +241,8 @@ public enum Treeish {
             try FetchRequest(
                 remote: request.remote,
                 remoteName: request.remoteName,
-                refNames: request.branch.map { [$0] } ?? []
+                refNames: request.branch.map { [$0] } ?? [],
+                filter: request.filter
             ),
             services: services
         ).value()
@@ -266,7 +267,11 @@ public enum Treeish {
         let branchName = String(selectedRemote.name.description.split(separator: "/").last ?? "main")
         let localBranch = try RefName("refs/heads/\(branchName)")
         _ = try await repository.checkout(
-            CheckoutRequest(commit: selectedRemote.current, reference: localBranch)
+            CheckoutRequest(
+                commit: selectedRemote.current,
+                reference: localBranch
+            ),
+            services: services
         ).value()
         let configPath = destinationComponents + [".git", "config"]
         let existing = try root.directory.read(configPath, limit: 16 * 1024 * 1024)

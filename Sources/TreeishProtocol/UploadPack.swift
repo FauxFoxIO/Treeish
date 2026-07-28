@@ -77,6 +77,7 @@ public enum UploadPackV0 {
     public static func fetchRequest(
         wants: [[UInt8]],
         haves: [[UInt8]] = [],
+        filter: String? = nil,
         objectFormat: GitHashAlgorithm = .sha1,
         capabilities advertised: Set<String>
     ) throws -> [UInt8] {
@@ -90,6 +91,12 @@ public enum UploadPackV0 {
         } else if objectFormat != .sha1 {
             throw UploadPackError.invalidObjectID
         }
+        if filter != nil {
+            guard advertised.contains("filter") else {
+                throw UploadPackError.malformedAdvertisement
+            }
+            supported.append("filter")
+        }
         let selected = supported.filter(advertised.contains)
         var output: [UInt8] = []
         for (index, identifier) in wants.enumerated() {
@@ -101,6 +108,14 @@ public enum UploadPackV0 {
                 : ""
             output += try PacketLineEncoder.encode(
                 .data(Array("want \(hex(identifier))\(suffix)\n".utf8))
+            )
+        }
+        if let filter {
+            guard validFilter(filter) else {
+                throw UploadPackError.malformedAdvertisement
+            }
+            output += try PacketLineEncoder.encode(
+                .data(Array("filter \(filter)\n".utf8))
             )
         }
         output += try PacketLineEncoder.encode(.flush)
@@ -167,6 +182,10 @@ public struct UploadPackV2Capabilities: Sendable, Hashable {
 
     public init(values: [String: String?]) { self.values = values }
     public func supports(_ name: String) -> Bool { values.keys.contains(name) }
+    public func feature(_ command: String, includes feature: String) -> Bool {
+        guard let advertised = values[command] ?? nil else { return false }
+        return advertised.split(separator: " ").contains(Substring(feature))
+    }
 
     public var objectFormat: GitHashAlgorithm {
         guard let value = values["object-format"] ?? nil else {
@@ -261,6 +280,7 @@ public enum UploadPackV2 {
     public static func fetchRequest(
         wants: [[UInt8]],
         haves: [[UInt8]] = [],
+        filter: String? = nil,
         objectFormat: GitHashAlgorithm = .sha1,
         capabilities: UploadPackV2Capabilities
     ) throws -> [UInt8] {
@@ -279,6 +299,15 @@ public enum UploadPackV2 {
         output += try PacketLineEncoder.encode(.delimiter)
         output += try PacketLineEncoder.encode(.data(Array("thin-pack\n".utf8)))
         output += try PacketLineEncoder.encode(.data(Array("ofs-delta\n".utf8)))
+        if let filter {
+            guard capabilities.feature("fetch", includes: "filter"),
+                  validFilter(filter) else {
+                throw UploadPackError.malformedAdvertisement
+            }
+            output += try PacketLineEncoder.encode(
+                .data(Array("filter \(filter)\n".utf8))
+            )
+        }
         for identifier in wants {
             guard identifier.count == objectFormat.byteCount else {
                 throw UploadPackError.invalidObjectID
@@ -336,4 +365,10 @@ private func decodeHexV2<S: Collection>(_ bytes: S) throws -> [UInt8] where S.El
 
 private func hexV2(_ bytes: [UInt8]) -> String {
     bytes.map { String(format: "%02x", $0) }.joined()
+}
+
+private func validFilter(_ value: String) -> Bool {
+    !value.isEmpty
+        && value.utf8.count <= 4_096
+        && value.utf8.allSatisfy { (0x21...0x7e).contains($0) }
 }

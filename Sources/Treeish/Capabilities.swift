@@ -86,7 +86,7 @@ public struct RepositoryCapabilities: Sendable, Hashable, Codable {
     public let isShallow: Bool
     public let usesAlternates: Bool
     public let hasMultiPackIndex: Bool
-    public let promisorRemote: String?
+    public let promisorRemotes: [String]
     public let index: IndexCapabilities
     public let repositoryExtensions: [RepositoryExtensionCapability]
     public let operations: Set<RepositoryOperationCapability>
@@ -99,7 +99,7 @@ public struct RepositoryCapabilities: Sendable, Hashable, Codable {
         isShallow: Bool,
         usesAlternates: Bool,
         hasMultiPackIndex: Bool,
-        promisorRemote: String?,
+        promisorRemotes: [String],
         index: IndexCapabilities,
         repositoryExtensions: [RepositoryExtensionCapability],
         operations: Set<RepositoryOperationCapability>,
@@ -111,7 +111,7 @@ public struct RepositoryCapabilities: Sendable, Hashable, Codable {
         self.isShallow = isShallow
         self.usesAlternates = usesAlternates
         self.hasMultiPackIndex = hasMultiPackIndex
-        self.promisorRemote = promisorRemote
+        self.promisorRemotes = promisorRemotes
         self.index = index
         self.repositoryExtensions = repositoryExtensions
         self.operations = operations

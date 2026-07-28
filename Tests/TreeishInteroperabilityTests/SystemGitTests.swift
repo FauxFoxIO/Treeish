@@ -1498,6 +1498,93 @@ func checkoutMovesOnlyHeadAndResetLogsResolvedHead(
     )
 }
 
+@Test func trackingAndPriorCheckoutSelectorsMatchSystemGit() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    func git(_ arguments: [String]) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory.path] + arguments
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "GIT_AUTHOR_NAME": "System Git",
+            "GIT_AUTHOR_EMAIL": "git@example.com",
+            "GIT_COMMITTER_NAME": "System Git",
+            "GIT_COMMITTER_EMAIL": "git@example.com",
+        ], uniquingKeysWith: { _, new in new })
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        let text = String(
+            decoding: output.fileHandleForReading.readDataToEndOfFile(),
+            as: UTF8.self
+        )
+        guard process.terminationStatus == 0 else {
+            throw TreeishError.recoveryRequired(text)
+        }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    _ = try git(["init"])
+    let branch = try git(["symbolic-ref", "--short", "HEAD"])
+    let file = directory.appendingPathComponent("value.txt")
+    try Data("base\n".utf8).write(to: file)
+    _ = try git(["add", "value.txt"])
+    _ = try git(["commit", "-m", "base"])
+    _ = try git(["branch", "feature"])
+    try Data("main\n".utf8).write(to: file)
+    _ = try git(["commit", "-am", "main"])
+    let mainTip = try ObjectID(hex: git(["rev-parse", "HEAD"]))
+    _ = try git(["checkout", "feature"])
+    try Data("feature\n".utf8).write(to: file)
+    _ = try git(["commit", "-am", "feature"])
+    let featureTip = try ObjectID(hex: git(["rev-parse", "HEAD"]))
+    _ = try git(["checkout", branch])
+
+    _ = try git(["update-ref", "refs/cache/origin/\(branch)", mainTip.description])
+    _ = try git(["update-ref", "refs/cache/origin/review", featureTip.description])
+    _ = try git(["config", "remote.origin.url", "https://example.test/repository.git"])
+    _ = try git([
+        "config", "--add", "remote.origin.fetch",
+        "+refs/heads/*:refs/cache/origin/*",
+    ])
+    _ = try git(["config", "branch.\(branch).remote", "origin"])
+    _ = try git(["config", "branch.\(branch).merge", "refs/heads/\(branch)"])
+    _ = try git(["config", "branch.\(branch).pushRemote", "origin"])
+    _ = try git([
+        "config", "--add", "remote.origin.push",
+        "refs/heads/\(branch):refs/heads/review",
+    ])
+
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.open(
+        try await Treeish.discover(in: root),
+        roots: [root]
+    )
+    for expression in [
+        "@{-1}",
+        "@{-2}",
+        "@{upstream}",
+        "\(branch)@{u}",
+        "@{push}",
+    ] {
+        #expect(
+            try await repository.resolveRevision(expression)
+                == ObjectID(hex: git(["rev-parse", expression]))
+        )
+    }
+    #expect(try await repository.resolveRevision("@{-1}") == featureTip)
+    #expect(try await repository.resolveRevision("@{upstream}") == mainTip)
+    #expect(try await repository.resolveRevision("@{push}") == featureTip)
+}
+
 @Test func treeishTraversesSystemGitDeltaPackAfterGC() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString)

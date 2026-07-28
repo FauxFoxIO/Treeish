@@ -299,7 +299,8 @@ decisions for the host app.
 - branches, lightweight and annotated tags, and linked worktrees;
 - `.gitmodules` parsing, gitlink-aware status, and bounded native submodule
   initialization and exact-commit updates;
-- revision expressions, numbered and date-based reflog selectors, structured
+- revision expressions, numbered/date/prior-checkout reflog selectors,
+  upstream and push tracking selectors with refspec mapping, structured
   file/reftable reflog reads, ancestry, ranges, logs, and merge bases;
 - merge, cherry-pick, rebase, continuation, conflict state, and abort;
 - unified patches, bundles, blob diffs, and binary-safe workspace snapshots.

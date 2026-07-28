@@ -3086,6 +3086,23 @@ public actor Repository {
             let value = expression[marker.upperBound..<expression.index(before: expression.endIndex)]
             let selector = String(value)
             guard !selector.isEmpty else { throw TreeishError.invalidObjectID }
+            if ["u", "upstream"].contains(selector.lowercased()) {
+                return try resolveReference(
+                    trackingReference(for: base, push: false)
+                )
+            }
+            if selector.lowercased() == "push" {
+                return try resolveReference(
+                    trackingReference(for: base, push: true)
+                )
+            }
+            if base.isEmpty,
+               selector.first == "-",
+               let checkoutIndex = Int(selector.dropFirst()),
+               checkoutIndex > 0,
+               checkoutIndex <= 1_000_000 {
+                return try resolvePriorCheckout(checkoutIndex)
+            }
             let reference: RefName
             let directory: RootDirectory
             if base.isEmpty || base == "HEAD" {
@@ -3209,6 +3226,197 @@ public actor Repository {
             throw candidates.isEmpty ? TreeishError.referenceNotFound : TreeishError.referenceChanged
         }
         return result
+    }
+
+    private func resolvePriorCheckout(_ index: Int) throws -> ObjectID {
+        let entries = try headReflog(limit: 1_000_001)
+        var remaining = index
+        for entry in entries {
+            let prefix = "checkout: moving from "
+            guard entry.message.hasPrefix(prefix),
+                  let separator = entry.message.range(
+                    of: " to ",
+                    range: entry.message.index(
+                        entry.message.startIndex,
+                        offsetBy: prefix.count
+                    )..<entry.message.endIndex
+                  ) else {
+                continue
+            }
+            remaining -= 1
+            guard remaining == 0 else { continue }
+            let source = String(
+                entry.message[
+                    entry.message.index(
+                        entry.message.startIndex,
+                        offsetBy: prefix.count
+                    )..<separator.lowerBound
+                ]
+            )
+            guard !source.isEmpty, source != "@{-\(index)}" else {
+                throw TreeishError.referenceNotFound
+            }
+            return try resolveRevision(source)
+        }
+        throw TreeishError.referenceNotFound
+    }
+
+    private func trackingReference(
+        for expression: String,
+        push: Bool
+    ) throws -> RefName {
+        let branch: RefName
+        if expression.isEmpty || expression == "HEAD" {
+            guard let current = try readHead().reference else {
+                throw TreeishError.referenceNotFound
+            }
+            branch = current
+        } else {
+            branch = try revisionReferenceName(expression)
+        }
+        let branchPrefix = "refs/heads/"
+        guard branch.description.hasPrefix(branchPrefix) else {
+            throw TreeishError.referenceNotFound
+        }
+        let shortName = String(branch.description.dropFirst(branchPrefix.count))
+        let configuration = try GitConfiguration.load(from: commonDirectory)
+        if push {
+            return try pushTrackingReference(
+                branch: branch,
+                shortName: shortName,
+                configuration: configuration
+            )
+        }
+        guard let remote = configuration.value(
+            section: "branch",
+            subsection: shortName,
+            key: "remote"
+        ), let merge = configuration.value(
+            section: "branch",
+            subsection: shortName,
+            key: "merge"
+        ) else {
+            throw TreeishError.referenceNotFound
+        }
+        let remoteReference = try RefName(merge)
+        if remote == "." { return remoteReference }
+        return try localTrackingReference(
+            remoteReference,
+            remote: remote,
+            configuration: configuration
+        )
+    }
+
+    private func pushTrackingReference(
+        branch: RefName,
+        shortName: String,
+        configuration: GitConfiguration
+    ) throws -> RefName {
+        let configuredRemote = configuration.value(
+            section: "branch",
+            subsection: shortName,
+            key: "pushremote"
+        ) ?? configuration.value(
+            section: "remote",
+            key: "pushdefault"
+        ) ?? configuration.value(
+            section: "branch",
+            subsection: shortName,
+            key: "remote"
+        )
+        let remote: String
+        if let configuredRemote {
+            remote = configuredRemote
+        } else {
+            let names = Set(configuration.entries.compactMap {
+                $0.section.caseInsensitiveCompare("remote") == .orderedSame
+                    ? $0.subsection
+                    : nil
+            })
+            guard names.count == 1, let only = names.first else {
+                throw TreeishError.referenceNotFound
+            }
+            remote = only
+        }
+
+        let pushValues = configuration.entries.filter {
+            $0.section.caseInsensitiveCompare("remote") == .orderedSame
+                && $0.subsection == remote
+                && $0.key.caseInsensitiveCompare("push") == .orderedSame
+        }.map(\.value)
+        let remoteDestination: RefName
+        if !pushValues.isEmpty {
+            let mappings = try pushValues.map(FetchRefspec.init)
+            let destinations = try mappings.compactMap {
+                try $0.localReference(for: branch.bytes)
+            }
+            guard destinations.count == 1, let destination = destinations.first else {
+                throw TreeishError.referenceNotFound
+            }
+            remoteDestination = destination
+        } else {
+            let mode = configuration.value(
+                section: "push",
+                key: "default"
+            )?.lowercased() ?? "simple"
+            switch mode {
+            case "current", "matching":
+                remoteDestination = branch
+            case "upstream", "tracking", "simple":
+                guard let merge = configuration.value(
+                    section: "branch",
+                    subsection: shortName,
+                    key: "merge"
+                ) else {
+                    throw TreeishError.referenceNotFound
+                }
+                remoteDestination = try RefName(merge)
+                if mode == "simple",
+                   remoteDestination.description != branch.description {
+                    throw TreeishError.referenceNotFound
+                }
+            default:
+                throw TreeishError.referenceNotFound
+            }
+        }
+        if remote == "." { return remoteDestination }
+        return try localTrackingReference(
+            remoteDestination,
+            remote: remote,
+            configuration: configuration
+        )
+    }
+
+    private func localTrackingReference(
+        _ remoteReference: RefName,
+        remote: String,
+        configuration: GitConfiguration
+    ) throws -> RefName {
+        let values = configuration.entries.filter {
+            $0.section.caseInsensitiveCompare("remote") == .orderedSame
+                && $0.subsection == remote
+                && $0.key.caseInsensitiveCompare("fetch") == .orderedSame
+        }.map(\.value)
+        let specifications = try values.map(FetchRefspec.init)
+        let negative = specifications.filter(\.negative)
+        guard !negative.contains(where: {
+            $0.matches(remoteReference.bytes)
+        }) else {
+            throw TreeishError.referenceNotFound
+        }
+        let candidates = try specifications.filter { !$0.negative }.compactMap {
+            try $0.localReference(for: remoteReference.bytes)
+        }
+        if candidates.count == 1, let candidate = candidates.first {
+            return candidate
+        }
+        guard candidates.isEmpty,
+              remoteReference.description.hasPrefix("refs/heads/") else {
+            throw TreeishError.referenceNotFound
+        }
+        return try RefName(
+            "refs/remotes/\(remote)/\(remoteReference.description.dropFirst("refs/heads/".count))"
+        )
     }
 
     private func readReflog(

@@ -18,8 +18,9 @@ declared object format.
 Reftable v1 and v2 stacks support symbolic references, peeled values, deletion
 records, bounded reflog reads, and append-only reference/reflog transactions.
 File and reftable repositories support numbered and date-based reflog revision
-selectors. Stack publication uses the standard `tables.list.lock`
-compare-and-swap boundary.
+selectors, prior-checkout selectors, and branch upstream/push selectors.
+Tracking selectors honor configured fetch and push refspec destinations. Stack
+publication uses the standard `tables.list.lock` compare-and-swap boundary.
 
 Branch checkout validates that the requested branch already names the requested
 commit and moves only symbolic `HEAD`; it never rewrites the branch as a side

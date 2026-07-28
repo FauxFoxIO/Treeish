@@ -247,19 +247,181 @@ public struct GitObjectFilter: Sendable, Hashable, Codable,
     public var description: String { rawValue }
 }
 
+public struct FetchRefspec: Sendable, Hashable, Codable,
+    CustomStringConvertible {
+    public let source: [UInt8]
+    public let destination: [UInt8]?
+    public let force: Bool
+    public let negative: Bool
+
+    public init(
+        source: String,
+        destination: String? = nil,
+        force: Bool = false,
+        negative: Bool = false
+    ) throws {
+        let sourceBytes = Array(source.utf8)
+        let destinationBytes = destination.map { Array($0.utf8) }
+        try Self.validate(
+            source: sourceBytes,
+            destination: destinationBytes,
+            force: force,
+            negative: negative
+        )
+        self.source = sourceBytes
+        self.destination = destinationBytes
+        self.force = force
+        self.negative = negative
+    }
+
+    public init(_ value: String) throws {
+        var bytes = Array(value.utf8)
+        let negative = bytes.first == 0x5e
+        let force = bytes.first == 0x2b
+        if negative || force {
+            bytes.removeFirst()
+        }
+        let separators = bytes.indices.filter { bytes[$0] == 0x3a }
+        guard separators.count <= 1 else {
+            throw TreeishError.invalidRefName
+        }
+        let source: [UInt8]
+        let destination: [UInt8]?
+        if let separator = separators.first {
+            source = Array(bytes[..<separator])
+            let suffix = Array(bytes[bytes.index(after: separator)...])
+            destination = suffix.isEmpty ? nil : suffix
+        } else {
+            source = bytes
+            destination = nil
+        }
+        try Self.validate(
+            source: source,
+            destination: destination,
+            force: force,
+            negative: negative
+        )
+        self.source = source
+        self.destination = destination
+        self.force = force
+        self.negative = negative
+    }
+
+    public var description: String {
+        let prefix = negative ? "^" : (force ? "+" : "")
+        let source = String(decoding: source, as: UTF8.self)
+        return prefix + source + (destination.map {
+            ":" + String(decoding: $0, as: UTF8.self)
+        } ?? "")
+    }
+
+    private static func validate(
+        source: [UInt8],
+        destination: [UInt8]?,
+        force: Bool,
+        negative: Bool
+    ) throws {
+        let sourceWildcards = source.filter { $0 == 0x2a }.count
+        let destinationWildcards = destination?
+            .filter { $0 == 0x2a }.count ?? 0
+        guard !source.isEmpty,
+              sourceWildcards <= 1,
+              negative || destinationWildcards == sourceWildcards,
+              !(negative && (force || destination != nil)) else {
+            throw TreeishError.invalidRefName
+        }
+        _ = try RefName(
+            validating: source.map { $0 == 0x2a ? 0x78 : $0 }
+        )
+        if let destination {
+            _ = try RefName(
+                validating: destination.map { $0 == 0x2a ? 0x78 : $0 }
+            )
+        }
+    }
+}
+
+extension FetchRefspec {
+    var advertisementPrefix: [UInt8] {
+        Array(source.prefix { $0 != 0x2a })
+    }
+
+    func matches(_ reference: [UInt8]) -> Bool {
+        Self.capture(reference, pattern: source) != nil
+    }
+
+    func localReference(for remoteReference: [UInt8]) throws -> RefName? {
+        guard let destination,
+              let capture = Self.capture(
+                  remoteReference,
+                  pattern: source
+              ) else {
+            return nil
+        }
+        return try RefName(
+            validating: Self.expanding(destination, with: capture)
+        )
+    }
+
+    func remoteReference(for localReference: [UInt8]) -> [UInt8]? {
+        guard let destination,
+              let capture = Self.capture(
+                  localReference,
+                  pattern: destination
+              ) else {
+            return nil
+        }
+        return Self.expanding(source, with: capture)
+    }
+
+    private static func capture(
+        _ reference: [UInt8],
+        pattern: [UInt8]
+    ) -> [UInt8]? {
+        guard let wildcard = pattern.firstIndex(of: 0x2a) else {
+            return reference == pattern ? [] : nil
+        }
+        let prefix = pattern[..<wildcard]
+        let suffix = pattern[pattern.index(after: wildcard)...]
+        guard reference.count >= prefix.count + suffix.count,
+              reference.starts(with: prefix),
+              reference.suffix(suffix.count).elementsEqual(suffix) else {
+            return nil
+        }
+        return Array(
+            reference[prefix.count..<(reference.count - suffix.count)]
+        )
+    }
+
+    private static func expanding(
+        _ pattern: [UInt8],
+        with capture: [UInt8]
+    ) -> [UInt8] {
+        guard let wildcard = pattern.firstIndex(of: 0x2a) else {
+            return pattern
+        }
+        return Array(pattern[..<wildcard])
+            + capture
+            + Array(pattern[pattern.index(after: wildcard)...])
+    }
+}
+
 public struct FetchRequest: Sendable, Hashable {
     public let remote: RemoteURL
     public let remoteName: String
-    public let refNames: [RefName]
+    public let refspecs: [FetchRefspec]
     public let filter: GitObjectFilter?
     public let depth: UInt32?
+    public let prune: Bool
+    let requiresMatch: Bool
 
     public init(
         remote: RemoteURL,
         remoteName: String = "origin",
-        refNames: [RefName] = [],
+        refspecs: [FetchRefspec] = [],
         filter: GitObjectFilter? = nil,
-        depth: UInt32? = nil
+        depth: UInt32? = nil,
+        prune: Bool = false
     ) throws {
         guard !remoteName.isEmpty,
               remoteName.allSatisfy({
@@ -269,9 +431,20 @@ public struct FetchRequest: Sendable, Hashable {
         else { throw TreeishError.invalidRefName }
         self.remote = remote
         self.remoteName = remoteName
-        self.refNames = refNames
+        requiresMatch = !refspecs.isEmpty
+        if refspecs.isEmpty {
+            self.refspecs = [
+                try FetchRefspec(
+                    "+refs/heads/*:refs/remotes/\(remoteName)/*"
+                ),
+                try FetchRefspec("+refs/tags/*:refs/tags/*"),
+            ]
+        } else {
+            self.refspecs = refspecs
+        }
         self.filter = filter
         self.depth = depth
+        self.prune = prune
     }
 }
 
@@ -280,17 +453,20 @@ public struct FetchResult: Sendable, Hashable, Codable {
     public let updatedReferences: [RefUpdateResult]
     public let remoteHead: RefName?
     public let shallowBoundaries: [ObjectID]
+    public let prunedReferences: [RefName]
 
     public init(
         receivedObjects: Int,
         updatedReferences: [RefUpdateResult],
         remoteHead: RefName?,
-        shallowBoundaries: [ObjectID] = []
+        shallowBoundaries: [ObjectID] = [],
+        prunedReferences: [RefName] = []
     ) {
         self.receivedObjects = receivedObjects
         self.updatedReferences = updatedReferences
         self.remoteHead = remoteHead
         self.shallowBoundaries = shallowBoundaries
+        self.prunedReferences = prunedReferences
     }
 }
 

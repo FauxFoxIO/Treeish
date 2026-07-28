@@ -49,6 +49,9 @@ public enum UploadPackV0 {
             if bytes.starts(with: Array("# service=".utf8)) { continue }
             var line = bytes
             if line.last == 0x0a { line.removeLast() }
+            if line == Array("version 1".utf8) {
+                continue
+            }
             let fields = line.split(separator: 0x20, maxSplits: 1)
             guard fields.count == 2 else { throw UploadPackError.malformedAdvertisement }
             let identifier = try decodeHex(fields[0])

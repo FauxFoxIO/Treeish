@@ -278,6 +278,9 @@ decisions for the host app.
 - receive-pack compare-and-swap updates with capability-gated atomic batches,
   push options and deletions, legacy status handling, and deletion-only
   requests without a packfile;
+- byte-preserving exact, wildcard, forced, and negative fetch refspecs,
+  capability-safe pruning, protocol v1 advertisements, and empty remote
+  cloning;
 - repository formats 0 and 1 when all required extensions are understood,
   normal repositories, and bare repositories;
 - loose, symbolic, and packed references with reflogs, plus bounded reftable

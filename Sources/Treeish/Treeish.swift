@@ -241,12 +241,42 @@ public enum Treeish {
             try FetchRequest(
                 remote: request.remote,
                 remoteName: request.remoteName,
-                refNames: request.branch.map { [$0] } ?? [],
+                refspecs: try request.branch.map { branch in
+                    let tail = branch.description.dropFirst(
+                        "refs/heads/".count
+                    )
+                    return [
+                        try FetchRefspec(
+                            source: branch.description,
+                            destination:
+                                "refs/remotes/\(request.remoteName)/\(tail)",
+                            force: true
+                        ),
+                    ]
+                } ?? [],
                 filter: request.filter,
                 depth: request.depth
             ),
             services: services
         ).value()
+        if fetched.updatedReferences.isEmpty {
+            let configPath = destinationComponents + [".git", "config"]
+            let existing = try root.directory.read(
+                configPath,
+                limit: 16 * 1024 * 1024
+            )
+            let remoteConfiguration = """
+            [remote "\(request.remoteName)"]
+            \turl = \(request.remote.description)
+            \tfetch = +refs/heads/*:refs/remotes/\(request.remoteName)/*
+
+            """
+            try root.directory.writeAtomically(
+                existing + Array(remoteConfiguration.utf8),
+                to: configPath
+            )
+            return repository
+        }
         let selectedRemote: RefUpdateResult
         if let requested = request.branch {
             let tail = requested.description.dropFirst("refs/heads/".count)

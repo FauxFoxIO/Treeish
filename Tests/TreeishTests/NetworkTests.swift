@@ -91,6 +91,87 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
     #expect(credential.description == "<redacted-git-credential>")
 }
 
+@Test func fetchRefspecMapsWildcardsAndNegativeSelections() throws {
+    let mapping = try FetchRefspec(
+        "+refs/heads/*:refs/remotes/origin/*"
+    )
+    #expect(mapping.force)
+    #expect(mapping.matches(Array("refs/heads/topic".utf8)))
+    #expect(
+        try mapping.localReference(
+            for: Array("refs/heads/topic".utf8)
+        ) == RefName("refs/remotes/origin/topic")
+    )
+    #expect(
+        mapping.remoteReference(
+            for: Array("refs/remotes/origin/topic".utf8)
+        ) == Array("refs/heads/topic".utf8)
+    )
+    let exclusion = try FetchRefspec("^refs/heads/private/*")
+    #expect(exclusion.negative)
+    #expect(exclusion.matches(Array("refs/heads/private/secret".utf8)))
+    #expect(!exclusion.matches(Array("refs/heads/public".utf8)))
+}
+
+@Test func cloneSupportsEmptyProtocolV2Repository() async throws {
+    let advertisement =
+        try PacketLineEncoder.encode(.data(Array("version 2\n".utf8)))
+        + PacketLineEncoder.encode(.data(Array("ls-refs=unborn\n".utf8)))
+        + PacketLineEncoder.encode(.data(Array("fetch=wait-for-done\n".utf8)))
+        + PacketLineEncoder.encode(.data(Array("object-format=sha1\n".utf8)))
+        + PacketLineEncoder.encode(.flush)
+    let emptyReferences = try PacketLineEncoder.encode(.flush)
+    let remote = try RemoteURL(
+        URL(string: "https://example.test/empty.git")!
+    )
+    let transport = ScriptedSmartHTTPTransport(responses: [
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type":
+                    "application/x-git-upload-pack-advertisement",
+            ],
+            body: advertisement,
+            finalURL: remote.url.appendingPathComponent("info/refs")
+        ),
+        SmartHTTPTransportResponse(
+            statusCode: 200,
+            headers: [
+                "content-type": "application/x-git-upload-pack-result",
+            ],
+            body: emptyReferences,
+            finalURL: remote.url.appendingPathComponent("git-upload-pack")
+        ),
+    ])
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.clone(
+        try CloneRequest(
+            remote: remote,
+            destination: try GitPath("empty")
+        ),
+        in: root,
+        services: RepositoryServices(httpTransport: transport)
+    )
+    #expect(try await repository.listReferences().value().isEmpty)
+    let configuration = String(
+        decoding: try root.directory.read(
+            ["empty", ".git", "config"],
+            limit: 1024 * 1024
+        ),
+        as: UTF8.self
+    )
+    #expect(configuration.contains("[remote \"origin\"]"))
+    #expect(configuration.contains("url = https://example.test/empty.git"))
+    #expect(await transport.requests.count == 2)
+}
+
 @Test func fetchUsesInjectedProtocolV2TransportAndPublishesValidatedPack() async throws {
     let blob = GitObject(type: .blob, payload: Array("network\n".utf8))
     let blobID = SHA1.hash(blob.canonicalBytes)
@@ -268,11 +349,17 @@ private actor ScriptedSSHGitTransport: SSHGitTransport {
             finalURL: remote.url.appendingPathComponent("git-upload-pack")
         ),
     ])
+    let stale = try RefName("refs/remotes/origin/stale")
+    _ = try await repository.updateReference(
+        stale,
+        to: try ObjectID(bytes: commitID)
+    ).value()
     let unshallowed = try await repository.fetch(
-        try FetchRequest(remote: remote),
+        try FetchRequest(remote: remote, prune: true),
         services: RepositoryServices(httpTransport: unshallowTransport)
     ).value()
     #expect(unshallowed.shallowBoundaries.isEmpty)
+    #expect(unshallowed.prunedReferences == [stale])
     #expect(!(try root.directory.exists([".git", "shallow"])))
     #expect(!(await repository.capabilities().isShallow))
     let unshallowRequests = await unshallowTransport.requests

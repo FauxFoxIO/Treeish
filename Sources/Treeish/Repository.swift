@@ -784,13 +784,10 @@ public actor Repository {
                         packets
                     )
                     v2Capabilities = capabilities
-                    var prefixes = request.refNames.map(\.bytes)
-                    if prefixes.isEmpty {
-                        prefixes = [
-                            Array("HEAD".utf8),
-                            Array("refs/heads/".utf8),
-                        ]
-                    }
+                    var prefixes = request.refspecs
+                        .filter { !$0.negative }
+                        .map(\.advertisementPrefix)
+                    prefixes.append(Array("HEAD".utf8))
                     let refsResponse = try await httpClient.uploadPack(
                         remote: url,
                         body: try UploadPackV2.lsRefsRequest(
@@ -831,14 +828,48 @@ public actor Repository {
                 v2Capabilities = nil
                 advertisement = try UploadPackV0.parseAdvertisement(packets)
             }
+            let positiveRefspecs = request.refspecs.filter { !$0.negative }
+            let negativeRefspecs = request.refspecs.filter(\.negative)
             let selected = advertisement.references.filter { value in
-                if request.refNames.isEmpty {
-                    return value.name.starts(with: Array("refs/heads/".utf8)) ||
-                        value.name.starts(with: Array("refs/tags/".utf8))
-                }
-                return request.refNames.contains { $0.bytes == value.name }
+                positiveRefspecs.contains { $0.matches(value.name) }
+                    && !negativeRefspecs.contains {
+                        $0.matches(value.name)
+                    }
             }
-            guard !selected.isEmpty else { throw TreeishError.referenceNotFound }
+            if selected.isEmpty {
+                guard !request.requiresMatch else {
+                    throw TreeishError.referenceNotFound
+                }
+                let pruned = request.prune
+                    ? try Repository.pruneFetchedReferences(
+                        positive: positiveRefspecs,
+                        negative: negativeRefspecs,
+                        advertisement: advertisement,
+                        directory: common
+                    )
+                    : []
+                try headDirectory.writeAtomically([], to: ["FETCH_HEAD"])
+                return FetchResult(
+                    receivedObjects: 0,
+                    updatedReferences: [],
+                    remoteHead: nil,
+                    shallowBoundaries: try Repository
+                        .shallowIdentifiers(
+                            directory: common,
+                            objectFormat: store.objectFormat
+                        )
+                        .sorted {
+                            $0.lexicographicallyPrecedes($1)
+                        }
+                        .map {
+                            try ObjectID(
+                                algorithm: store.objectFormat,
+                                bytes: $0
+                            )
+                        },
+                    prunedReferences: pruned
+                )
+            }
             let wants = Array(Set(selected.map(\.objectID)))
             let localReferences = try Repository.allReferences(directory: common)
             let haves = Array(Set(localReferences.values.map(\.bytes)))
@@ -919,52 +950,93 @@ public actor Repository {
             var updates: [RefUpdateResult] = []
             var fetchHead: [UInt8] = []
             for value in selected {
+                let current = try ObjectID(bytes: value.objectID)
+                var destinations: [RefName: Bool] = [:]
+                for refspec in positiveRefspecs
+                where refspec.matches(value.name) {
+                    if let target = try refspec.localReference(
+                        for: value.name
+                    ) {
+                        destinations[target] =
+                            (destinations[target] ?? false) || refspec.force
+                    }
+                }
+                for (target, force) in destinations {
+                    let prior = try? Repository.readReference(
+                        directory: common,
+                        name: target
+                    )
+                    if !force, let prior, prior != current {
+                        if target.description.hasPrefix("refs/tags/") {
+                            throw TreeishError.referenceChanged
+                        }
+                        let graph = CommitGraph(
+                            source: RepositoryCommitSource(store: store)
+                        )
+                        guard try await graph.isAncestor(
+                            prior.bytes,
+                            of: current.bytes
+                        ) else {
+                            throw TreeishError.referenceChanged
+                        }
+                    }
+                    try Repository.publishReference(
+                        directory: common,
+                        name: target,
+                        value: current,
+                        expected: prior,
+                        requireMissing: prior == nil,
+                        reflog: nil
+                    )
+                    updates.append(
+                        RefUpdateResult(
+                            name: target,
+                            previous: prior,
+                            current: current
+                        )
+                    )
+                }
                 let headPrefix = Array("refs/heads/".utf8)
                 let tagPrefix = Array("refs/tags/".utf8)
-                let target: RefName
                 let description: String
                 if value.name.starts(with: headPrefix) {
                     let branch = String(
                         decoding: value.name.dropFirst(headPrefix.count),
                         as: UTF8.self
                     )
-                    target = try RefName(
-                        "refs/remotes/\(request.remoteName)/\(branch)"
-                    )
                     description = "branch '\(branch)'"
                 } else if value.name.starts(with: tagPrefix) {
-                    target = try RefName(
-                        String(decoding: value.name, as: UTF8.self)
+                    let tag = String(
+                        decoding: value.name.dropFirst(tagPrefix.count),
+                        as: UTF8.self
                     )
-                    description = "tag '\(String(decoding: value.name.dropFirst(tagPrefix.count), as: UTF8.self))'"
+                    description = "tag '\(tag)'"
                 } else {
-                    continue
+                    let reference = String(
+                        decoding: value.name,
+                        as: UTF8.self
+                    )
+                    description = "'\(reference)'"
                 }
-                let current = try ObjectID(bytes: value.objectID)
-                let prior = try? Repository.readReference(
-                    directory: common,
-                    name: target
-                )
-                try Repository.publishReference(
-                    directory: common,
-                    name: target,
-                    value: current,
-                    expected: nil,
-                    requireMissing: false,
-                    reflog: nil
-                )
-                updates.append(RefUpdateResult(name: target, previous: prior, current: current))
                 fetchHead += Array(
                     "\(current.description)\t\t\(description) of \(request.remote.description)\n".utf8
                 )
             }
+            var pruned: [RefName] = []
+            if request.prune {
+                pruned = try Repository.pruneFetchedReferences(
+                    positive: positiveRefspecs,
+                    negative: negativeRefspecs,
+                    advertisement: advertisement,
+                    directory: common
+                )
+            }
             try headDirectory.writeAtomically(fetchHead, to: ["FETCH_HEAD"])
             let remoteHead = try advertisement.symbolicHead.flatMap { symbolic -> RefName? in
-                let prefix = "refs/heads/"
-                guard symbolic.hasPrefix(prefix) else { return nil }
-                return try RefName(
-                    "refs/remotes/\(request.remoteName)/\(symbolic.dropFirst(prefix.count))"
-                )
+                let bytes = Array(symbolic.utf8)
+                return try positiveRefspecs.lazy.compactMap {
+                    try $0.localReference(for: bytes)
+                }.first
             }
             return FetchResult(
                 receivedObjects: pack.objects.count,
@@ -977,6 +1049,9 @@ public actor Repository {
                         algorithm: store.objectFormat,
                         bytes: $0
                     )
+                },
+                prunedReferences: pruned.sorted {
+                    $0.bytes.lexicographicallyPrecedes($1.bytes)
                 }
             )
         }
@@ -3567,6 +3642,40 @@ public actor Repository {
             remotes.append(primary)
         }
         return remotes
+    }
+
+    private static func pruneFetchedReferences(
+        positive: [FetchRefspec],
+        negative: [FetchRefspec],
+        advertisement: UploadPackAdvertisement,
+        directory: RootDirectory
+    ) throws -> [RefName] {
+        let advertisedNames = Set(advertisement.references.map(\.name))
+        let local = try allReferences(directory: directory)
+        var pruned: Set<RefName> = []
+        for refspec in positive where refspec.destination != nil {
+            for (name, value) in local {
+                guard !pruned.contains(name),
+                      let remote = refspec.remoteReference(
+                          for: name.bytes
+                      ),
+                      !advertisedNames.contains(remote),
+                      !negative.contains(where: {
+                          $0.matches(remote)
+                      }) else {
+                    continue
+                }
+                try removeReference(
+                    directory: directory,
+                    name: name,
+                    expected: value
+                )
+                pruned.insert(name)
+            }
+        }
+        return pruned.sorted {
+            $0.bytes.lexicographicallyPrecedes($1.bytes)
+        }
     }
 
     private static func publishPack(

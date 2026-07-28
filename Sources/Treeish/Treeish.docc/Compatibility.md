@@ -41,3 +41,8 @@ Receive-pack selects `report-status-v2` ahead of `report-status`, requests
 reference deletion unless the server advertises `delete-refs`. Deletion-only
 pushes omit the packfile; creates and updates always carry a pack, including a
 canonical empty pack when the remote already has every required object.
+
+``FetchRequest/refspecs`` accepts exact or single-wildcard mappings with Git's
+leading `+` force and `^` negative forms. ``FetchRequest/prune`` removes only
+destinations covered by positive mappings and protects negative selections.
+Empty repositories clone without fabricating a commit or reference.

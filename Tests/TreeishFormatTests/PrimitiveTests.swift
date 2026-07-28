@@ -13,6 +13,16 @@ import Testing
     #expect(hexadecimal == "a9993e364706816aba3e25717850c26c9cd0d89d")
 }
 
+@Test func sha256Vectors() {
+    #expect(
+        SHA256.hash(Array("abc".utf8)).map {
+            String(format: "%02x", $0)
+        }.joined() ==
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    )
+    #expect(GitHashAlgorithm.sha256.hash([]) == SHA256.hash([]))
+}
+
 @Test func boundedTextDiffProducesEdits() throws {
     let result = try DiffEngine.diff(
         old: Array("a\nb\n".utf8),
@@ -105,6 +115,27 @@ import Testing
     let index = try PackIndexV2.read(archive.index)
     #expect(index.contains(identifier))
     #expect(index.entries.first?.offset == 12)
+}
+
+@Test func sha256PackAndIndexRoundTrip() throws {
+    let object = GitObject(type: .blob, payload: Array("sha256 packed\n".utf8))
+    let identifier = SHA256.hash(object.canonicalBytes)
+    let archive = try PackWriter.write(
+        [try PackObject(identifier: identifier, object: object)],
+        objectFormat: .sha256
+    )
+    let decoded = try PackReader.read(
+        archive.pack,
+        objectFormat: .sha256
+    )
+    #expect(decoded.objectFormat == .sha256)
+    #expect(decoded.object(identifier: identifier) == object)
+    let index = try PackIndexV2.read(
+        archive.index,
+        objectFormat: .sha256
+    )
+    #expect(index.objectFormat == .sha256)
+    #expect(index.contains(identifier))
 }
 
 @Test func thinPackResolvesExternalBaseAndEnforcesAggregateBudget() throws {
@@ -213,6 +244,32 @@ import Testing
         let decoded = try GitIndex.decode(index.encode())
         #expect(decoded == index)
     }
+
+    let sha256Entries = try entries.map {
+        try GitIndexEntry(
+            path: $0.path,
+            objectID: [UInt8](repeating: $0.objectID[0], count: 32),
+            mode: $0.mode,
+            size: $0.size,
+            modificationSeconds: $0.modificationSeconds,
+            modificationNanoseconds: $0.modificationNanoseconds,
+            stage: $0.stage,
+            assumeValid: $0.assumeValid,
+            skipWorktree: $0.skipWorktree,
+            intentToAdd: $0.intentToAdd
+        )
+    }
+    let sha256Index = GitIndex(
+        version: 4,
+        objectFormat: .sha256,
+        entries: sha256Entries
+    )
+    #expect(
+        try GitIndex.decode(
+            sha256Index.encode(),
+            objectFormat: .sha256
+        ) == sha256Index
+    )
 }
 
 @Test func receivePackRequestCarriesCompareAndSwapAndPack() throws {

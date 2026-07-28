@@ -266,17 +266,7 @@ public struct RefName: Sendable, Hashable, Codable, CustomStringConvertible {
     }
 }
 
-public enum ObjectHashAlgorithm: String, Sendable, Hashable, Codable {
-    case sha1
-    case sha256
-
-    public var byteCount: Int {
-        switch self {
-        case .sha1: 20
-        case .sha256: 32
-        }
-    }
-}
+public typealias ObjectHashAlgorithm = GitHashAlgorithm
 
 public struct ObjectID: Sendable, Hashable, Codable, CustomStringConvertible {
     public let algorithm: ObjectHashAlgorithm

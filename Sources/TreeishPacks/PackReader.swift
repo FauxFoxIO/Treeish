@@ -42,6 +42,7 @@ public struct ResolvedPackObject: Sendable, Hashable {
 
 public struct PackFile: Sendable, Hashable {
     public let version: UInt32
+    public let objectFormat: GitHashAlgorithm
     public let checksum: [UInt8]
     public let objects: [ResolvedPackObject]
 
@@ -69,13 +70,17 @@ public enum PackReader {
 
     public static func read(
         _ bytes: [UInt8],
+        objectFormat: GitHashAlgorithm = .sha1,
         limits: PackLimits = .init(),
         externalBase: ExternalBaseResolver? = nil
     ) throws -> PackFile {
-        guard bytes.count >= 12 + 20 else { throw PackReadError.truncated }
-        let content = Array(bytes.dropLast(20))
-        let checksum = Array(bytes.suffix(20))
-        guard SHA1.hash(content) == checksum else {
+        let hashLength = objectFormat.byteCount
+        guard bytes.count >= 12 + hashLength else {
+            throw PackReadError.truncated
+        }
+        let content = Array(bytes.dropLast(hashLength))
+        let checksum = Array(bytes.suffix(hashLength))
+        guard objectFormat.hash(content) == checksum else {
             throw PackReadError.checksumMismatch
         }
         var reader = CheckedByteReader(content)
@@ -130,7 +135,7 @@ public enum PackReader {
                 }
                 base = .offset(offset - Int(distance))
             case 7:
-                base = .identifier(Array(try reader.read(count: 20)))
+                base = .identifier(Array(try reader.read(count: hashLength)))
             default:
                 throw PackReadError.invalidEntry
             }
@@ -172,12 +177,13 @@ public enum PackReader {
                     byOffset: byOffset,
                     byIdentifier: idCache,
                     externalBase: externalBase,
+                    objectFormat: objectFormat,
                     cache: &cache,
                     visiting: [],
                     depth: 0,
                     limits: limits
                 ) {
-                    let identifier = SHA1.hash(object.canonicalBytes)
+                    let identifier = objectFormat.hash(object.canonicalBytes)
                     idCache[identifier] = object
                     progress = true
                 }
@@ -196,11 +202,16 @@ public enum PackReader {
             resolvedBytes += object.payload.count
             return ResolvedPackObject(
                 offset: entry.offset,
-                identifier: SHA1.hash(object.canonicalBytes),
+                identifier: objectFormat.hash(object.canonicalBytes),
                 object: object
             )
         }
-        return PackFile(version: version, checksum: checksum, objects: resolved)
+        return PackFile(
+            version: version,
+            objectFormat: objectFormat,
+            checksum: checksum,
+            objects: resolved
+        )
     }
 
     private static func readerOffsetAfterHeader(
@@ -216,6 +227,7 @@ public enum PackReader {
         byOffset: [Int: Entry],
         byIdentifier: [[UInt8]: GitObject],
         externalBase: ExternalBaseResolver?,
+        objectFormat: GitHashAlgorithm,
         cache: inout [Int: GitObject],
         visiting: Set<Int>,
         depth: Int,
@@ -244,6 +256,7 @@ public enum PackReader {
                 byOffset: byOffset,
                 byIdentifier: byIdentifier,
                 externalBase: externalBase,
+                objectFormat: objectFormat,
                 cache: &cache,
                 visiting: next,
                 depth: depth + 1,
@@ -260,7 +273,7 @@ public enum PackReader {
             if let packed = byIdentifier[identifier] {
                 base = packed
             } else if let resolved = try externalBase?(identifier) {
-                guard SHA1.hash(resolved.canonicalBytes) == identifier else {
+                guard objectFormat.hash(resolved.canonicalBytes) == identifier else {
                     throw PackReadError.missingDeltaBase
                 }
                 base = resolved

@@ -8,13 +8,23 @@ final class RepositoryObjectStore: @unchecked Sendable {
     private let loose: LooseObjectStore
     private let directory: RootDirectory
     private let limits: TreeishResourceLimits
+    private let objectFormat: GitHashAlgorithm
     private let lock = NSLock()
     private var cachedPacks: [String: PackFile] = [:]
     private var cachedIndexes: [String: PackIndexV2] = [:]
 
-    init(directory: RootDirectory, limits: TreeishResourceLimits) {
-        loose = LooseObjectStore(gitDirectory: directory, limits: limits)
+    init(
+        directory: RootDirectory,
+        objectFormat: GitHashAlgorithm,
+        limits: TreeishResourceLimits
+    ) {
+        loose = LooseObjectStore(
+            gitDirectory: directory,
+            algorithm: objectFormat,
+            limits: limits
+        )
         self.directory = directory
+        self.objectFormat = objectFormat
         self.limits = limits
     }
 
@@ -35,7 +45,8 @@ final class RepositoryObjectStore: @unchecked Sendable {
     }
 
     func resolvePrefix(_ hexadecimal: String) throws -> [UInt8]? {
-        guard hexadecimal.count >= 4, hexadecimal.count < 40,
+        guard hexadecimal.count >= 4,
+              hexadecimal.count < objectFormat.byteCount * 2,
               hexadecimal.allSatisfy(\.isHexDigit) else {
             return nil
         }
@@ -59,8 +70,9 @@ final class RepositoryObjectStore: @unchecked Sendable {
             )) ?? []
             for file in names {
                 let value = namePrefix + file.lastPathComponent.lowercased()
-                guard value.count == 40, value.hasPrefix(prefix),
-                      let identifier = Self.decodeHex(value)
+                guard value.count == objectFormat.byteCount * 2,
+                      value.hasPrefix(prefix),
+                      let identifier = decodeHex(value)
                 else { continue }
                 matches.insert(identifier)
             }
@@ -77,7 +89,10 @@ final class RepositoryObjectStore: @unchecked Sendable {
                 throw PackReadError.resourceLimitExceeded
             }
             let bytes = try Data(contentsOf: url)
-            for entry in try PackIndexV2.read(Array(bytes)).entries {
+            for entry in try PackIndexV2.read(
+                Array(bytes),
+                objectFormat: objectFormat
+            ).entries {
                 let value = entry.identifier.map {
                     String(format: "%02x", $0)
                 }.joined()
@@ -90,8 +105,8 @@ final class RepositoryObjectStore: @unchecked Sendable {
         return matches.first
     }
 
-    private static func decodeHex(_ value: String) -> [UInt8]? {
-        guard value.count == 40 else { return nil }
+    private func decodeHex(_ value: String) -> [UInt8]? {
+        guard value.count == objectFormat.byteCount * 2 else { return nil }
         var result: [UInt8] = []
         var index = value.startIndex
         while index < value.endIndex {
@@ -131,7 +146,10 @@ final class RepositoryObjectStore: @unchecked Sendable {
                         ["objects", "pack", indexName],
                         limit: limits.maximumPackBytes
                     )
-                    index = try PackIndexV2.read(indexBytes)
+                    index = try PackIndexV2.read(
+                        indexBytes,
+                        objectFormat: objectFormat
+                    )
                     lock.withLock { cachedIndexes[key] = index }
                 }
                 guard index.contains(identifier) else { continue }
@@ -146,6 +164,7 @@ final class RepositoryObjectStore: @unchecked Sendable {
             )
             let pack = try PackReader.read(
                 bytes,
+                objectFormat: objectFormat,
                 limits: PackLimits(
                     maximumObjectBytes: limits.maximumObjectBytes,
                     maximumDeltaDepth: limits.maximumDeltaDepth

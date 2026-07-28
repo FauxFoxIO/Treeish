@@ -36,7 +36,8 @@ public struct GitIndexEntry: Sendable, Hashable {
     ) throws {
         guard !path.isEmpty,
               !path.contains(0),
-              objectID.count == 20,
+              (objectID.count == GitHashAlgorithm.sha1.byteCount ||
+                objectID.count == GitHashAlgorithm.sha256.byteCount),
               stage <= 3
         else {
             throw GitIndexError.corrupt
@@ -55,21 +56,36 @@ public struct GitIndexEntry: Sendable, Hashable {
 }
 public struct GitIndex: Sendable, Hashable {
     public let version: UInt32
+    public let objectFormat: GitHashAlgorithm
     public var entries: [GitIndexEntry]
 
-    public init(version: UInt32 = 2, entries: [GitIndexEntry] = []) {
+    public init(
+        version: UInt32 = 2,
+        objectFormat: GitHashAlgorithm = .sha1,
+        entries: [GitIndexEntry] = []
+    ) {
         precondition((2...4).contains(version))
+        precondition(entries.allSatisfy {
+            $0.objectID.count == objectFormat.byteCount
+        })
         self.version = version
+        self.objectFormat = objectFormat
         self.entries = entries.sorted {
             if $0.path == $1.path { return $0.stage < $1.stage }
             return $0.path.lexicographicallyPrecedes($1.path)
         }
     }
 
-    public static func decode(_ data: [UInt8]) throws -> GitIndex {
-        guard data.count >= 12 + 20 else { throw GitIndexError.corrupt }
-        let content = Array(data.dropLast(20))
-        guard SHA1.hash(content) == Array(data.suffix(20)) else {
+    public static func decode(
+        _ data: [UInt8],
+        objectFormat: GitHashAlgorithm = .sha1
+    ) throws -> GitIndex {
+        let hashLength = objectFormat.byteCount
+        guard data.count >= 12 + hashLength else {
+            throw GitIndexError.corrupt
+        }
+        let content = Array(data.dropLast(hashLength))
+        guard objectFormat.hash(content) == Array(data.suffix(hashLength)) else {
             throw GitIndexError.checksumMismatch
         }
         var reader = CheckedByteReader(content)
@@ -99,7 +115,7 @@ public struct GitIndex: Sendable, Hashable {
             _ = try reader.readUInt32BE()
             _ = try reader.readUInt32BE()
             let size = try reader.readUInt32BE()
-            let objectID = Array(try reader.read(count: 20))
+            let objectID = Array(try reader.read(count: hashLength))
             let flagsHigh = try reader.readByte()
             let flagsLow = try reader.readByte()
             let flags = UInt16(flagsHigh) << 8 | UInt16(flagsLow)
@@ -169,7 +185,11 @@ public struct GitIndex: Sendable, Hashable {
                 )
             }
         }
-        return GitIndex(version: version, entries: entries)
+        return GitIndex(
+            version: version,
+            objectFormat: objectFormat,
+            entries: entries
+        )
     }
 
     public func encode() -> [UInt8] {
@@ -225,7 +245,7 @@ public struct GitIndex: Sendable, Hashable {
             }
             previousPath = entry.path
         }
-        return writer.bytes + SHA1.hash(writer.bytes)
+        return writer.bytes + objectFormat.hash(writer.bytes)
     }
 
     private static func decodeIndexVariableInteger(
@@ -255,17 +275,23 @@ public struct GitIndex: Sendable, Hashable {
 
 public struct GitIndexStore: Sendable {
     private let gitDirectory: RootDirectory
+    private let objectFormat: GitHashAlgorithm
 
-    public init(gitDirectory: RootDirectory) {
+    public init(
+        gitDirectory: RootDirectory,
+        objectFormat: GitHashAlgorithm = .sha1
+    ) {
         self.gitDirectory = gitDirectory
+        self.objectFormat = objectFormat
     }
 
     public func read() throws -> GitIndex {
         guard try gitDirectory.exists(["index"]) else {
-            return GitIndex()
+            return GitIndex(objectFormat: objectFormat)
         }
         return try GitIndex.decode(
-            gitDirectory.read(["index"], limit: 512 * 1024 * 1024)
+            gitDirectory.read(["index"], limit: 512 * 1024 * 1024),
+            objectFormat: objectFormat
         )
     }
 

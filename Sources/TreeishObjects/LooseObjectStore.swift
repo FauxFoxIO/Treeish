@@ -5,12 +5,15 @@ import TreeishFileSystem
 public struct LooseObjectStore: Sendable {
     private let gitDirectory: RootDirectory
     private let limits: TreeishResourceLimits
+    private let algorithm: GitHashAlgorithm
 
     public init(
         gitDirectory: RootDirectory,
+        algorithm: GitHashAlgorithm = .sha1,
         limits: TreeishResourceLimits = .init()
     ) {
         self.gitDirectory = gitDirectory
+        self.algorithm = algorithm
         self.limits = limits
     }
 
@@ -20,7 +23,7 @@ public struct LooseObjectStore: Sendable {
             throw ZlibError.resourceLimitExceeded
         }
         let canonical = object.canonicalBytes
-        let identifier = SHA1.hash(canonical)
+        let identifier = algorithm.hash(canonical)
         let hexadecimal = hexadecimalString(identifier)
         let components = [
             "objects",
@@ -37,7 +40,7 @@ public struct LooseObjectStore: Sendable {
     }
 
     public func read(identifier: [UInt8]) throws -> GitObject {
-        guard identifier.count == 20 else {
+        guard identifier.count == algorithm.byteCount else {
             throw GitObjectError.objectNotFound
         }
         let hexadecimal = hexadecimalString(identifier)
@@ -58,7 +61,7 @@ public struct LooseObjectStore: Sendable {
             compressed,
             maximumOutputBytes: limits.maximumObjectBytes
         )
-        guard SHA1.hash(canonical) == identifier else {
+        guard algorithm.hash(canonical) == identifier else {
             throw GitObjectError.hashMismatch
         }
         return try GitObject.decodeCanonical(

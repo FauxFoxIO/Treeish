@@ -34,12 +34,21 @@ public actor Repository {
         commonDirectory = try root.directory.childDirectory(
             location.commonDirectoryPath.components
         )
+        let capabilities = try Repository.inspectCapabilities(
+            root: root,
+            gitDirectory: gitDirectory
+        )
+        repositoryCapabilities = capabilities
         objectStore = RepositoryObjectStore(
             directory: commonDirectory,
+            objectFormat: capabilities.objectFormat,
             limits: options.resourceLimits
         )
         resourceLimits = options.resourceLimits
-        indexStore = GitIndexStore(gitDirectory: gitDirectory)
+        indexStore = GitIndexStore(
+            gitDirectory: gitDirectory,
+            objectFormat: capabilities.objectFormat
+        )
         if let worktreePath = location.worktreePath {
             worktree = try root.directory.childDirectory(worktreePath.components)
         } else {
@@ -53,10 +62,6 @@ public actor Repository {
                 maximumBytes: options.resourceLimits.maximumTransactionBytes
             )
         }
-        repositoryCapabilities = try Repository.inspectCapabilities(
-            root: root,
-            gitDirectory: gitDirectory
-        )
     }
 
     public func capabilities() -> RepositoryCapabilities {
@@ -189,7 +194,11 @@ public actor Repository {
                 index.entries.append(entry)
                 updated.append(path)
             }
-            index = GitIndex(version: index.version, entries: index.entries)
+            index = GitIndex(
+                version: index.version,
+                objectFormat: index.objectFormat,
+                entries: index.entries
+            )
             try indexStore.write(index)
             return IndexUpdate(addedOrUpdated: updated, removed: removed)
         }
@@ -1266,7 +1275,11 @@ public actor Repository {
                 }
                 if request.restoreIndex {
                     try indexStore.write(
-                        GitIndex(version: index.version, entries: index.entries)
+                        GitIndex(
+                            version: index.version,
+                            objectFormat: index.objectFormat,
+                            entries: index.entries
+                        )
                     )
                 }
                 return IndexUpdate(addedOrUpdated: updated, removed: removed)
@@ -1382,7 +1395,11 @@ public actor Repository {
                 }
                 if request.updateIndex {
                     try indexStore.write(
-                        GitIndex(version: index.version, entries: index.entries)
+                        GitIndex(
+                            version: index.version,
+                            objectFormat: index.objectFormat,
+                            entries: index.entries
+                        )
                     )
                 }
                 return ApplyPatchResult(updated: updated, deleted: deleted)
@@ -3448,7 +3465,10 @@ public actor Repository {
         let indexCapabilities: IndexCapabilities
         if try gitDirectory.exists(["index"]) {
             do {
-                let index = try GitIndexStore(gitDirectory: gitDirectory).read()
+                let index = try GitIndexStore(
+                    gitDirectory: gitDirectory,
+                    objectFormat: objectFormat
+                ).read()
                 indexCapabilities = IndexCapabilities(
                     version: Int(index.version),
                     canRead: true,

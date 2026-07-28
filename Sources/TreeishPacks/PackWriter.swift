@@ -7,8 +7,10 @@ public struct PackObject: Sendable, Hashable {
     public let object: GitObject
 
     public init(identifier: [UInt8], object: GitObject) throws {
-        guard identifier.count == 20,
-              SHA1.hash(object.canonicalBytes) == identifier
+        guard let algorithm = GitHashAlgorithm.allCases.first(where: {
+            $0.byteCount == identifier.count
+        }),
+              algorithm.hash(object.canonicalBytes) == identifier
         else { throw PackError.invalidObject }
         self.identifier = identifier
         self.object = object
@@ -28,8 +30,14 @@ public enum PackError: Error, Sendable, Equatable {
 }
 
 public enum PackWriter {
-    public static func write(_ objects: [PackObject]) throws -> PackArchive {
+    public static func write(
+        _ objects: [PackObject],
+        objectFormat: GitHashAlgorithm = .sha1
+    ) throws -> PackArchive {
         guard objects.count <= Int(UInt32.max) else { throw PackError.tooManyObjects }
+        guard objects.allSatisfy({
+            $0.identifier.count == objectFormat.byteCount
+        }) else { throw PackError.invalidObject }
         var pack = Array("PACK".utf8)
         appendUInt32(2, to: &pack)
         appendUInt32(UInt32(objects.count), to: &pack)
@@ -45,11 +53,15 @@ public enum PackWriter {
             pack.append(contentsOf: try Zlib.compress(value.object.payload))
             records.append((value.identifier, offset, CRC32.hash(pack[start...])))
         }
-        let checksum = SHA1.hash(pack)
+        let checksum = objectFormat.hash(pack)
         pack.append(contentsOf: checksum)
         return PackArchive(
             pack: pack,
-            index: makeIndex(records: records, packChecksum: checksum),
+            index: makeIndex(
+                records: records,
+                packChecksum: checksum,
+                objectFormat: objectFormat
+            ),
             checksum: checksum
         )
     }
@@ -81,7 +93,8 @@ public enum PackWriter {
 
     private static func makeIndex(
         records: [(id: [UInt8], offset: UInt32, crc: UInt32)],
-        packChecksum: [UInt8]
+        packChecksum: [UInt8],
+        objectFormat: GitHashAlgorithm
     ) -> [UInt8] {
         let sorted = records.sorted { $0.id.lexicographicallyPrecedes($1.id) }
         var result: [UInt8] = [0xff, 0x74, 0x4f, 0x63]
@@ -97,7 +110,7 @@ public enum PackWriter {
         for record in sorted { appendUInt32(record.crc, to: &result) }
         for record in sorted { appendUInt32(record.offset, to: &result) }
         result.append(contentsOf: packChecksum)
-        result.append(contentsOf: SHA1.hash(result))
+        result.append(contentsOf: objectFormat.hash(result))
         return result
     }
 

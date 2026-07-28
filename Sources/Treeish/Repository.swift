@@ -3027,6 +3027,25 @@ public actor Repository {
         try resolveReference(name, visited: [])
     }
 
+    public func reflog(
+        for reference: RefName,
+        limit: Int = 100
+    ) throws -> [ReflogEntry] {
+        try readReflog(
+            reference,
+            directory: commonDirectory,
+            limit: limit
+        )
+    }
+
+    public func headReflog(limit: Int = 100) throws -> [ReflogEntry] {
+        try readReflog(
+            try RefName("HEAD"),
+            directory: gitDirectory,
+            limit: limit
+        )
+    }
+
     public func resolveRevision(_ expression: String) throws -> ObjectID {
         guard !expression.isEmpty, expression.utf8.count <= 4096 else {
             throw TreeishError.invalidObjectID
@@ -3035,35 +3054,44 @@ public actor Repository {
            let marker = expression.range(of: "@{", options: .backwards) {
             let base = String(expression[..<marker.lowerBound])
             let value = expression[marker.upperBound..<expression.index(before: expression.endIndex)]
-            guard let index = Int(value), index >= 0, index <= 1_000_000 else {
-                throw TreeishError.invalidObjectID
-            }
-            let components: [String]
+            let selector = String(value)
+            guard !selector.isEmpty else { throw TreeishError.invalidObjectID }
+            let reference: RefName
             let directory: RootDirectory
             if base.isEmpty || base == "HEAD" {
-                components = ["logs", "HEAD"]
+                reference = try RefName("HEAD")
                 directory = gitDirectory
             } else {
-                let name = try revisionReferenceName(base)
-                components = ["logs"] + (try name.pathComponents)
+                reference = try revisionReferenceName(base)
                 directory = commonDirectory
             }
-            let bytes = try directory.read(
-                components,
-                limit: resourceLimits.maximumConfigBytes
+            let entries: [ReflogEntry]
+            if let index = Int(selector) {
+                guard index >= 0, index <= 1_000_000 else {
+                    throw TreeishError.invalidObjectID
+                }
+                entries = try readReflog(
+                    reference,
+                    directory: directory,
+                    limit: index + 1
+                )
+                guard entries.indices.contains(index) else {
+                    throw TreeishError.referenceNotFound
+                }
+                return entries[index].current
+            }
+            let timestamp = try reflogDate(selector)
+            entries = try readReflog(
+                reference,
+                directory: directory,
+                limit: 1_000_001
             )
-            let lines = Array(bytes.split(separator: 0x0a).reversed())
-            guard lines.indices.contains(index) else {
+            guard let entry = entries.first(where: {
+                $0.committer.secondsSinceEpoch <= timestamp
+            }) ?? entries.last else {
                 throw TreeishError.referenceNotFound
             }
-            let fields = lines[index]
-                .split(separator: 0x20, maxSplits: 2)
-            guard fields.count >= 2 else {
-                throw TreeishError.malformedReference
-            }
-            return try ObjectID(
-                hex: String(decoding: fields[1], as: UTF8.self)
-            )
+            return entry.current
         }
         if let colon = expression.firstIndex(of: ":"), colon != expression.startIndex {
             let base = try resolveRevision(String(expression[..<colon]))
@@ -3151,6 +3179,167 @@ public actor Repository {
             throw candidates.isEmpty ? TreeishError.referenceNotFound : TreeishError.referenceChanged
         }
         return result
+    }
+
+    private func readReflog(
+        _ reference: RefName,
+        directory: RootDirectory,
+        limit: Int
+    ) throws -> [ReflogEntry] {
+        guard limit >= 0, limit <= 1_000_001 else {
+            throw TreeishError.malformedReference
+        }
+        guard limit > 0 else { return [] }
+        let storage = try Repository.referenceStorage(directory: commonDirectory)
+        if storage.format == .reftable {
+            return Array(
+                try ReftableStack(
+                    directory: commonDirectory,
+                    objectFormat: storage.objectFormat
+                ).reflog(reference).prefix(limit)
+            )
+        }
+        let bytes = try directory.read(
+            ["logs"] + reference.pathComponents,
+            limit: resourceLimits.maximumConfigBytes
+        )
+        var result: [ReflogEntry] = []
+        result.reserveCapacity(min(limit, 1024))
+        for line in bytes.split(separator: 0x0a).reversed().prefix(limit) {
+            result.append(try Repository.parseReflogLine(Array(line)))
+        }
+        return result
+    }
+
+    private static func parseReflogLine(_ line: [UInt8]) throws -> ReflogEntry {
+        guard let firstSpace = line.firstIndex(of: 0x20),
+              firstSpace > line.startIndex,
+              let secondSpace = line[(firstSpace + 1)...].firstIndex(of: 0x20),
+              secondSpace > firstSpace + 1 else {
+            throw TreeishError.malformedReference
+        }
+        let previous = try ObjectID(
+            hex: String(decoding: line[..<firstSpace], as: UTF8.self)
+        )
+        let current = try ObjectID(
+            hex: String(decoding: line[(firstSpace + 1)..<secondSpace], as: UTF8.self)
+        )
+        guard previous.algorithm == current.algorithm else {
+            throw TreeishError.malformedReference
+        }
+        let remainder = Array(line[(secondSpace + 1)...])
+        let tab = remainder.firstIndex(of: 0x09) ?? remainder.endIndex
+        let identity = Array(remainder[..<tab])
+        let messageBytes = tab < remainder.endIndex
+            ? Array(remainder[(tab + 1)...])
+            : []
+        guard let lastSpace = identity.lastIndex(of: 0x20),
+              lastSpace < identity.index(before: identity.endIndex),
+              let timestampSpace = identity[..<lastSpace].lastIndex(of: 0x20),
+              let emailEnd = identity[..<timestampSpace].lastIndex(of: 0x3e),
+              emailEnd == identity.index(before: timestampSpace),
+              let emailStart = identity[..<emailEnd].lastIndex(of: 0x3c),
+              emailStart > identity.startIndex,
+              identity[emailStart - 1] == 0x20,
+              let name = String(
+                bytes: identity[..<(emailStart - 1)],
+                encoding: .utf8
+              ),
+              let email = String(
+                bytes: identity[(emailStart + 1)..<emailEnd],
+                encoding: .utf8
+              ),
+              let seconds = Int64(
+                String(decoding: identity[(timestampSpace + 1)..<lastSpace], as: UTF8.self)
+              ),
+              let zone = parseTimeZone(
+                String(decoding: identity[(lastSpace + 1)...], as: UTF8.self)
+              ),
+              let message = String(bytes: messageBytes, encoding: .utf8) else {
+            throw TreeishError.malformedReference
+        }
+        return ReflogEntry(
+            previous: previous,
+            current: current,
+            committer: Signature(
+                name: name,
+                email: email,
+                secondsSinceEpoch: seconds,
+                timeZoneOffsetMinutes: zone
+            ),
+            message: message
+        )
+    }
+
+    private static func parseTimeZone(_ value: String) -> Int? {
+        let bytes = Array(value.utf8)
+        guard bytes.count == 5,
+              bytes[0] == 0x2b || bytes[0] == 0x2d,
+              let hours = Int(String(decoding: bytes[1...2], as: UTF8.self)),
+              let minutes = Int(String(decoding: bytes[3...4], as: UTF8.self)),
+              hours <= 24, minutes < 60 else {
+            return nil
+        }
+        let offset = hours * 60 + minutes
+        return bytes[0] == 0x2d ? -offset : offset
+    }
+
+    private func reflogDate(_ selector: String) throws -> Int64 {
+        let lowercased = selector.lowercased()
+        if lowercased == "now" {
+            return Int64(Date().timeIntervalSince1970)
+        }
+        if lowercased == "yesterday" {
+            return Int64(Date().timeIntervalSince1970) - 86_400
+        }
+        if let range = lowercased.range(
+            of: #"^([0-9]+) (second|minute|hour|day|week)s? ago$"#,
+            options: .regularExpression
+        ), range == lowercased.startIndex..<lowercased.endIndex {
+            let parts = lowercased.split(separator: " ")
+            guard let count = Int64(parts[0]) else {
+                throw TreeishError.invalidObjectID
+            }
+            let multiplier: Int64 = switch parts[1] {
+            case "second", "seconds": 1
+            case "minute", "minutes": 60
+            case "hour", "hours": 3_600
+            case "day", "days": 86_400
+            case "week", "weeks": 604_800
+            default: 0
+            }
+            let (interval, overflow) = count.multipliedReportingOverflow(
+                by: multiplier
+            )
+            guard !overflow else { throw TreeishError.invalidObjectID }
+            return Int64(Date().timeIntervalSince1970) - interval
+        }
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [
+            .withInternetDateTime,
+            .withFractionalSeconds,
+        ]
+        if let date = iso.date(from: selector) {
+            return Int64(date.timeIntervalSince1970)
+        }
+        iso.formatOptions = [.withInternetDateTime]
+        if let date = iso.date(from: selector) {
+            return Int64(date.timeIntervalSince1970)
+        }
+        for format in [
+            "yyyy-MM-dd HH:mm:ss Z",
+            "yyyy-MM-dd HH:mm:ss",
+            "yyyy-MM-dd",
+            "EEE, dd MMM yyyy HH:mm:ss Z",
+        ] {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = format
+            if let date = formatter.date(from: selector) {
+                return Int64(date.timeIntervalSince1970)
+            }
+        }
+        throw TreeishError.invalidObjectID
     }
 
     public func resolveRevisionRange(_ expression: String) throws -> RevisionRange {

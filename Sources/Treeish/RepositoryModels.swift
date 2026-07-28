@@ -176,6 +176,25 @@ public struct ReflogMetadata: Sendable, Hashable, Codable {
     }
 }
 
+public struct ReflogEntry: Sendable, Hashable, Codable {
+    public let previous: ObjectID
+    public let current: ObjectID
+    public let committer: Signature
+    public let message: String
+
+    public init(
+        previous: ObjectID,
+        current: ObjectID,
+        committer: Signature,
+        message: String
+    ) {
+        self.previous = previous
+        self.current = current
+        self.committer = committer
+        self.message = message
+    }
+}
+
 public struct CheckoutRequest: Sendable, Hashable, Codable {
     public let commit: ObjectID
     public let reference: RefName?

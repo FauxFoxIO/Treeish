@@ -39,6 +39,8 @@ typed result.
 - ``StatusEntry``
 - ``StatusChangeKind``
 - ``StatusOptions``
+- ``ReflogEntry``
+- ``ReflogMetadata``
 
 ### Operations
 

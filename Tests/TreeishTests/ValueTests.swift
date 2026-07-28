@@ -71,6 +71,21 @@ import TreeishFileSystem
     ])
 
     #expect(try git(["rev-parse", "refs/heads/treeish"]).1 == "\(head)\n")
+    let entries = try ReftableStack(
+        directory: gitDirectory,
+        objectFormat: .sha1
+    ).reflog(branch)
+    let zero = try ObjectID(
+        algorithm: .sha1,
+        bytes: [UInt8](repeating: 0, count: 20)
+    )
+    #expect(entries.first?.current == head)
+    #expect(entries.first?.previous == zero)
+    #expect(entries.first?.committer.name == "Treeish")
+    #expect(entries.first?.committer.email == "treeish@example.com")
+    #expect(entries.first?.committer.secondsSinceEpoch == 1_700_000_000)
+    #expect(entries.first?.committer.timeZoneOffsetMinutes == -480)
+    #expect(entries.first?.message == "branch: Created from HEAD")
     let reflog = try git(["reflog", "show", "--format=%gs", "treeish"])
     #expect(reflog.0 == 0)
     #expect(reflog.1 == "branch: Created from HEAD\n")

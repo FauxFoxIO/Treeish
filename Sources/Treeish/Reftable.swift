@@ -22,6 +22,12 @@ struct ReftableReferenceRecord: Sendable, Hashable {
     let value: ReftableReferenceValue
 }
 
+struct ReftableLogRecord: Sendable, Hashable {
+    let name: RefName
+    let updateIndex: UInt64
+    let entry: ReflogEntry?
+}
+
 enum ReftableExpectedValue: Sendable, Hashable {
     case any
     case missing
@@ -79,6 +85,28 @@ struct ReftableStack: Sendable {
             }
         }
         throw TreeishError.referenceNotFound
+    }
+
+    func reflog(_ name: RefName) throws -> [ReflogEntry] {
+        let tables = try tableNames()
+        var records: [ReftableLogRecord] = []
+        for table in tables.reversed() {
+            let bytes = try directory.read(
+                ["reftable", table],
+                limit: Self.maximumTableBytes
+            )
+            records += try ReftableReader(
+                bytes: bytes,
+                expectedObjectFormat: objectFormat,
+                maximumRecords: Self.maximumRecordsPerTable
+            ).logRecords().filter { $0.name == name }
+            guard records.count <= Self.maximumRecordsPerTable else {
+                throw ReftableError.resourceLimitExceeded
+            }
+        }
+        return records
+            .sorted { $0.updateIndex > $1.updateIndex }
+            .compactMap(\.entry)
     }
 
     func append(_ updates: [ReftableUpdate]) throws {
@@ -312,6 +340,230 @@ private struct ReftableReader {
             blockHeader = blockStart
         }
         return records
+    }
+
+    func logRecords() throws -> [ReftableLogRecord] {
+        let header = try parseHeader(at: 0)
+        guard header.objectFormat == expectedObjectFormat else {
+            throw ReftableError.hashMismatch
+        }
+        let footerLength = header.version == 1 ? 68 : 72
+        guard bytes.count >= header.length + footerLength else {
+            throw ReftableError.invalidTable
+        }
+        let footerOffset = bytes.count - footerLength
+        let footer = try parseFooter(at: footerOffset, expected: header)
+        guard footer.logPosition > 0,
+              footer.logPosition < UInt64(footerOffset),
+              let firstBlock = Int(exactly: footer.logPosition)
+        else {
+            if footer.logPosition == 0 { return [] }
+            throw ReftableError.invalidTable
+        }
+        let sectionEndValue = footer.logIndexPosition > 0
+            ? min(footer.logIndexPosition, UInt64(footerOffset))
+            : UInt64(footerOffset)
+        guard let sectionEnd = Int(exactly: sectionEndValue),
+              firstBlock < sectionEnd else {
+            throw ReftableError.invalidTable
+        }
+
+        var records: [ReftableLogRecord] = []
+        var blockStart = firstBlock
+        while blockStart < sectionEnd {
+            guard bytes[blockStart] == 0x67 else { break }
+            let inflatedLength = try readUInt24(at: blockStart + 1)
+            guard inflatedLength >= 6 else {
+                throw ReftableError.invalidTable
+            }
+            let compressedStart = blockStart + 4
+            let prefix = try Zlib.decompressPrefix(
+                Array(bytes[compressedStart..<sectionEnd]),
+                maximumOutputBytes: inflatedLength - 4
+            )
+            guard prefix.bytes.count == inflatedLength - 4 else {
+                throw ReftableError.invalidTable
+            }
+            try parseLogBlock(
+                [0x67, bytes[blockStart + 1], bytes[blockStart + 2], bytes[blockStart + 3]]
+                    + prefix.bytes,
+                tableHeader: header,
+                into: &records
+            )
+            guard records.count <= maximumRecords else {
+                throw ReftableError.resourceLimitExceeded
+            }
+            if header.blockSize == 0 {
+                blockStart = compressedStart + prefix.consumedInputBytes
+            } else {
+                let next = ((blockStart / header.blockSize) + 1) * header.blockSize
+                guard next > blockStart else { throw ReftableError.invalidTable }
+                blockStart = next
+            }
+        }
+        return records
+    }
+
+    private func parseLogBlock(
+        _ block: [UInt8],
+        tableHeader: Header,
+        into records: inout [ReftableLogRecord]
+    ) throws {
+        let end = block.count
+        let restartCount = Int(readUInt16(block, at: end - 2))
+        guard restartCount > 0,
+              restartCount <= (end - 2) / 3 else {
+            throw ReftableError.invalidTable
+        }
+        let recordsEnd = end - 2 - restartCount * 3
+        var priorRestart = -1
+        for index in 0..<restartCount {
+            let restart = Int(readUInt24(block, at: recordsEnd + index * 3))
+            guard restart > priorRestart,
+                  restart >= 4,
+                  restart < recordsEnd else {
+                throw ReftableError.invalidTable
+            }
+            priorRestart = restart
+        }
+        var offset = 4
+        var priorKey: [UInt8] = []
+        while offset < recordsEnd {
+            let prefixLength = try readVarint(block, at: &offset)
+            let typeAndLength = try readVarint(block, at: &offset)
+            guard prefixLength <= UInt64(priorKey.count),
+                  let suffixLength = Int(exactly: typeAndLength >> 3),
+                  suffixLength <= recordsEnd - offset else {
+                throw ReftableError.invalidTable
+            }
+            let valueType = UInt8(typeAndLength & 0x07)
+            let key = Array(priorKey.prefix(Int(prefixLength)))
+                + block[offset..<(offset + suffixLength)]
+            offset += suffixLength
+            guard key.count >= 9,
+                  key[key.count - 9] == 0,
+                  let name = try? RefName(
+                    validating: Array(key.dropLast(9))
+                  ) else {
+                throw ReftableError.invalidTable
+            }
+            let reversedIndex = key.suffix(8).reduce(into: UInt64.zero) {
+                $0 = ($0 << 8) | UInt64($1)
+            }
+            let updateIndex = UInt64.max - reversedIndex
+            let entry: ReflogEntry?
+            switch valueType {
+            case 0:
+                entry = nil
+            case 1:
+                let old = try ObjectID(bytes: readBytes(
+                    block,
+                    count: tableHeader.objectFormat.byteCount,
+                    at: &offset,
+                    before: recordsEnd
+                ))
+                let new = try ObjectID(bytes: readBytes(
+                    block,
+                    count: tableHeader.objectFormat.byteCount,
+                    at: &offset,
+                    before: recordsEnd
+                ))
+                let committerName = try readUTF8(block, at: &offset, before: recordsEnd)
+                let email = try readUTF8(block, at: &offset, before: recordsEnd)
+                let seconds = try readVarint(block, at: &offset)
+                guard seconds <= UInt64(Int64.max),
+                      offset <= recordsEnd - 2 else {
+                    throw ReftableError.invalidTable
+                }
+                let zone = Int(Int16(bitPattern: readUInt16(block, at: offset)))
+                offset += 2
+                var message = try readUTF8(block, at: &offset, before: recordsEnd)
+                if message.last == "\n" { message.removeLast() }
+                entry = ReflogEntry(
+                    previous: old,
+                    current: new,
+                    committer: Signature(
+                        name: committerName,
+                        email: email,
+                        secondsSinceEpoch: Int64(seconds),
+                        timeZoneOffsetMinutes: zone
+                    ),
+                    message: message
+                )
+            default:
+                throw ReftableError.invalidTable
+            }
+            records.append(ReftableLogRecord(
+                name: name,
+                updateIndex: updateIndex,
+                entry: entry
+            ))
+            priorKey = key
+        }
+        guard offset == recordsEnd else { throw ReftableError.invalidTable }
+    }
+
+    private func readVarint(_ source: [UInt8], at offset: inout Int) throws -> UInt64 {
+        guard offset < source.count else { throw ReftableError.invalidTable }
+        var value = UInt64(source[offset] & 0x7f)
+        var byte = source[offset]
+        offset += 1
+        var count = 1
+        while byte & 0x80 != 0 {
+            guard count < 10, offset < source.count,
+                  value < (UInt64.max >> 7) else {
+                throw ReftableError.invalidTable
+            }
+            byte = source[offset]
+            offset += 1
+            value = ((value + 1) << 7) | UInt64(byte & 0x7f)
+            count += 1
+        }
+        return value
+    }
+
+    private func readBytes(
+        _ source: [UInt8],
+        count: Int,
+        at offset: inout Int,
+        before end: Int
+    ) throws -> [UInt8] {
+        guard count >= 0, offset >= 0, offset <= end - count else {
+            throw ReftableError.invalidTable
+        }
+        defer { offset += count }
+        return Array(source[offset..<(offset + count)])
+    }
+
+    private func readUTF8(
+        _ source: [UInt8],
+        at offset: inout Int,
+        before end: Int
+    ) throws -> String {
+        let length = try readVarint(source, at: &offset)
+        guard let count = Int(exactly: length),
+              let value = String(
+                bytes: try readBytes(
+                    source,
+                    count: count,
+                    at: &offset,
+                    before: end
+                ),
+                encoding: .utf8
+              ) else {
+            throw ReftableError.invalidTable
+        }
+        return value
+    }
+
+    private func readUInt16(_ source: [UInt8], at offset: Int) -> UInt16 {
+        (UInt16(source[offset]) << 8) | UInt16(source[offset + 1])
+    }
+
+    private func readUInt24(_ source: [UInt8], at offset: Int) -> UInt32 {
+        (UInt32(source[offset]) << 16)
+            | (UInt32(source[offset + 1]) << 8)
+            | UInt32(source[offset + 2])
     }
 
     private func parseReferenceBlock(

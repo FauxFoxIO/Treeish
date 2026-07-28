@@ -1297,6 +1297,83 @@ func systemGitRecognizesTreeishLinkedWorktree(
     )
 }
 
+@Test(arguments: [false, true])
+func treeishReadsSystemGitReflogsAndRevisionSelectors(
+    reftable: Bool
+) async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    func git(_ arguments: [String], date: String? = nil) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory.path] + arguments
+        var environment = ProcessInfo.processInfo.environment.merging([
+            "GIT_AUTHOR_NAME": "System Git",
+            "GIT_AUTHOR_EMAIL": "git@example.com",
+            "GIT_COMMITTER_NAME": "System Git",
+            "GIT_COMMITTER_EMAIL": "git@example.com",
+        ], uniquingKeysWith: { _, new in new })
+        if let date {
+            environment["GIT_AUTHOR_DATE"] = date
+            environment["GIT_COMMITTER_DATE"] = date
+        }
+        process.environment = environment
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        let text = String(
+            decoding: output.fileHandleForReading.readDataToEndOfFile(),
+            as: UTF8.self
+        )
+        guard process.terminationStatus == 0 else {
+            throw TreeishError.recoveryRequired(text)
+        }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    _ = try git(reftable ? ["init", "--ref-format=reftable"] : ["init"])
+    try Data("first\n".utf8).write(
+        to: directory.appendingPathComponent("file.txt")
+    )
+    _ = try git(["add", "file.txt"])
+    _ = try git(["commit", "-m", "first"], date: "2024-01-01T12:00:00+00:00")
+    let first = try ObjectID(hex: git(["rev-parse", "HEAD"]))
+    try Data("second\n".utf8).write(
+        to: directory.appendingPathComponent("file.txt")
+    )
+    _ = try git(["commit", "-am", "second"], date: "2024-01-02T12:00:00+00:00")
+    let second = try ObjectID(hex: git(["rev-parse", "HEAD"]))
+
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.open(
+        try await Treeish.discover(in: root),
+        roots: [root]
+    )
+    let branch = try git(["symbolic-ref", "--short", "HEAD"])
+    let branchName = try RefName("refs/heads/\(branch)")
+    let entries = try await repository.reflog(for: branchName)
+    #expect(entries.count == 2)
+    #expect(entries[0].current == second)
+    #expect(entries[1].current == first)
+    #expect(entries[0].message == "commit: second")
+    #expect(entries[1].committer.email == "git@example.com")
+    #expect(try await repository.resolveRevision("\(branch)@{1}") == first)
+    #expect(
+        try await repository.resolveRevision(
+            "\(branch)@{2024-01-01T18:00:00Z}"
+        ) == first
+    )
+    #expect(try await repository.headReflog().first?.current == second)
+}
+
 @Test func treeishTraversesSystemGitDeltaPackAfterGC() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString)

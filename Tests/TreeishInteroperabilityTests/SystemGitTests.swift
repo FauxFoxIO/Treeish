@@ -1802,3 +1802,140 @@ func systemGitRecognizesTreeishLinkedWorktree(
     #expect(files.contains("S excluded/file.txt"))
     #expect(files.contains("H included/file.txt"))
 }
+
+@Test func treeishPreservesSHA256IndexAcrossResetAndCherryPick() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.initialize(
+        in: root,
+        options: RepositoryInitialization(objectFormat: .sha256)
+    )
+    let signature = Signature(
+        name: "Treeish",
+        email: "treeish@example.com",
+        secondsSinceEpoch: 1_700_000_000,
+        timeZoneOffsetMinutes: 0
+    )
+    func commit(
+        path: String,
+        text: String,
+        parents: [ObjectID],
+        expected: ObjectID?
+    ) async throws -> ObjectID {
+        try Data(text.utf8).write(
+            to: directory.appendingPathComponent(path)
+        )
+        _ = try await repository.stage(
+            StageRequest(pathspecs: [try GitPathspec(path)])
+        ).value()
+        return try await repository.commit(
+            CommitRequest(
+                tree: try await repository.writeIndexTree().value(),
+                parents: parents,
+                expectedHead: expected,
+                author: signature,
+                committer: signature,
+                message: Array("\(path)\n".utf8)
+            )
+        ).value().objectID
+    }
+    func git(_ arguments: [String]) throws -> (Int32, String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory.path] + arguments
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        return (
+            process.terminationStatus,
+            String(
+                decoding: output.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            )
+        )
+    }
+
+    let base = try await commit(
+        path: "base.txt",
+        text: "base\n",
+        parents: [],
+        expected: nil
+    )
+    let second = try await commit(
+        path: "base.txt",
+        text: "second\n",
+        parents: [base],
+        expected: base
+    )
+    _ = try await repository.reset(
+        ResetRequest(commit: base, mode: .mixed)
+    ).value()
+    #expect(try git(["ls-files", "--stage"]).0 == 0)
+    _ = try await repository.reset(
+        ResetRequest(commit: second, mode: .hard)
+    ).value()
+    #expect(try git(["status", "--porcelain=v1"]).1.isEmpty)
+
+    _ = try await repository.createBranch(
+        named: "feature",
+        at: second
+    ).value()
+    let main = try await commit(
+        path: "main.txt",
+        text: "main\n",
+        parents: [second],
+        expected: second
+    )
+    _ = try await repository.checkout(
+        CheckoutRequest(
+            commit: second,
+            reference: try RefName("refs/heads/feature")
+        )
+    ).value()
+    let picked = try await commit(
+        path: "feature.txt",
+        text: "feature\n",
+        parents: [second],
+        expected: second
+    )
+    _ = try await repository.checkout(
+        CheckoutRequest(
+            commit: main,
+            reference: try RefName("refs/heads/main")
+        )
+    ).value()
+    guard case .committed(let result) = try await repository.cherryPick(
+        CherryPickRequest(
+            commit: picked,
+            author: signature,
+            committer: signature
+        )
+    ).value() else {
+        Issue.record("expected SHA-256 cherry-pick commit")
+        return
+    }
+    #expect(result.algorithm == .sha256)
+    guard case .merged(let merged) = try await repository.merge(
+        MergeRequest(
+            other: picked,
+            author: signature,
+            committer: signature,
+            message: Array("merge feature\n".utf8)
+        )
+    ).value() else {
+        Issue.record("expected SHA-256 merge commit")
+        return
+    }
+    #expect(merged.algorithm == .sha256)
+    #expect(try git(["status", "--porcelain=v1"]).1.isEmpty)
+    #expect(try git(["fsck", "--strict"]).0 == 0)
+}

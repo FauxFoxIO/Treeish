@@ -1507,6 +1507,7 @@ public actor Repository {
                 headDirectory: headDirectory,
                 refsDirectory: refsDirectory
             )
+            let currentIndex = try indexStore.read()
             func publishReference() throws {
                 if let reference = head.reference {
                     try Repository.publishReference(
@@ -1527,12 +1528,15 @@ public actor Repository {
             }
             if request.mode == .mixed {
                 let entries = try target.map { try Repository.indexEntry($0, stage: 0, store: store) }
-                try indexStore.write(GitIndex(entries: entries))
+                try indexStore.write(GitIndex(
+                    version: currentIndex.version,
+                    objectFormat: currentIndex.objectFormat,
+                    entries: entries
+                ))
             } else if request.mode == .hard {
                 guard let worktree else { throw TreeishError.repositoryNotFound }
-                let current = try indexStore.read()
                 let paths = try Set(
-                    (current.entries.map(\.path) + target.map(\.path))
+                    (currentIndex.entries.map(\.path) + target.map(\.path))
                         .map(GitPath.init(bytes:))
                 )
                 let expected = Data("\(request.commit.description)\n".utf8)
@@ -1909,8 +1913,9 @@ public actor Repository {
             guard let ours = head.objectID, let headReference = head.reference else {
                 throw TreeishError.malformedReference
             }
+            let currentIndex = try indexStore.read()
             let dirty = try Repository.worktreeStatus(
-                index: indexStore.read(),
+                index: currentIndex,
                 worktree: worktree
             )
             guard dirty.isEmpty else {
@@ -1974,7 +1979,11 @@ public actor Repository {
             )
             let indexEntries = mergePlan.entries
             let conflicts = mergePlan.conflicts
-            try indexStore.write(GitIndex(entries: indexEntries))
+            try indexStore.write(GitIndex(
+                version: currentIndex.version,
+                objectFormat: currentIndex.objectFormat,
+                entries: indexEntries
+            ))
             try headDirectory.writeAtomically(
                 Array("\(ours.description)\n".utf8),
                 to: ["ORIG_HEAD"]
@@ -2131,7 +2140,8 @@ public actor Repository {
             guard let ours = head.objectID, let reference = head.reference else {
                 throw TreeishError.malformedReference
             }
-            guard try Repository.worktreeStatus(index: indexStore.read(), worktree: worktree).isEmpty else {
+            let currentIndex = try indexStore.read()
+            guard try Repository.worktreeStatus(index: currentIndex, worktree: worktree).isEmpty else {
                 throw TreeishError.recoveryRequired("cherry-pick requires a clean worktree")
             }
             let picked = try CommitRecord(
@@ -2167,7 +2177,12 @@ public actor Repository {
                 worktree: worktree,
                 store: store
             )
-            try indexStore.write(GitIndex(entries: plan.entries))
+            let index = GitIndex(
+                version: currentIndex.version,
+                objectFormat: currentIndex.objectFormat,
+                entries: plan.entries
+            )
+            try indexStore.write(index)
             try headDirectory.writeAtomically(Array("\(ours.description)\n".utf8), to: ["ORIG_HEAD"])
             try headDirectory.writeAtomically(
                 Array("\(request.commit.description)\n".utf8),
@@ -2177,7 +2192,7 @@ public actor Repository {
             try headDirectory.writeAtomically(message, to: ["CHERRY_PICK_MSG"])
             if !plan.conflicts.isEmpty { return .conflicted(plan.conflicts) }
             let identifier = try Repository.commitSequencerIndex(
-                index: GitIndex(entries: plan.entries),
+                index: index,
                 parent: ours,
                 reference: reference,
                 author: request.author,
@@ -4385,7 +4400,11 @@ public actor Repository {
         }
         try materializeTree(identifier: tree, at: [], root: worktree, store: store)
         let entries = try target.map { try indexEntry($0, stage: 0, store: store) }
-        try indexStore.write(GitIndex(entries: entries))
+        try indexStore.write(GitIndex(
+            version: current.version,
+            objectFormat: current.objectFormat,
+            entries: entries
+        ))
     }
 
     private static func writeConflict(
@@ -4480,7 +4499,12 @@ public actor Repository {
                 worktree: worktree,
                 store: store
             )
-            let index = GitIndex(entries: plan.entries)
+            let currentIndex = try indexStore.read()
+            let index = GitIndex(
+                version: currentIndex.version,
+                objectFormat: currentIndex.objectFormat,
+                entries: plan.entries
+            )
             try indexStore.write(index)
             if !plan.conflicts.isEmpty {
                 return .conflicted(commit: pickedID, paths: plan.conflicts)

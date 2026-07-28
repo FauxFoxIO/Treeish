@@ -31,6 +31,110 @@ public struct RepositoryOpenOptions: Sendable, Hashable, Codable {
     }
 }
 
+public struct GitConfigurationKey: Sendable, Hashable, Codable {
+    public let section: String
+    public let subsection: String?
+    public let name: String
+
+    public init(
+        section: String,
+        subsection: String? = nil,
+        name: String
+    ) throws {
+        guard !section.isEmpty,
+              section.allSatisfy({
+                $0.isLetter || $0.isNumber || $0 == "-"
+              }),
+              !name.isEmpty,
+              name.allSatisfy({
+                $0.isLetter || $0.isNumber || $0 == "-"
+              }),
+              subsection?.contains("\0") != true
+        else {
+            throw TreeishError.invalidConfiguration
+        }
+        self.section = section.lowercased()
+        self.subsection = subsection
+        self.name = name.lowercased()
+    }
+
+    public init(_ variable: String) throws {
+        guard let first = variable.firstIndex(of: "."),
+              let last = variable.lastIndex(of: "."),
+              first != variable.startIndex,
+              last < variable.index(before: variable.endIndex)
+        else {
+            throw TreeishError.invalidConfiguration
+        }
+        let section = String(variable[..<first])
+        let name = String(variable[variable.index(after: last)...])
+        let subsection = first == last
+            ? nil
+            : String(
+                variable[
+                    variable.index(after: first)..<last
+                ]
+            )
+        try self.init(
+            section: section,
+            subsection: subsection,
+            name: name
+        )
+    }
+
+    public var description: String {
+        ([section] + (subsection.map { [$0] } ?? []) + [name])
+            .joined(separator: ".")
+    }
+}
+
+public struct GitConfigurationEntry: Sendable, Hashable, Codable {
+    public let key: GitConfigurationKey
+    public let value: String
+
+    public init(key: GitConfigurationKey, value: String) {
+        self.key = key
+        self.value = value
+    }
+}
+
+public enum GitConfigurationSetMode: String, Sendable, Hashable, Codable {
+    case replaceAll
+    case add
+}
+
+public struct GitConfigurationSetRequest: Sendable, Hashable, Codable {
+    public let key: GitConfigurationKey
+    public let value: String
+    public let mode: GitConfigurationSetMode
+
+    public init(
+        key: GitConfigurationKey,
+        value: String,
+        mode: GitConfigurationSetMode = .replaceAll
+    ) {
+        self.key = key
+        self.value = value
+        self.mode = mode
+    }
+}
+
+public struct GitConfigurationUnsetRequest: Sendable, Hashable, Codable {
+    public let key: GitConfigurationKey
+    public let matchingValue: String?
+    public let all: Bool
+
+    public init(
+        key: GitConfigurationKey,
+        matchingValue: String? = nil,
+        all: Bool = false
+    ) {
+        self.key = key
+        self.matchingValue = matchingValue
+        self.all = all
+    }
+}
+
 public struct RepositoryInitialization: Sendable, Hashable, Codable {
     public var bare: Bool
     public var initialBranch: String

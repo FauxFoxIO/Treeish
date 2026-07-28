@@ -35,6 +35,10 @@ typed result.
 - ``RepositoryCapabilities``
 - ``RepositoryAccess``
 - ``RepositoryOperationCapability``
+- ``GitConfigurationKey``
+- ``GitConfigurationEntry``
+- ``GitConfigurationSetRequest``
+- ``GitConfigurationUnsetRequest``
 - ``Status``
 - ``StatusEntry``
 - ``StatusChangeKind``

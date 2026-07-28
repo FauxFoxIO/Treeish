@@ -46,6 +46,16 @@ peels it with bounded cycle detection, and returns immediate or recursive
 byte-aware entries. Modes and object kinds match `git ls-tree`; recursive
 listing is allocation-bounded and cancellation-aware.
 
+``Repository/configuration()`` and
+``Repository/configurationValues(for:)`` return the effective repository
+configuration after bounded, root-contained relative includes.
+``Repository/setConfiguration(_:)`` and
+``Repository/unsetConfiguration(_:)`` mutate only the repository's own config
+file through a lockfile compare-and-swap. They preserve included files and
+unrelated text, support multivars and continued lines, and refuse keys that
+would change the repository format, object format, ref storage, bare state, or
+worktree root while the open repository still holds derived capabilities.
+
 Object lookup follows root-contained alternate object databases and classic or
 incremental multi-pack indexes. Revision traversal honors `shallow` boundaries
 and replacement references. Partial-clone configuration is reported through

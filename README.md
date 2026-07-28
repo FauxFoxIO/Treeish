@@ -309,6 +309,9 @@ decisions for the host app.
   file/reftable reflog reads, ancestry, ranges, logs, and merge bases;
 - bounded recursive tree listings with byte-aware paths, canonical modes,
   object types, and SHA-1/SHA-256 object IDs;
+- effective repository configuration reads across bounded relative includes,
+  plus compare-and-swap local set/add/unset operations that preserve unrelated
+  text and refuse format-defining keys while a repository is open;
 - merge, cherry-pick, rebase, continuation, conflict state, and abort;
 - unified patches, bundles, blob diffs, and binary-safe workspace snapshots.
 

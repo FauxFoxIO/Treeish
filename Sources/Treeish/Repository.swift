@@ -116,6 +116,105 @@ public actor Repository {
         )
     }
 
+    public func configuration() -> GitOperation<[GitConfigurationEntry]> {
+        let directory = commonDirectory
+        return GitOperation(phase: .validating) {
+            try GitConfiguration.load(from: directory).entries.map {
+                GitConfigurationEntry(
+                    key: try GitConfigurationKey(
+                        section: $0.section,
+                        subsection: $0.subsection,
+                        name: $0.key
+                    ),
+                    value: $0.value
+                )
+            }
+        }
+    }
+
+    public func configurationValues(
+        for key: GitConfigurationKey
+    ) -> GitOperation<[String]> {
+        let directory = commonDirectory
+        return GitOperation(phase: .validating) {
+            try GitConfiguration.load(from: directory).entries.filter {
+                $0.section.caseInsensitiveCompare(key.section)
+                    == .orderedSame &&
+                $0.subsection == key.subsection &&
+                $0.key.caseInsensitiveCompare(key.name) == .orderedSame
+            }.map(\.value)
+        }
+    }
+
+    public func setConfiguration(
+        _ request: GitConfigurationSetRequest
+    ) -> GitOperation<Void> {
+        let directory = commonDirectory
+        let access = repositoryCapabilities.access
+        return GitOperation(phase: .updatingRefs) {
+            guard case .readWrite = access else {
+                throw TreeishError.mutationDisabled(
+                    access.reason ?? .rootIsReadOnly
+                )
+            }
+            try Repository.validateMutableConfigurationKey(request.key)
+            let original = try directory.read(
+                ["config"],
+                limit: 16 * 1024 * 1024
+            )
+            let document = try GitConfiguration(bytes: original)
+            let updated = try document.setting(
+                section: request.key.section,
+                subsection: request.key.subsection,
+                key: request.key.name,
+                value: request.value,
+                add: request.mode == .add
+            )
+            guard try directory.compareAndSwap(
+                updated,
+                to: ["config"],
+                expected: original
+            ) else {
+                throw TreeishError.referenceChanged
+            }
+        }
+    }
+
+    public func unsetConfiguration(
+        _ request: GitConfigurationUnsetRequest
+    ) -> GitOperation<Int> {
+        let directory = commonDirectory
+        let access = repositoryCapabilities.access
+        return GitOperation(phase: .updatingRefs) {
+            guard case .readWrite = access else {
+                throw TreeishError.mutationDisabled(
+                    access.reason ?? .rootIsReadOnly
+                )
+            }
+            try Repository.validateMutableConfigurationKey(request.key)
+            let original = try directory.read(
+                ["config"],
+                limit: 16 * 1024 * 1024
+            )
+            let result = try GitConfiguration(bytes: original).removing(
+                section: request.key.section,
+                subsection: request.key.subsection,
+                key: request.key.name,
+                value: request.matchingValue,
+                all: request.all
+            )
+            guard result.removed > 0 else { return 0 }
+            guard try directory.compareAndSwap(
+                result.bytes,
+                to: ["config"],
+                expected: original
+            ) else {
+                throw TreeishError.referenceChanged
+            }
+            return result.removed
+        }
+    }
+
     public func writeObject(
         type: GitObjectKind,
         payload: [UInt8]
@@ -4490,6 +4589,22 @@ public actor Repository {
         return (storage, objectFormat)
     }
 
+    private static func validateMutableConfigurationKey(
+        _ key: GitConfigurationKey
+    ) throws {
+        let section = key.section.lowercased()
+        let name = key.name.lowercased()
+        guard section != "extensions",
+              !(section == "core" && [
+                "repositoryformatversion",
+                "bare",
+                "worktree",
+              ].contains(name))
+        else {
+            throw TreeishError.invalidConfiguration
+        }
+    }
+
     private static func readPackedReference(
         directory: RootDirectory,
         name: RefName
@@ -6819,12 +6934,14 @@ public actor Repository {
             .readOnly(reason: $0.reason)
         } ?? .readWrite
         var operations: Set<RepositoryOperationCapability> = [
-            .readObjects, .checkIntegrity, .listTrees, .readRefs,
+            .readObjects, .checkIntegrity, .listTrees, .readConfiguration,
+            .readRefs,
         ]
         if case .readWrite = access {
             operations.formUnion([
-                .writeObjects, .updateRefs, .createCommit, .status, .stage,
-                .checkout, .fetch, .push, .merge, .linkedWorktrees,
+                .writeConfiguration, .writeObjects, .updateRefs,
+                .createCommit, .status, .stage, .checkout, .fetch, .push,
+                .merge, .linkedWorktrees,
             ])
         }
         return RepositoryCapabilities(

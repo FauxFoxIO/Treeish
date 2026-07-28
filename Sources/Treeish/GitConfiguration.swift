@@ -17,6 +17,7 @@ struct GitConfiguration: Sendable {
         let key: String
         let value: String
         let line: Int
+        let endLine: Int
     }
 
     let bytes: [UInt8]
@@ -69,32 +70,115 @@ struct GitConfiguration: Sendable {
     }
 
     func replacing(section: String, subsection: String? = nil, key: String, value: String) throws -> [UInt8] {
-        guard !value.contains("\n"), !value.contains("\0") else {
+        guard !value.contains("\0") else {
             throw GitConfigurationError.invalidSyntax(line: 0)
         }
         var lines = String(decoding: bytes, as: UTF8.self)
             .split(separator: "\n", omittingEmptySubsequences: false)
             .map(String.init)
-        if let entry = entries.last(where: {
+        let rootEntries = try Self.parse(bytes)
+        if let entry = rootEntries.last(where: {
             $0.section.caseInsensitiveCompare(section) == .orderedSame &&
             $0.subsection == subsection &&
             $0.key.caseInsensitiveCompare(key) == .orderedSame
         }), lines.indices.contains(entry.line - 1) {
             let indentation = String(lines[entry.line - 1].prefix { $0 == " " || $0 == "\t" })
-            lines[entry.line - 1] = "\(indentation)\(key) = \(Self.quote(value))"
+            lines.replaceSubrange(
+                (entry.line - 1)..<entry.endLine,
+                with: ["\(indentation)\(key) = \(Self.quote(value))"]
+            )
         } else {
-            if lines.last != "" { lines.append("") }
-            let header = subsection.map { "[\(section) \"\(Self.escape($0))\"]" } ?? "[\(section)]"
-            lines.append(header)
-            lines.append("\t\(key) = \(Self.quote(value))")
-            lines.append("")
+            Self.append(
+                section: section,
+                subsection: subsection,
+                key: key,
+                value: value,
+                to: &lines
+            )
         }
         return Array(lines.joined(separator: "\n").utf8)
+    }
+
+    func setting(
+        section: String,
+        subsection: String? = nil,
+        key: String,
+        value: String,
+        add: Bool
+    ) throws -> [UInt8] {
+        guard !value.contains("\0") else {
+            throw GitConfigurationError.invalidSyntax(line: 0)
+        }
+        var lines = String(decoding: bytes, as: UTF8.self)
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+        if !add {
+            let matches = try Self.parse(bytes).filter {
+                $0.section.caseInsensitiveCompare(section) == .orderedSame &&
+                $0.subsection == subsection &&
+                $0.key.caseInsensitiveCompare(key) == .orderedSame
+            }
+            for entry in matches.reversed() {
+                lines.removeSubrange((entry.line - 1)..<entry.endLine)
+            }
+        }
+        Self.append(
+            section: section,
+            subsection: subsection,
+            key: key,
+            value: value,
+            to: &lines
+        )
+        return Array(lines.joined(separator: "\n").utf8)
+    }
+
+    func removing(
+        section: String,
+        subsection: String? = nil,
+        key: String,
+        value: String? = nil,
+        all: Bool
+    ) throws -> (bytes: [UInt8], removed: Int) {
+        var matches = try Self.parse(bytes).filter {
+            $0.section.caseInsensitiveCompare(section) == .orderedSame &&
+            $0.subsection == subsection &&
+            $0.key.caseInsensitiveCompare(key) == .orderedSame &&
+            (value == nil || $0.value == value)
+        }
+        if !all, let last = matches.last {
+            matches = [last]
+        }
+        var lines = String(decoding: bytes, as: UTF8.self)
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+        for entry in matches.reversed() {
+            lines.removeSubrange((entry.line - 1)..<entry.endLine)
+        }
+        return (
+            Array(lines.joined(separator: "\n").utf8),
+            matches.count
+        )
     }
 
     private init(bytes: [UInt8], entries: [Entry]) {
         self.bytes = bytes
         self.entries = entries
+    }
+
+    private static func append(
+        section: String,
+        subsection: String?,
+        key: String,
+        value: String,
+        to lines: inout [String]
+    ) {
+        if lines.last != "" { lines.append("") }
+        let header = subsection.map {
+            "[\(section) \"\(escape($0))\"]"
+        } ?? "[\(section)]"
+        lines.append(header)
+        lines.append("\t\(key) = \(quote(value))")
+        lines.append("")
     }
 
     private static func loadEntries(
@@ -145,7 +229,7 @@ struct GitConfiguration: Sendable {
             throw GitConfigurationError.invalidSyntax(line: 1)
         }
         let physical = source.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        var logical: [(String, Int)] = []
+        var logical: [(value: String, line: Int, endLine: Int)] = []
         var pending = ""
         var pendingLine = 1
         for (offset, raw) in physical.enumerated() {
@@ -154,7 +238,11 @@ struct GitConfiguration: Sendable {
             if line.hasSuffix("\\") && !line.hasSuffix("\\\\") {
                 pending += line.dropLast()
             } else {
-                logical.append((pending + line, pendingLine))
+                logical.append((
+                    value: pending + line,
+                    line: pendingLine,
+                    endLine: offset + 1
+                ))
                 pending = ""
             }
         }
@@ -162,7 +250,7 @@ struct GitConfiguration: Sendable {
         var section = ""
         var subsection: String?
         var output: [Entry] = []
-        for (raw, lineNumber) in logical {
+        for (raw, lineNumber, endLine) in logical {
             let line = raw.trimmingCharacters(in: .whitespaces)
             if line.isEmpty || line.hasPrefix("#") || line.hasPrefix(";") { continue }
             if line.hasPrefix("[") {
@@ -192,7 +280,14 @@ struct GitConfiguration: Sendable {
             }
             let rawValue = equals.map { String(line[line.index(after: $0)...]) } ?? "true"
             let value = try parseValue(rawValue, line: lineNumber)
-            output.append(Entry(section: section, subsection: subsection, key: key, value: value, line: lineNumber))
+            output.append(Entry(
+                section: section,
+                subsection: subsection,
+                key: key,
+                value: value,
+                line: lineNumber,
+                endLine: endLine
+            ))
         }
         return output
     }
@@ -238,6 +333,9 @@ struct GitConfiguration: Sendable {
     private static func escape(_ value: String) -> String {
         value.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\t", with: "\\t")
+            .replacingOccurrences(of: "\u{8}", with: "\\b")
     }
 
     private static func quote(_ value: String) -> String {

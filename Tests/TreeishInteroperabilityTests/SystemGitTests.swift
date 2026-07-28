@@ -794,6 +794,167 @@ func treeListingMatchesSystemGit(
     )
 }
 
+@Test func repositoryConfigurationMatchesSystemGit() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.initialize(in: root)
+    let configURL = directory.appendingPathComponent(".git/config")
+    var config = try Data(contentsOf: configURL)
+    config.append(Data(
+        """
+
+        [include]
+            path = included.conf
+        [custom]
+            multiline = first\\
+        second
+
+        """.utf8
+    ))
+    try config.write(to: configURL)
+    let includedURL = directory.appendingPathComponent(
+        ".git/included.conf"
+    )
+    try Data(
+        """
+        [user]
+            email = included@example.com
+
+        """.utf8
+    ).write(to: includedURL)
+
+    let email = try GitConfigurationKey(
+        section: "user",
+        name: "email"
+    )
+    #expect(
+        try await repository.configurationValues(for: email).value()
+            == ["included@example.com"]
+    )
+    try await repository.setConfiguration(
+        GitConfigurationSetRequest(
+            key: email,
+            value: "local@example.com"
+        )
+    ).value()
+    #expect(
+        try await repository.configurationValues(for: email).value()
+            == ["included@example.com", "local@example.com"]
+    )
+    #expect(
+        String(decoding: try Data(contentsOf: includedURL), as: UTF8.self)
+            .contains("included@example.com")
+    )
+
+    let fetch = try GitConfigurationKey(
+        section: "remote",
+        subsection: "origin",
+        name: "fetch"
+    )
+    for value in [
+        "+refs/heads/*:refs/remotes/origin/*",
+        "+refs/tags/*:refs/tags/*",
+    ] {
+        try await repository.setConfiguration(
+            GitConfigurationSetRequest(
+                key: fetch,
+                value: value,
+                mode: .add
+            )
+        ).value()
+    }
+    #expect(
+        try await repository.configurationValues(for: fetch).value().count
+            == 2
+    )
+    try await repository.setConfiguration(
+        GitConfigurationSetRequest(
+            key: fetch,
+            value: "+refs/heads/main:refs/remotes/origin/main"
+        )
+    ).value()
+    #expect(
+        try await repository.configurationValues(for: fetch).value()
+            == ["+refs/heads/main:refs/remotes/origin/main"]
+    )
+    #expect(
+        try await repository.unsetConfiguration(
+            GitConfigurationUnsetRequest(key: fetch, all: true)
+        ).value() == 1
+    )
+    #expect(
+        try await repository.configurationValues(for: fetch).value().isEmpty
+    )
+
+    let multiline = try GitConfigurationKey(
+        section: "custom",
+        name: "multiline"
+    )
+    try await repository.setConfiguration(
+        GitConfigurationSetRequest(
+            key: multiline,
+            value: "replacement\nvalue"
+        )
+    ).value()
+    #expect(
+        try await repository.configurationValues(for: multiline).value()
+            == ["replacement\nvalue"]
+    )
+    await #expect(throws: TreeishError.invalidConfiguration) {
+        try await repository.setConfiguration(
+            GitConfigurationSetRequest(
+                key: try GitConfigurationKey(
+                    section: "extensions",
+                    name: "objectformat"
+                ),
+                value: "sha256"
+            )
+        ).value()
+    }
+
+    func git(_ arguments: [String]) throws -> (Int32, String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory.path] + arguments
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        return (
+            process.terminationStatus,
+            String(
+                decoding: output.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            )
+        )
+    }
+    #expect(try git(["config", "user.email"]).1 == "local@example.com\n")
+    #expect(try git(["config", "--get-all", fetch.description]).0 != 0)
+    #expect(
+        try git(["config", "--get", multiline.description]).1
+            == "replacement\nvalue\n"
+    )
+    #expect(
+        try git(["config", "branch.main.remote", "origin"]).0 == 0
+    )
+    let remote = try GitConfigurationKey(
+        section: "branch",
+        subsection: "main",
+        name: "remote"
+    )
+    #expect(
+        try await repository.configurationValues(for: remote).value()
+            == ["origin"]
+    )
+}
+
 @Test func systemGitReadsTreeishLooseObject() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString)

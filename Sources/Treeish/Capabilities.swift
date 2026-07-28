@@ -36,6 +36,8 @@ public enum RepositoryOperationCapability: String, Sendable, Hashable, Codable {
     case readObjects
     case checkIntegrity
     case listTrees
+    case readConfiguration
+    case writeConfiguration
     case writeObjects
     case readRefs
     case updateRefs

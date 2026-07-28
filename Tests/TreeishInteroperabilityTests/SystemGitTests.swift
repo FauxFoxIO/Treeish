@@ -720,6 +720,80 @@ func integrityCheckMatchesSystemGitConnectivity(
     }
 }
 
+@Test(arguments: ObjectHashAlgorithm.allCases)
+func treeListingMatchesSystemGit(
+    objectFormat: ObjectHashAlgorithm
+) async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory.appendingPathComponent("nested"),
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try Data("nested\n".utf8).write(
+        to: directory.appendingPathComponent("nested/value.txt")
+    )
+    let script = directory.appendingPathComponent("script.sh")
+    try Data("#!/bin/sh\n".utf8).write(to: script)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: script.path
+    )
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.initialize(
+        in: root,
+        options: RepositoryInitialization(objectFormat: objectFormat)
+    )
+    _ = try await repository.stage(
+        StageRequest(pathspecs: [
+            try GitPathspec("nested/value.txt"),
+            try GitPathspec("script.sh"),
+        ])
+    ).value()
+    let signature = Signature(
+        name: "Treeish",
+        email: "treeish@example.com",
+        secondsSinceEpoch: 1_700_000_000,
+        timeZoneOffsetMinutes: 0
+    )
+    let commit = try await repository.commit(
+        CommitRequest(
+            tree: try await repository.writeIndexTree().value(),
+            author: signature,
+            committer: signature,
+            message: Array("tree listing\n".utf8)
+        )
+    ).value().objectID
+    let entries = try await repository.listTree(
+        commit,
+        options: GitTreeListingOptions(
+            recursive: true,
+            includeTrees: true
+        )
+    ).value()
+    let actual = entries.map {
+        "\($0.mode.gitDescription) \($0.type.rawValue) \($0.objectID)\t\($0.path.displayString)"
+    }.joined(separator: "\n") + "\n"
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+    process.arguments = [
+        "-C", directory.path, "ls-tree", "-r", "-t", commit.description,
+    ]
+    let output = Pipe()
+    process.standardOutput = output
+    try process.run()
+    process.waitUntilExit()
+    #expect(process.terminationStatus == 0)
+    #expect(
+        actual == String(
+            decoding: output.fileHandleForReading.readDataToEndOfFile(),
+            as: UTF8.self
+        )
+    )
+}
+
 @Test func systemGitReadsTreeishLooseObject() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString)

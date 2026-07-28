@@ -41,6 +41,11 @@ unreachable and dangling objects, treats absent promisor objects as warnings,
 and does not require gitlink targets to exist in the superproject object
 database.
 
+``Repository/listTree(_:options:)`` accepts a tree, commit, or annotated tag,
+peels it with bounded cycle detection, and returns immediate or recursive
+byte-aware entries. Modes and object kinds match `git ls-tree`; recursive
+listing is allocation-bounded and cancellation-aware.
+
 Object lookup follows root-contained alternate object databases and classic or
 incremental multi-pack indexes. Revision traversal honors `shallow` boundaries
 and replacement references. Partial-clone configuration is reported through

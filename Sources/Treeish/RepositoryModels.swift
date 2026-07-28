@@ -697,6 +697,59 @@ public struct CommitInfo: Sendable, Hashable {
     public let message: [UInt8]
 }
 
+public struct GitTreeEntryMode: RawRepresentable, Sendable, Hashable, Codable {
+    public let rawValue: UInt32
+
+    public init(rawValue: UInt32) {
+        self.rawValue = rawValue
+    }
+
+    public static let tree = GitTreeEntryMode(rawValue: 0o040000)
+    public static let regular = GitTreeEntryMode(rawValue: 0o100644)
+    public static let executable = GitTreeEntryMode(rawValue: 0o100755)
+    public static let symbolicLink = GitTreeEntryMode(rawValue: 0o120000)
+    public static let gitlink = GitTreeEntryMode(rawValue: 0o160000)
+
+    public var gitDescription: String {
+        String(format: "%06o", rawValue)
+    }
+}
+
+public struct GitTreeListingOptions: Sendable, Hashable, Codable {
+    public let recursive: Bool
+    public let includeTrees: Bool
+    public let maximumEntries: Int
+
+    public init(
+        recursive: Bool = false,
+        includeTrees: Bool = false,
+        maximumEntries: Int = 1_000_000
+    ) {
+        self.recursive = recursive
+        self.includeTrees = includeTrees
+        self.maximumEntries = maximumEntries
+    }
+}
+
+public struct GitTreeEntryInfo: Sendable, Hashable, Codable {
+    public let mode: GitTreeEntryMode
+    public let type: GitObjectKind
+    public let objectID: ObjectID
+    public let path: GitPath
+
+    public init(
+        mode: GitTreeEntryMode,
+        type: GitObjectKind,
+        objectID: ObjectID,
+        path: GitPath
+    ) {
+        self.mode = mode
+        self.type = type
+        self.objectID = objectID
+        self.path = path
+    }
+}
+
 public struct RevisionRange: Sendable, Hashable {
     public enum Kind: String, Sendable, Hashable, Codable {
         case exclusion

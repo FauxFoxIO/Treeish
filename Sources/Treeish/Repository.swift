@@ -164,6 +164,126 @@ public actor Repository {
         }
     }
 
+    public func listTree(
+        _ treeish: ObjectID,
+        options: GitTreeListingOptions = .init()
+    ) -> GitOperation<[GitTreeEntryInfo]> {
+        let store = objectStore
+        return GitOperation(phase: .counting) {
+            guard treeish.algorithm == store.objectFormat,
+                  options.maximumEntries > 0 else {
+                throw TreeishError.invalidObjectID
+            }
+            var visitedTags: Set<[UInt8]> = []
+            var root = treeish.bytes
+            while true {
+                guard visitedTags.count < 16,
+                      visitedTags.insert(root).inserted else {
+                    throw TreeishError.recoveryRequired(
+                        "tree-ish tag chain limit exceeded"
+                    )
+                }
+                let object = try store.read(identifier: root)
+                switch object.type {
+                case .tree:
+                    break
+                case .commit:
+                    root = try CommitRecord(
+                        identifier: root,
+                        object: object
+                    ).tree
+                    continue
+                case .tag:
+                    guard let target = try Repository.tagTarget(
+                        object.payload
+                    ) else {
+                        throw GitObjectError.invalidHeader
+                    }
+                    root = target
+                    continue
+                case .blob:
+                    throw GitObjectError.invalidHeader
+                }
+                break
+            }
+
+            var result: [GitTreeEntryInfo] = []
+            func appendTree(
+                identifier: [UInt8],
+                prefix: [UInt8]
+            ) throws {
+                try Task.checkCancellation()
+                let object = try store.read(identifier: identifier)
+                guard object.type == .tree else {
+                    throw GitObjectError.invalidHeader
+                }
+                var reader = CheckedByteReader(object.payload)
+                while reader.remainingCount > 0 {
+                    var modeBytes: [UInt8] = []
+                    while true {
+                        guard modeBytes.count < 8 else {
+                            throw GitObjectError.invalidHeader
+                        }
+                        let byte = try reader.readByte()
+                        if byte == 0x20 { break }
+                        modeBytes.append(byte)
+                    }
+                    var name: [UInt8] = []
+                    while true {
+                        let byte = try reader.readByte()
+                        if byte == 0 { break }
+                        name.append(byte)
+                    }
+                    guard !name.isEmpty,
+                          !name.contains(0x2f),
+                          let rawMode = UInt32(
+                            String(decoding: modeBytes, as: UTF8.self),
+                            radix: 8
+                          )
+                    else {
+                        throw GitObjectError.invalidHeader
+                    }
+                    let type: GitObjectKind
+                    switch rawMode & 0o170000 {
+                    case 0o040000:
+                        type = .tree
+                    case 0o160000:
+                        type = .commit
+                    case 0o100000, 0o120000:
+                        type = .blob
+                    default:
+                        throw GitObjectError.invalidHeader
+                    }
+                    let child = try ObjectID(bytes: Array(
+                        try reader.read(count: store.objectFormat.byteCount)
+                    ))
+                    let path = prefix.isEmpty
+                        ? name
+                        : prefix + [0x2f] + name
+                    if !options.recursive || type != .tree ||
+                        options.includeTrees {
+                        guard result.count < options.maximumEntries else {
+                            throw TreeishError.recoveryRequired(
+                                "tree listing entry limit exceeded"
+                            )
+                        }
+                        result.append(GitTreeEntryInfo(
+                            mode: GitTreeEntryMode(rawValue: rawMode),
+                            type: type,
+                            objectID: child,
+                            path: try GitPath(bytes: path)
+                        ))
+                    }
+                    if options.recursive, type == .tree {
+                        try appendTree(identifier: child.bytes, prefix: path)
+                    }
+                }
+            }
+            try appendTree(identifier: root, prefix: [])
+            return result
+        }
+    }
+
     public func signatures(
         for identifier: ObjectID,
         services: RepositoryServices = .init()
@@ -6699,7 +6819,7 @@ public actor Repository {
             .readOnly(reason: $0.reason)
         } ?? .readWrite
         var operations: Set<RepositoryOperationCapability> = [
-            .readObjects, .checkIntegrity, .readRefs,
+            .readObjects, .checkIntegrity, .listTrees, .readRefs,
         ]
         if case .readWrite = access {
             operations.formUnion([

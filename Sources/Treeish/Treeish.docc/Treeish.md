@@ -44,6 +44,9 @@ typed result.
 - ``RepositoryIntegrityOptions``
 - ``RepositoryIntegrityReport``
 - ``RepositoryIntegrityIssue``
+- ``GitTreeListingOptions``
+- ``GitTreeEntryInfo``
+- ``GitTreeEntryMode``
 
 ### Operations
 

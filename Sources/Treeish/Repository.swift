@@ -93,7 +93,7 @@ public actor Repository {
             let bytes = try store.write(
                 GitObject(type: type.storageType, payload: payload)
             )
-            return try ObjectID(algorithm: .sha1, bytes: bytes)
+            return try ObjectID(bytes: bytes)
         }
     }
 
@@ -101,7 +101,7 @@ public actor Repository {
         let store = objectStore
         return GitOperation(phase: .validating) {
             try Task.checkCancellation()
-            guard identifier.algorithm == .sha1 else {
+            guard identifier.algorithm == store.objectFormat else {
                 throw TreeishError.unsupportedRepositoryFormat(
                     identifier.algorithm.rawValue
                 )
@@ -306,7 +306,7 @@ public actor Repository {
                     : (permissions & 0o111 == 0 ? 0o100644 : 0o100755)
                 if mode != entry.mode {
                     changes[bytes, default: (nil, nil)].worktree = .typeChanged
-                } else if SHA1.hash(canonical) != entry.objectID {
+                } else if store.objectFormat.hash(canonical) != entry.objectID {
                     changes[bytes, default: (nil, nil)].worktree = .modified
                 }
             }
@@ -359,7 +359,7 @@ public actor Repository {
                 )
             }
             let bytes = try Repository.writeTree(items: items, store: store)
-            return try ObjectID(algorithm: .sha1, bytes: bytes)
+            return try ObjectID(bytes: bytes)
         }
     }
 
@@ -370,17 +370,19 @@ public actor Repository {
         let store = objectStore
         return GitOperation(phase: .counting) {
             guard limit > 0, limit <= 100_000,
-                  starts.allSatisfy({ $0.algorithm == .sha1 }) else {
+                  starts.allSatisfy({
+                      $0.algorithm == store.objectFormat
+                  }) else {
                 throw TreeishError.invalidObjectID
             }
             let graph = CommitGraph(source: RepositoryCommitSource(store: store))
             let records = try await graph.walk(from: starts.map(\.bytes))
             return try records.prefix(limit).map { record in
                 CommitInfo(
-                    objectID: try ObjectID(algorithm: .sha1, bytes: record.identifier),
-                    tree: try ObjectID(algorithm: .sha1, bytes: record.tree),
+                    objectID: try ObjectID(bytes: record.identifier),
+                    tree: try ObjectID(bytes: record.tree),
                     parents: try record.parents.map {
-                        try ObjectID(algorithm: .sha1, bytes: $0)
+                        try ObjectID(bytes: $0)
                     },
                     authorTime: record.authorTime,
                     message: record.message
@@ -396,8 +398,8 @@ public actor Repository {
         let store = objectStore
         return GitOperation(phase: .counting) {
             guard limit > 0, limit <= 100_000,
-                  range.left.algorithm == .sha1,
-                  range.right.algorithm == .sha1 else {
+                  range.left.algorithm == store.objectFormat,
+                  range.right.algorithm == store.objectFormat else {
                 throw TreeishError.invalidObjectID
             }
             let graph = CommitGraph(source: RepositoryCommitSource(store: store))
@@ -419,16 +421,10 @@ public actor Repository {
             }
             return try records.prefix(limit).map { record in
                 CommitInfo(
-                    objectID: try ObjectID(
-                        algorithm: .sha1,
-                        bytes: record.identifier
-                    ),
-                    tree: try ObjectID(
-                        algorithm: .sha1,
-                        bytes: record.tree
-                    ),
+                    objectID: try ObjectID(bytes: record.identifier),
+                    tree: try ObjectID(bytes: record.tree),
                     parents: try record.parents.map {
-                        try ObjectID(algorithm: .sha1, bytes: $0)
+                        try ObjectID(bytes: $0)
                     },
                     authorTime: record.authorTime,
                     message: record.message
@@ -443,12 +439,13 @@ public actor Repository {
     ) -> GitOperation<[ObjectID]> {
         let store = objectStore
         return GitOperation(phase: .counting) {
-            guard left.algorithm == .sha1, right.algorithm == .sha1 else {
+            guard left.algorithm == store.objectFormat,
+                  right.algorithm == store.objectFormat else {
                 throw TreeishError.invalidObjectID
             }
             let graph = CommitGraph(source: RepositoryCommitSource(store: store))
             return try await graph.mergeBases(left.bytes, right.bytes).map {
-                try ObjectID(algorithm: .sha1, bytes: $0)
+                try ObjectID(bytes: $0)
             }
         }
     }
@@ -492,7 +489,7 @@ public actor Repository {
                 throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
             }
             guard root.policy.allowsSiblingWorktrees,
-                  request.start.algorithm == .sha1 else {
+                  request.start.algorithm == store.objectFormat else {
                 throw TreeishError.invalidPath
             }
             let destinationComponents = try request.destination.components
@@ -549,7 +546,11 @@ public actor Repository {
             )
             let flat = try Repository.flattenTree(identifier: record.tree, prefix: [], store: store)
             let adminDirectory = try common.childDirectory(administration)
-            try GitIndexStore(gitDirectory: adminDirectory).write(GitIndex(
+            try GitIndexStore(
+                gitDirectory: adminDirectory,
+                objectFormat: store.objectFormat
+            ).write(GitIndex(
+                objectFormat: store.objectFormat,
                 entries: try flat.map { try Repository.indexEntry($0, stage: 0, store: store) }
             ))
             return WorktreeResult(
@@ -595,6 +596,7 @@ public actor Repository {
     ) -> GitOperation<GitPath> {
         let root = root
         let common = commonDirectory
+        let objectFormat = repositoryCapabilities.objectFormat
         return GitOperation(phase: .updatingWorktree) {
             guard Repository.validWorktreeIdentifier(identifier) else { throw TreeishError.invalidPath }
             let administration = ["worktrees", identifier]
@@ -612,7 +614,10 @@ public actor Repository {
             if !force {
                 let worktree = try RootDirectory(url: destinationURL)
                 let admin = try common.childDirectory(administration)
-                let index = try GitIndexStore(gitDirectory: admin).read()
+                let index = try GitIndexStore(
+                    gitDirectory: admin,
+                    objectFormat: objectFormat
+                ).read()
                 guard try Repository.worktreeStatus(index: index, worktree: worktree).isEmpty,
                       Set(try Repository.enumerateFiles(in: worktree)).isSubset(
                         of: Set(index.entries.filter { $0.stage == 0 }.compactMap { try? GitPath(bytes: $0.path) })
@@ -687,6 +692,7 @@ public actor Repository {
                         remote: url,
                         body: try UploadPackV2.lsRefsRequest(
                             prefixes: prefixes,
+                            objectFormat: store.objectFormat,
                             capabilities: capabilities
                         ),
                         authorization: credential?.authorizationHeader
@@ -742,12 +748,14 @@ public actor Repository {
                 try UploadPackV2.fetchRequest(
                     wants: wants,
                     haves: haves,
+                    objectFormat: store.objectFormat,
                     capabilities: v2Capabilities
                 )
             } else {
                 try UploadPackV0.fetchRequest(
                     wants: wants,
                     haves: haves,
+                    objectFormat: store.objectFormat,
                     capabilities: advertisement.capabilities
                 )
             }
@@ -776,11 +784,16 @@ public actor Repository {
             }
             let pack = try PackReader.read(
                 packBytes,
+                objectFormat: store.objectFormat,
                 externalBase: { identifier in
                     try? store.read(identifier: identifier)
                 }
             )
-            try Repository.publishPack(pack.objects, in: common)
+            try Repository.publishPack(
+                pack.objects,
+                objectFormat: store.objectFormat,
+                in: common
+            )
             var updates: [RefUpdateResult] = []
             var fetchHead: [UInt8] = []
             for value in selected {
@@ -805,7 +818,7 @@ public actor Repository {
                 } else {
                     continue
                 }
-                let current = try ObjectID(algorithm: .sha1, bytes: value.objectID)
+                let current = try ObjectID(bytes: value.objectID)
                 let prior = try? Repository.readDirectReference(
                     directory: common,
                     components: target.pathComponents
@@ -902,7 +915,10 @@ public actor Repository {
                 let advertised = advertisement.references.first {
                     $0.name == refspec.destination.bytes
                 }
-                let oldBytes = advertised?.objectID ?? [UInt8](repeating: 0, count: 20)
+                let oldBytes = advertised?.objectID ?? [UInt8](
+                    repeating: 0,
+                    count: store.objectFormat.byteCount
+                )
                 let newValue = try refspec.source.map {
                     try Repository.readReference(directory: localDirectory, name: $0)
                 }
@@ -924,16 +940,20 @@ public actor Repository {
                 desired[refspec.destination] = newValue
                 commands.append(try ReceivePackCommand(
                     old: oldBytes,
-                    new: newValue?.bytes ?? [UInt8](repeating: 0, count: 20),
+                    new: newValue?.bytes ?? [UInt8](
+                        repeating: 0,
+                        count: store.objectFormat.byteCount
+                    ),
                     name: refspec.destination.bytes
                 ))
             }
             let archive = try PackWriter.write(objectsByID.values.sorted {
                 $0.identifier.lexicographicallyPrecedes($1.identifier)
-            })
+            }, objectFormat: store.objectFormat)
             let body = try ReceivePackV0.request(
                 commands: commands,
                 pack: archive.pack,
+                objectFormat: store.objectFormat,
                 advertisedCapabilities: advertisement.capabilities
             )
             let resultBody: [UInt8]
@@ -976,7 +996,7 @@ public actor Repository {
                     $0.name == refspec.destination.bytes
                 }
                 let previous = try advertised.map {
-                    try ObjectID(algorithm: .sha1, bytes: $0.objectID)
+                    try ObjectID(bytes: $0.objectID)
                 }
                 let disposition: PushRefDisposition
                 switch status {
@@ -1009,7 +1029,8 @@ public actor Repository {
             guard case .readWrite = access else {
                 throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
             }
-            guard let worktree, request.commit.algorithm == .sha1 else {
+            guard let worktree,
+                  request.commit.algorithm == store.objectFormat else {
                 throw TreeishError.repositoryNotFound
             }
             let commitObject = try store.read(identifier: request.commit.bytes)
@@ -1034,7 +1055,7 @@ public actor Repository {
                 let url = try worktree.url(for: path.components, followFinalSymlink: false)
                 let bytes = try Repository.worktreePayload(url: url)
                 let canonical = Array("blob \(bytes.count)\0".utf8) + bytes
-                guard SHA1.hash(canonical) == entry.objectID else {
+                guard store.objectFormat.hash(canonical) == entry.objectID else {
                     throw TreeishError.worktreeCollision(path)
                 }
             }
@@ -1116,7 +1137,8 @@ public actor Repository {
         let limits = resourceLimits
         let access = repositoryCapabilities.access
         return GitOperation(phase: .reconciling) {
-            guard case .readWrite = access, request.commit.algorithm == .sha1 else {
+            guard case .readWrite = access,
+                  request.commit.algorithm == store.objectFormat else {
                 throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
             }
             let object = try store.read(identifier: request.commit.bytes)
@@ -1442,7 +1464,8 @@ public actor Repository {
             let archive = try PackWriter.write(
                 objectsByID.values.sorted {
                     $0.identifier.lexicographicallyPrecedes($1.identifier)
-                }
+                },
+                objectFormat: store.objectFormat
             )
             var bytes = Array("# v2 git bundle\n".utf8)
             for reference in references.sorted(by: { $0.bytes.lexicographicallyPrecedes($1.bytes) }) {
@@ -1489,11 +1512,16 @@ public actor Repository {
             let packStart = separator.upperBound - 4
             let pack = try PackReader.read(
                 Array(bytes[packStart...]),
+                objectFormat: store.objectFormat,
                 externalBase: { identifier in
                     try? store.read(identifier: identifier)
                 }
             )
-            try Repository.publishPack(pack.objects, in: common)
+            try Repository.publishPack(
+                pack.objects,
+                objectFormat: store.objectFormat,
+                in: common
+            )
             for identifier in references.values {
                 _ = try store.read(identifier: identifier.bytes)
             }
@@ -1513,7 +1541,7 @@ public actor Repository {
         let access = repositoryCapabilities.access
         return GitOperation(phase: .reconciling) {
             guard case .readWrite = access, let worktree,
-                  request.other.algorithm == .sha1 else {
+                  request.other.algorithm == store.objectFormat else {
                 throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
             }
             let head = try Repository.readHead(
@@ -1601,14 +1629,14 @@ public actor Repository {
             let tree = try Repository.writeTree(items: items, store: store)
             try Repository.materializeTree(identifier: tree, at: [], root: worktree, store: store)
             let commitObject = GitObjectEncoder.commit(
-                treeHex: try ObjectID(algorithm: .sha1, bytes: tree).description,
+                treeHex: try ObjectID(bytes: tree).description,
                 parentHexes: [ours.description, request.other.description],
                 author: request.author.storageSignature,
                 committer: request.committer.storageSignature,
                 message: request.message
             )
             let commitBytes = try store.write(commitObject)
-            let commitID = try ObjectID(algorithm: .sha1, bytes: commitBytes)
+            let commitID = try ObjectID(bytes: commitBytes)
             try refsDirectory.writeAtomically(
                 Array("\(commitID.description)\n".utf8),
                 to: headReference.pathComponents
@@ -1649,7 +1677,7 @@ public actor Repository {
                 (components: $0.path.split(separator: 0x2f).map(Array.init), entry: $0)
             }
             let treeBytes = try Repository.writeTree(items: items, store: store)
-            let tree = try ObjectID(algorithm: .sha1, bytes: treeBytes)
+            let tree = try ObjectID(bytes: treeBytes)
             let storedMessage = try headDirectory.read(["MERGE_MSG"], limit: 16 * 1024 * 1024)
             let commit = GitObjectEncoder.commit(
                 treeHex: tree.description,
@@ -1658,10 +1686,7 @@ public actor Repository {
                 committer: request.committer.storageSignature,
                 message: request.message ?? storedMessage
             )
-            let identifier = try ObjectID(
-                algorithm: .sha1,
-                bytes: store.write(commit)
-            )
+            let identifier = try ObjectID(bytes: store.write(commit))
             try refsDirectory.writeAtomically(
                 Array("\(identifier.description)\n".utf8),
                 to: reference.pathComponents
@@ -1719,7 +1744,7 @@ public actor Repository {
         let access = repositoryCapabilities.access
         return GitOperation(phase: .reconciling) {
             guard case .readWrite = access, let worktree,
-                  request.commit.algorithm == .sha1 else {
+                  request.commit.algorithm == store.objectFormat else {
                 throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
             }
             let head = try Repository.readHead(
@@ -1874,8 +1899,10 @@ public actor Repository {
         let access = repositoryCapabilities.access
         return GitOperation(phase: .reconciling) {
             guard case .readWrite = access, let worktree,
-                  request.onto.algorithm == .sha1,
-                  request.commits.allSatisfy({ $0.algorithm == .sha1 }) else {
+                  request.onto.algorithm == store.objectFormat,
+                  request.commits.allSatisfy({
+                      $0.algorithm == store.objectFormat
+                  }) else {
                 throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
             }
             let head = try Repository.readHead(
@@ -2006,6 +2033,7 @@ public actor Repository {
         let worktree = worktree
         let headDirectory = gitDirectory
         let refsDirectory = commonDirectory
+        let objectFormat = repositoryCapabilities.objectFormat
         return GitOperation(phase: .indexing) {
             guard let worktree else { throw TreeishError.repositoryNotFound }
             let head = try Repository.readHead(
@@ -2021,7 +2049,7 @@ public actor Repository {
                 let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
                 let type = attributes[.type] as? FileAttributeType
                 let payload = try Repository.worktreePayload(url: url)
-                let identifier = SHA1.hash(payload)
+                let identifier = objectFormat.hash(payload)
                 blobs[identifier] = WorkspaceStateBlob(identifier: identifier, bytes: payload)
                 let permissions = (attributes[.posixPermissions] as? NSNumber)?.uint32Value ?? 0o644
                 let mode: UInt32 = type == .typeSymbolicLink
@@ -2055,6 +2083,7 @@ public actor Repository {
         let headDirectory = gitDirectory
         let refsDirectory = commonDirectory
         let access = repositoryCapabilities.access
+        let objectFormat = repositoryCapabilities.objectFormat
         return GitOperation(phase: .updatingWorktree) {
             guard case .readWrite = access, let worktree else {
                 throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
@@ -2062,7 +2091,9 @@ public actor Repository {
             let blobMap = Dictionary(uniqueKeysWithValues: state.blobs.map {
                 ($0.identifier, $0.bytes)
             })
-            guard state.blobs.allSatisfy({ SHA1.hash($0.bytes) == $0.identifier }),
+            guard state.blobs.allSatisfy({
+                objectFormat.hash($0.bytes) == $0.identifier
+            }),
                   state.entries.allSatisfy({ blobMap[$0.contentIdentifier] != nil }) else {
                 throw TreeishError.recoveryRequired("workspace state content verification failed")
             }
@@ -2175,7 +2206,7 @@ public actor Repository {
             guard let match = entries.first(where: { $0.path == path.bytes }) else {
                 throw TreeishError.invalidPath
             }
-            return try ObjectID(algorithm: .sha1, bytes: match.objectID)
+            return try ObjectID(bytes: match.objectID)
         }
         if expression.hasSuffix("^{tree}") {
             let base = try resolveRevision(String(expression.dropLast(7)))
@@ -2184,7 +2215,7 @@ public actor Repository {
                 identifier: peeled.bytes,
                 object: objectStore.read(identifier: peeled.bytes)
             )
-            return try ObjectID(algorithm: .sha1, bytes: record.tree)
+            return try ObjectID(bytes: record.tree)
         }
         if expression.hasSuffix("^{}") {
             return try peelTag(try resolveRevision(String(expression.dropLast(3))))
@@ -2205,7 +2236,7 @@ public actor Repository {
                     guard count > 0, record.parents.indices.contains(count - 1) else {
                         throw TreeishError.referenceNotFound
                     }
-                    return try ObjectID(algorithm: .sha1, bytes: record.parents[count - 1])
+                    return try ObjectID(bytes: record.parents[count - 1])
                 }
                 for _ in 0..<count {
                     let record = try CommitRecord(
@@ -2215,7 +2246,7 @@ public actor Repository {
                     guard let parent = record.parents.first else {
                         throw TreeishError.referenceNotFound
                     }
-                    current = try ObjectID(algorithm: .sha1, bytes: parent)
+                    current = try ObjectID(bytes: parent)
                 }
                 return current
             }
@@ -2229,7 +2260,7 @@ public actor Repository {
             return identifier
         }
         if let identifier = try objectStore.resolvePrefix(expression) {
-            return try ObjectID(algorithm: .sha1, bytes: identifier)
+            return try ObjectID(bytes: identifier)
         }
         var candidates: [ObjectID] = []
         let names = expression.hasPrefix("refs/")
@@ -2310,7 +2341,7 @@ public actor Repository {
             guard let target = try Repository.tagTarget(object.payload) else {
                 throw TreeishError.invalidObjectID
             }
-            current = try ObjectID(algorithm: .sha1, bytes: target)
+            current = try ObjectID(bytes: target)
         }
     }
 
@@ -2330,13 +2361,14 @@ public actor Repository {
     ) -> GitOperation<RefUpdateResult> {
         let directory = commonDirectory
         let access = repositoryCapabilities.access
+        let objectFormat = repositoryCapabilities.objectFormat
         return GitOperation(phase: .updatingRefs) {
             guard case .readWrite = access else {
                 throw TreeishError.mutationDisabled(
                     access.reason ?? .rootIsReadOnly
                 )
             }
-            guard newValue.algorithm == .sha1 else {
+            guard newValue.algorithm == objectFormat else {
                 throw TreeishError.invalidObjectID
             }
             let components = try name.pathComponents
@@ -2381,7 +2413,8 @@ public actor Repository {
         let directory = commonDirectory
         let access = repositoryCapabilities.access
         return GitOperation(phase: .updatingRefs) {
-            guard case .readWrite = access, request.target.algorithm == .sha1 else {
+            guard case .readWrite = access,
+                  request.target.algorithm == store.objectFormat else {
                 throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
             }
             let reference = try RefName("refs/tags/\(request.name)")
@@ -2395,7 +2428,7 @@ public actor Repository {
                     tagger: tagger.storageSignature,
                     message: message
                 )
-                finalTarget = try ObjectID(algorithm: .sha1, bytes: store.write(tag))
+                finalTarget = try ObjectID(bytes: store.write(tag))
             } else {
                 finalTarget = request.target
             }
@@ -2453,8 +2486,10 @@ public actor Repository {
         let directory = commonDirectory
         let store = objectStore
         let access = repositoryCapabilities.access
+        let objectFormat = repositoryCapabilities.objectFormat
         return GitOperation(phase: .updatingRefs) {
-            guard case .readWrite = access, target.algorithm == .sha1 else {
+            guard case .readWrite = access,
+                  target.algorithm == objectFormat else {
                 throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
             }
             _ = try store.read(identifier: target.bytes)
@@ -2508,7 +2543,7 @@ public actor Repository {
                 message: request.message
             )
             let bytes = try store.write(object)
-            let identifier = try ObjectID(algorithm: .sha1, bytes: bytes)
+            let identifier = try ObjectID(bytes: bytes)
             let components = try reference.pathComponents
             let looseExists = try refsDirectory.exists(components)
             let expectedBytes = head.objectID.map { Array("\($0.description)\n".utf8) }
@@ -2713,7 +2748,10 @@ public actor Repository {
         current: ObjectID,
         metadata: ReflogMetadata
     ) throws {
-        let zero = String(repeating: "0", count: 40)
+        let zero = String(
+            repeating: "0",
+            count: current.algorithm.byteCount * 2
+        )
         let line = "\(previous?.description ?? zero) \(current.description) \(metadata.signature.storageSignature.encoded)\t\(metadata.message.replacingOccurrences(of: "\n", with: " "))\n"
         try directory.appendAtomically(
             Array(line.utf8),
@@ -2744,10 +2782,14 @@ public actor Repository {
 
     private static func publishPack(
         _ objects: [ResolvedPackObject],
+        objectFormat: ObjectHashAlgorithm,
         in directory: RootDirectory
     ) throws {
         let canonical = try PackWriter.write(
-            objects.map { try PackObject(identifier: $0.identifier, object: $0.object) }
+            objects.map {
+                try PackObject(identifier: $0.identifier, object: $0.object)
+            },
+            objectFormat: objectFormat
         )
         let checksum = canonical.checksum.map { String(format: "%02x", $0) }.joined()
         let token = UUID().uuidString.lowercased()
@@ -3202,7 +3244,9 @@ public actor Repository {
             }
             let url = try worktree.url(for: path.components, followFinalSymlink: false)
             let payload = try worktreePayload(url: url)
-            if SHA1.hash(Array("blob \(payload.count)\0".utf8) + payload) != entry.objectID {
+            if index.objectFormat.hash(
+                Array("blob \(payload.count)\0".utf8) + payload
+            ) != entry.objectID {
                 result.append(path)
             }
         }
@@ -3382,10 +3426,7 @@ public actor Repository {
         let items = index.entries.map {
             (components: $0.path.split(separator: 0x2f).map(Array.init), entry: $0)
         }
-        let tree = try ObjectID(
-            algorithm: .sha1,
-            bytes: writeTree(items: items, store: store)
-        )
+        let tree = try ObjectID(bytes: writeTree(items: items, store: store))
         let object = GitObjectEncoder.commit(
             treeHex: tree.description,
             parentHexes: [parent.description],
@@ -3393,7 +3434,7 @@ public actor Repository {
             committer: committer.storageSignature,
             message: message
         )
-        let identifier = try ObjectID(algorithm: .sha1, bytes: store.write(object))
+        let identifier = try ObjectID(bytes: store.write(object))
         let components = try reference.pathComponents
         let loose = try refsDirectory.exists(components)
         guard try refsDirectory.compareAndSwap(
@@ -3439,7 +3480,7 @@ public actor Repository {
                 if let value = ObjectHashAlgorithm(rawValue: normalizedValue) {
                     objectFormat = value
                 }
-                understood = normalizedValue == ObjectHashAlgorithm.sha1.rawValue
+                understood = ObjectHashAlgorithm(rawValue: normalizedValue) != nil
             case "refstorage":
                 if let value = RefStorageFormat(rawValue: normalizedValue) {
                     refStorage = value
@@ -3462,11 +3503,6 @@ public actor Repository {
                     RepositoryRestriction(reason: .requiredExtension(name))
                 )
             }
-        }
-        if objectFormat != .sha1 {
-            restrictions.append(
-                RepositoryRestriction(reason: .objectFormat(objectFormat))
-            )
         }
         if refStorage != .files {
             restrictions.append(

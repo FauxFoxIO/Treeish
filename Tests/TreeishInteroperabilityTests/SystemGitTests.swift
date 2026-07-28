@@ -31,6 +31,94 @@ import Testing
     )
 }
 
+@Test func systemGitReadsAndMutatesTreeishSHA256Repository() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let file = directory.appendingPathComponent("sha256.txt")
+    try Data("treeish\n".utf8).write(to: file)
+
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.initialize(
+        in: root,
+        options: RepositoryInitialization(objectFormat: .sha256)
+    )
+    #expect(await repository.capabilities().objectFormat == .sha256)
+    #expect(await repository.capabilities().access == .readWrite)
+    _ = try await repository.stage(
+        StageRequest(pathspecs: [try GitPathspec("sha256.txt")])
+    ).value()
+    let tree = try await repository.writeIndexTree().value()
+    let signature = Signature(
+        name: "Treeish",
+        email: "treeish@example.com",
+        secondsSinceEpoch: 1_700_000_000,
+        timeZoneOffsetMinutes: 0
+    )
+    let commit = try await repository.commit(
+        CommitRequest(
+            tree: tree,
+            author: signature,
+            committer: signature,
+            message: Array("sha256 initial\n".utf8)
+        )
+    ).value()
+    #expect(commit.objectID.algorithm == .sha256)
+    #expect(commit.objectID.description.count == 64)
+
+    func git(_ arguments: [String]) throws -> (Int32, Data) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory.path] + arguments
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        return (
+            process.terminationStatus,
+            output.fileHandleForReading.readDataToEndOfFile()
+        )
+    }
+
+    let format = try git(["rev-parse", "--show-object-format"])
+    #expect(format.0 == 0)
+    #expect(String(decoding: format.1, as: UTF8.self) == "sha256\n")
+    #expect(try git(["fsck", "--strict"]).0 == 0)
+
+    try Data("system git\n".utf8).write(to: file)
+    #expect(try git(["add", "sha256.txt"]).0 == 0)
+    let environment = [
+        "GIT_AUTHOR_NAME": "System Git",
+        "GIT_AUTHOR_EMAIL": "git@example.com",
+        "GIT_COMMITTER_NAME": "System Git",
+        "GIT_COMMITTER_EMAIL": "git@example.com",
+    ]
+    let commitProcess = Process()
+    commitProcess.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+    commitProcess.arguments = [
+        "-C", directory.path, "commit", "-m", "system git mutation",
+    ]
+    commitProcess.environment = ProcessInfo.processInfo.environment.merging(
+        environment,
+        uniquingKeysWith: { _, new in new }
+    )
+    try commitProcess.run()
+    commitProcess.waitUntilExit()
+    #expect(commitProcess.terminationStatus == 0)
+
+    let reopened = try await Treeish.open(
+        try await Treeish.discover(in: root),
+        roots: [root]
+    )
+    #expect(try await reopened.snapshot().headObjectID?.algorithm == .sha256)
+    #expect(try await reopened.status().value().isClean)
+}
+
 @Test func systemGitReadsTreeishIndexAndCommit() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString)

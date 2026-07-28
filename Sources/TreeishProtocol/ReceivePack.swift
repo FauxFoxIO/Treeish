@@ -1,4 +1,5 @@
 import Foundation
+import TreeishCore
 
 public struct ReceivePackCommand: Sendable, Hashable {
     public let old: [UInt8]
@@ -6,7 +7,9 @@ public struct ReceivePackCommand: Sendable, Hashable {
     public let name: [UInt8]
 
     public init(old: [UInt8], new: [UInt8], name: [UInt8]) throws {
-        guard old.count == 20, new.count == 20, !name.isEmpty else {
+        guard (old.count == 20 || old.count == 32),
+              old.count == new.count,
+              !name.isEmpty else {
             throw ReceivePackError.invalidCommand
         }
         self.old = old
@@ -36,10 +39,20 @@ public enum ReceivePackV0 {
     public static func request(
         commands: [ReceivePackCommand],
         pack: [UInt8],
+        objectFormat: GitHashAlgorithm = .sha1,
         advertisedCapabilities: Set<String>
     ) throws -> [UInt8] {
         guard !commands.isEmpty else { throw ReceivePackError.invalidCommand }
-        let supported = ["report-status-v2", "report-status", "side-band-64k", "ofs-delta", "atomic"]
+        var supported = [
+            "report-status-v2", "report-status", "side-band-64k", "ofs-delta",
+            "atomic",
+        ]
+        let objectCapability = "object-format=\(objectFormat.rawValue)"
+        if advertisedCapabilities.contains(objectCapability) {
+            supported.append(objectCapability)
+        } else if objectFormat != .sha1 {
+            throw ReceivePackError.invalidCommand
+        }
         let selected = supported.filter(advertisedCapabilities.contains)
         var output: [UInt8] = []
         for (index, command) in commands.enumerated() {

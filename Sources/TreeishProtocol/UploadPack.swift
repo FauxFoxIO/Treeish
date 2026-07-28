@@ -77,14 +77,25 @@ public enum UploadPackV0 {
     public static func fetchRequest(
         wants: [[UInt8]],
         haves: [[UInt8]] = [],
+        objectFormat: GitHashAlgorithm = .sha1,
         capabilities advertised: Set<String>
     ) throws -> [UInt8] {
         guard !wants.isEmpty else { throw UploadPackError.invalidObjectID }
-        let supported = ["multi_ack_detailed", "side-band-64k", "ofs-delta", "include-tag"]
+        var supported = [
+            "multi_ack_detailed", "side-band-64k", "ofs-delta", "include-tag",
+        ]
+        let objectCapability = "object-format=\(objectFormat.rawValue)"
+        if advertised.contains(objectCapability) {
+            supported.append(objectCapability)
+        } else if objectFormat != .sha1 {
+            throw UploadPackError.invalidObjectID
+        }
         let selected = supported.filter(advertised.contains)
         var output: [UInt8] = []
         for (index, identifier) in wants.enumerated() {
-            guard identifier.count == 20 else { throw UploadPackError.invalidObjectID }
+            guard identifier.count == objectFormat.byteCount else {
+                throw UploadPackError.invalidObjectID
+            }
             let suffix = index == 0 && !selected.isEmpty
                 ? " " + selected.joined(separator: " ")
                 : ""
@@ -94,7 +105,7 @@ public enum UploadPackV0 {
         }
         output += try PacketLineEncoder.encode(.flush)
         for identifier in haves {
-            guard identifier.count == 20 else {
+            guard identifier.count == objectFormat.byteCount else {
                 throw UploadPackError.invalidObjectID
             }
             output += try PacketLineEncoder.encode(
@@ -130,7 +141,9 @@ public enum UploadPackV0 {
     }
 
     private static func decodeHex(_ bytes: ArraySlice<UInt8>) throws -> [UInt8] {
-        guard bytes.count == 40 else { throw UploadPackError.invalidObjectID }
+        guard bytes.count == 40 || bytes.count == 64 else {
+            throw UploadPackError.invalidObjectID
+        }
         var output: [UInt8] = []
         var index = bytes.startIndex
         while index < bytes.endIndex {
@@ -154,6 +167,13 @@ public struct UploadPackV2Capabilities: Sendable, Hashable {
 
     public init(values: [String: String?]) { self.values = values }
     public func supports(_ name: String) -> Bool { values.keys.contains(name) }
+
+    public var objectFormat: GitHashAlgorithm {
+        guard let value = values["object-format"] ?? nil else {
+            return .sha1
+        }
+        return GitHashAlgorithm(rawValue: value) ?? .sha1
+    }
 }
 
 public enum UploadPackV2 {
@@ -182,6 +202,7 @@ public enum UploadPackV2 {
 
     public static func lsRefsRequest(
         prefixes: [[UInt8]] = [],
+        objectFormat: GitHashAlgorithm = .sha1,
         capabilities: UploadPackV2Capabilities
     ) throws -> [UInt8] {
         guard capabilities.supports("ls-refs") else {
@@ -189,7 +210,12 @@ public enum UploadPackV2 {
         }
         var output = try PacketLineEncoder.encode(.data(Array("command=ls-refs\n".utf8)))
         if capabilities.supports("object-format") {
-            output += try PacketLineEncoder.encode(.data(Array("object-format=sha1\n".utf8)))
+            guard capabilities.objectFormat == objectFormat else {
+                throw UploadPackError.invalidObjectID
+            }
+            output += try PacketLineEncoder.encode(
+                .data(Array("object-format=\(objectFormat.rawValue)\n".utf8))
+            )
         }
         output += try PacketLineEncoder.encode(.delimiter)
         output += try PacketLineEncoder.encode(.data(Array("peel\n".utf8)))
@@ -235,6 +261,7 @@ public enum UploadPackV2 {
     public static func fetchRequest(
         wants: [[UInt8]],
         haves: [[UInt8]] = [],
+        objectFormat: GitHashAlgorithm = .sha1,
         capabilities: UploadPackV2Capabilities
     ) throws -> [UInt8] {
         guard !wants.isEmpty, capabilities.supports("fetch") else {
@@ -242,17 +269,26 @@ public enum UploadPackV2 {
         }
         var output = try PacketLineEncoder.encode(.data(Array("command=fetch\n".utf8)))
         if capabilities.supports("object-format") {
-            output += try PacketLineEncoder.encode(.data(Array("object-format=sha1\n".utf8)))
+            guard capabilities.objectFormat == objectFormat else {
+                throw UploadPackError.invalidObjectID
+            }
+            output += try PacketLineEncoder.encode(
+                .data(Array("object-format=\(objectFormat.rawValue)\n".utf8))
+            )
         }
         output += try PacketLineEncoder.encode(.delimiter)
         output += try PacketLineEncoder.encode(.data(Array("thin-pack\n".utf8)))
         output += try PacketLineEncoder.encode(.data(Array("ofs-delta\n".utf8)))
         for identifier in wants {
-            guard identifier.count == 20 else { throw UploadPackError.invalidObjectID }
+            guard identifier.count == objectFormat.byteCount else {
+                throw UploadPackError.invalidObjectID
+            }
             output += try PacketLineEncoder.encode(.data(Array("want \(hexV2(identifier))\n".utf8)))
         }
         for identifier in haves {
-            guard identifier.count == 20 else { throw UploadPackError.invalidObjectID }
+            guard identifier.count == objectFormat.byteCount else {
+                throw UploadPackError.invalidObjectID
+            }
             output += try PacketLineEncoder.encode(.data(Array("have \(hexV2(identifier))\n".utf8)))
         }
         output += try PacketLineEncoder.encode(.data(Array("done\n".utf8)))
@@ -284,7 +320,9 @@ public enum UploadPackV2 {
 }
 
 private func decodeHexV2<S: Collection>(_ bytes: S) throws -> [UInt8] where S.Element == UInt8 {
-    guard bytes.count == 40 else { throw UploadPackError.invalidObjectID }
+    guard bytes.count == 40 || bytes.count == 64 else {
+        throw UploadPackError.invalidObjectID
+    }
     let values = Array(bytes)
     var output: [UInt8] = []
     for index in stride(from: 0, to: values.count, by: 2) {

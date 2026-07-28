@@ -9,3 +9,8 @@ the object format, repository format, extensions, and storage features actually
 present in that repository. Unknown required extensions or unsupported mutation
 formats make the repository read-only or metadata-only rather than risking
 corruption.
+
+Treeish reads and writes both SHA-1 and SHA-256 object-format repositories.
+Object IDs, loose objects, trees, commits, indexes, packs, pack indexes,
+references, reflogs, bundles, and smart-protocol requests use the repository's
+declared object format.

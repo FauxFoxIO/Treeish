@@ -280,14 +280,28 @@ public struct ObjectID: Sendable, Hashable, Codable, CustomStringConvertible {
         self.bytes = bytes
     }
 
-    public init(hex: String, algorithm: ObjectHashAlgorithm = .sha1) throws {
-        guard hex.utf8.count == algorithm.byteCount * 2 else {
+    public init(bytes: [UInt8]) throws {
+        guard let algorithm = ObjectHashAlgorithm.allCases.first(where: {
+            $0.byteCount == bytes.count
+        }) else { throw TreeishError.invalidObjectID }
+        try self.init(algorithm: algorithm, bytes: bytes)
+    }
+
+    public init(
+        hex: String,
+        algorithm: ObjectHashAlgorithm? = nil
+    ) throws {
+        guard let resolvedAlgorithm = algorithm ??
+                ObjectHashAlgorithm.allCases.first(where: {
+                    $0.byteCount * 2 == hex.utf8.count
+                }),
+              hex.utf8.count == resolvedAlgorithm.byteCount * 2 else {
             throw TreeishError.invalidObjectID
         }
         var decoded: [UInt8] = []
-        decoded.reserveCapacity(algorithm.byteCount)
+        decoded.reserveCapacity(resolvedAlgorithm.byteCount)
         var index = hex.startIndex
-        for _ in 0..<algorithm.byteCount {
+        for _ in 0..<resolvedAlgorithm.byteCount {
             let next = hex.index(index, offsetBy: 2)
             guard let byte = UInt8(hex[index..<next], radix: 16) else {
                 throw TreeishError.invalidObjectID
@@ -295,7 +309,7 @@ public struct ObjectID: Sendable, Hashable, Codable, CustomStringConvertible {
             decoded.append(byte)
             index = next
         }
-        try self.init(algorithm: algorithm, bytes: decoded)
+        try self.init(algorithm: resolvedAlgorithm, bytes: decoded)
     }
 
     public var description: String {

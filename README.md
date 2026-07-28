@@ -265,7 +265,7 @@ decisions for the host app.
 
 ### Repository storage
 
-- SHA-1 loose objects and packfiles;
+- SHA-1 and SHA-256 loose objects, packfiles, pack indexes, and indexes;
 - OFS and REF deltas, thin-pack resolution, pack indexes, and zlib streams;
 - repository formats 0 and 1 when all required extensions are understood,
   normal repositories, and bare repositories;
@@ -289,9 +289,8 @@ decisions for the host app.
 - GitHub token authentication and general Basic or Bearer credentials; and
 - validated pack publication before remote-tracking references move.
 
-Treeish does not currently mutate SHA-256 repositories, reftable repositories,
-or repository-format-1 repositories containing unsupported required
-extensions.
+Treeish does not currently mutate reftable repositories or
+repository-format-1 repositories containing unsupported required extensions.
 Inspect `repository.capabilities()` after opening an unfamiliar repository.
 Unknown required extensions make the repository read-only or metadata-only
 instead of risking corruption.

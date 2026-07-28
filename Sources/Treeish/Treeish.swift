@@ -90,11 +90,6 @@ public enum Treeish {
         at path: GitPath = .root,
         options: RepositoryInitialization = .init()
     ) async throws -> Repository {
-        guard options.objectFormat == .sha1 else {
-            throw TreeishError.unsupportedRepositoryFormat(
-                "SHA-256 mutation is not implemented"
-            )
-        }
         _ = try RefName("refs/heads/\(options.initialBranch)")
         let base = try path.components
         try root.directory.createDirectory(base)
@@ -118,15 +113,31 @@ public enum Treeish {
             to: git + ["HEAD"]
         )
         let bareValue = options.bare ? "true" : "false"
-        try root.directory.writeAtomically(
-            Array("""
+        let formatConfiguration: String
+        switch options.objectFormat {
+        case .sha1:
+            formatConfiguration = """
             [core]
             \trepositoryformatversion = 0
             \tfilemode = true
             \tbare = \(bareValue)
             \tlogallrefupdates = true
 
-            """.utf8),
+            """
+        case .sha256:
+            formatConfiguration = """
+            [core]
+            \trepositoryformatversion = 1
+            \tfilemode = true
+            \tbare = \(bareValue)
+            \tlogallrefupdates = true
+            [extensions]
+            \tobjectformat = sha256
+
+            """
+        }
+        try root.directory.writeAtomically(
+            Array(formatConfiguration.utf8),
             to: git + ["config"]
         )
         try root.directory.writeAtomically(

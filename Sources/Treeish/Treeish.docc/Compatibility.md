@@ -34,6 +34,12 @@ payload while ``GitObjectSigner`` and ``GitObjectSignatureVerifier`` let the
 host own OpenPGP, X.509, or SSH keys and trust policy. System Git can verify
 objects produced through this boundary.
 
+``Repository/revert(_:)`` applies the selected commit's inverse through the
+same three-way merge used by Git, requires an explicit mainline parent for
+merge commits, and creates a single-parent revert commit. Conflicts use the
+standard `REVERT_HEAD`, `MERGE_MSG`, and staged index entries, so system Git
+and Treeish can inspect, continue, or abort the operation interchangeably.
+
 ``Repository/checkIntegrity(_:)`` validates canonical loose and packed objects,
 commit/tree/tag connectivity and types, file or reftable references, and
 optional reflog roots without mutating the repository. It classifies

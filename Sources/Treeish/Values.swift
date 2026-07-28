@@ -26,6 +26,7 @@ public enum TreeishError: Error, Sendable, Equatable {
     case signingUnavailable
     case invalidSignature
     case invalidConfiguration
+    case invalidMainlineParent
 }
 
 public struct GitPath: Sendable, Hashable, Codable {

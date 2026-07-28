@@ -2599,6 +2599,163 @@ func checkoutMovesOnlyHeadAndResetLogsResolvedHead(
     )
 }
 
+@Test func systemGitReadsTreeishRevertAndCleanWorktree() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let file = directory.appendingPathComponent("file.txt")
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.initialize(in: root)
+    let signature = Signature(
+        name: "Treeish",
+        email: "treeish@example.com",
+        secondsSinceEpoch: 1_700_000_000,
+        timeZoneOffsetMinutes: 0
+    )
+    func commit(_ text: String, message: String, parent: ObjectID?) async throws -> ObjectID {
+        try Data(text.utf8).write(to: file)
+        _ = try await repository.stage(
+            StageRequest(pathspecs: [try GitPathspec("file.txt")])
+        ).value()
+        return try await repository.commit(
+            CommitRequest(
+                tree: try await repository.writeIndexTree().value(),
+                parents: parent.map { [$0] } ?? [],
+                expectedHead: parent,
+                author: signature,
+                committer: signature,
+                message: Array("\(message)\n".utf8)
+            )
+        ).value().objectID
+    }
+    let base = try await commit("base\n", message: "base", parent: nil)
+    let changed = try await commit("changed\n", message: "change file", parent: base)
+
+    let result = try await repository.revert(
+        RevertRequest(
+            commit: changed,
+            author: signature,
+            committer: signature
+        )
+    ).value()
+    guard case .committed(let reverted) = result else {
+        Issue.record("expected revert commit")
+        return
+    }
+    #expect(try Data(contentsOf: file) == Data("base\n".utf8))
+    #expect(try await repository.status().value().isClean)
+    #expect(!FileManager.default.fileExists(
+        atPath: directory.appendingPathComponent(".git/REVERT_HEAD").path
+    ))
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+    process.arguments = [
+        "-C", directory.path, "show", "-s", "--format=%P%n%s", reverted.description,
+    ]
+    let output = Pipe()
+    process.standardOutput = output
+    process.standardError = output
+    try process.run()
+    process.waitUntilExit()
+    let lines = String(
+        decoding: output.fileHandleForReading.readDataToEndOfFile(),
+        as: UTF8.self
+    ).split(separator: "\n").map(String.init)
+    #expect(process.terminationStatus == 0)
+    #expect(lines == [changed.description, "Revert \"change file\""])
+}
+
+@Test func systemGitContinuesTreeishRevertConflict() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let file = directory.appendingPathComponent("file.txt")
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.initialize(in: root)
+    let signature = Signature(
+        name: "Treeish",
+        email: "treeish@example.com",
+        secondsSinceEpoch: 1_700_000_000,
+        timeZoneOffsetMinutes: 0
+    )
+    func commit(_ text: String, message: String, parent: ObjectID?) async throws -> ObjectID {
+        try Data(text.utf8).write(to: file)
+        _ = try await repository.stage(
+            StageRequest(pathspecs: [try GitPathspec("file.txt")])
+        ).value()
+        return try await repository.commit(
+            CommitRequest(
+                tree: try await repository.writeIndexTree().value(),
+                parents: parent.map { [$0] } ?? [],
+                expectedHead: parent,
+                author: signature,
+                committer: signature,
+                message: Array("\(message)\n".utf8)
+            )
+        ).value().objectID
+    }
+    let base = try await commit("base\n", message: "base", parent: nil)
+    let reverted = try await commit("target\n", message: "target", parent: base)
+    let head = try await commit("later\n", message: "later", parent: reverted)
+
+    let result = try await repository.revert(
+        RevertRequest(
+            commit: reverted,
+            author: signature,
+            committer: signature
+        )
+    ).value()
+    guard case .conflicted(let paths) = result else {
+        Issue.record("expected revert conflict")
+        return
+    }
+    #expect(paths == [try GitPath("file.txt")])
+    #expect(try await repository.status().value().entries.first?.indexChange == .unmerged)
+    #expect(FileManager.default.fileExists(
+        atPath: directory.appendingPathComponent(".git/REVERT_HEAD").path
+    ))
+    #expect(FileManager.default.fileExists(
+        atPath: directory.appendingPathComponent(".git/MERGE_MSG").path
+    ))
+
+    try Data("resolved\n".utf8).write(to: file)
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+    process.arguments = [
+        "-C", directory.path,
+        "-c", "user.name=System Git",
+        "-c", "user.email=git@example.com",
+        "add", "file.txt",
+    ]
+    try process.run()
+    process.waitUntilExit()
+    #expect(process.terminationStatus == 0)
+    let continuation = Process()
+    continuation.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+    continuation.arguments = [
+        "-C", directory.path,
+        "-c", "user.name=System Git",
+        "-c", "user.email=git@example.com",
+        "revert", "--continue",
+    ]
+    try continuation.run()
+    continuation.waitUntilExit()
+    #expect(continuation.terminationStatus == 0)
+
+    let reopened = try await Treeish.open(
+        try await Treeish.discover(in: root),
+        roots: [root]
+    )
+    let finalHead = try await reopened.snapshot().headObjectID
+    #expect(finalHead != nil)
+    #expect(finalHead != head)
+    #expect(try await reopened.status().value().isClean)
+    #expect(try Data(contentsOf: file) == Data("resolved\n".utf8))
+}
+
 @Test func systemGitReadsTreeishTypedMultiCommitRebase() async throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

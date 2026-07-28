@@ -3240,6 +3240,205 @@ public actor Repository {
         }
     }
 
+    public func revert(_ request: RevertRequest) -> GitOperation<RevertResult> {
+        let store = objectStore
+        let indexStore = indexStore
+        let worktree = worktree
+        let headDirectory = gitDirectory
+        let refsDirectory = commonDirectory
+        let access = repositoryCapabilities.access
+        return GitOperation(phase: .reconciling) {
+            guard case .readWrite = access, let worktree,
+                  request.commit.algorithm == store.objectFormat else {
+                throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
+            }
+            let head = try Repository.readHead(
+                headDirectory: headDirectory,
+                refsDirectory: refsDirectory
+            )
+            guard let ours = head.objectID, let reference = head.reference else {
+                throw TreeishError.malformedReference
+            }
+            let currentIndex = try Repository.readIndex(
+                indexStore,
+                store: store
+            )
+            guard try Repository.worktreeStatus(
+                index: currentIndex,
+                worktree: worktree
+            ).isEmpty else {
+                throw TreeishError.recoveryRequired("revert requires a clean worktree")
+            }
+            let reverted = try CommitRecord(
+                identifier: request.commit.bytes,
+                object: store.read(identifier: request.commit.bytes)
+            )
+            let parentTree: [UInt8]
+            if reverted.parents.isEmpty {
+                guard request.mainlineParentNumber == nil else {
+                    throw TreeishError.invalidMainlineParent
+                }
+                parentTree = try store.write(GitObjectEncoder.tree(entries: []))
+            } else if reverted.parents.count == 1 {
+                guard request.mainlineParentNumber == nil ||
+                        request.mainlineParentNumber == 1 else {
+                    throw TreeishError.invalidMainlineParent
+                }
+                parentTree = try CommitRecord(
+                    identifier: reverted.parents[0],
+                    object: store.read(identifier: reverted.parents[0])
+                ).tree
+            } else {
+                guard let parentNumber = request.mainlineParentNumber,
+                      parentNumber > 0,
+                      parentNumber <= reverted.parents.count else {
+                    throw TreeishError.invalidMainlineParent
+                }
+                let parent = reverted.parents[parentNumber - 1]
+                parentTree = try CommitRecord(
+                    identifier: parent,
+                    object: store.read(identifier: parent)
+                ).tree
+            }
+            let oursRecord = try CommitRecord(
+                identifier: ours.bytes,
+                object: store.read(identifier: ours.bytes)
+            )
+            let base = Dictionary(uniqueKeysWithValues: try Repository.flattenTree(
+                identifier: reverted.tree,
+                prefix: [],
+                store: store
+            ).map { ($0.path, $0) })
+            let oursTree = Dictionary(uniqueKeysWithValues: try Repository.flattenTree(
+                identifier: oursRecord.tree,
+                prefix: [],
+                store: store
+            ).map { ($0.path, $0) })
+            let inverse = Dictionary(uniqueKeysWithValues: try Repository.flattenTree(
+                identifier: parentTree,
+                prefix: [],
+                store: store
+            ).map { ($0.path, $0) })
+            let plan = try Repository.mergeTrees(
+                base: base,
+                ours: oursTree,
+                theirs: inverse,
+                worktree: worktree,
+                store: store
+            )
+            let index = GitIndex(
+                version: currentIndex.version,
+                objectFormat: currentIndex.objectFormat,
+                entries: plan.entries
+            )
+            try indexStore.write(index)
+            try headDirectory.writeAtomically(
+                Array("\(request.commit.description)\n".utf8),
+                to: ["REVERT_HEAD"]
+            )
+            let message = request.message ?? Repository.defaultRevertMessage(
+                commit: request.commit,
+                originalMessage: reverted.message
+            )
+            try headDirectory.writeAtomically(message, to: ["MERGE_MSG"])
+            if !plan.conflicts.isEmpty {
+                return .conflicted(plan.conflicts)
+            }
+            let identifier = try Repository.commitSequencerIndex(
+                index: index,
+                parent: ours,
+                reference: reference,
+                author: request.author,
+                committer: request.committer,
+                message: message,
+                store: store,
+                headDirectory: headDirectory,
+                refsDirectory: refsDirectory,
+                reflogAction: "revert"
+            )
+            try Repository.clearRevertState(in: headDirectory)
+            return .committed(identifier)
+        }
+    }
+
+    public func continueRevert(
+        _ request: MergeContinuationRequest
+    ) -> GitOperation<CommitResult> {
+        let store = objectStore
+        let indexStore = indexStore
+        let headDirectory = gitDirectory
+        let refsDirectory = commonDirectory
+        let access = repositoryCapabilities.access
+        return GitOperation(phase: .updatingRefs) {
+            guard case .readWrite = access else {
+                throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
+            }
+            _ = try headDirectory.read(["REVERT_HEAD"], limit: 4096)
+            let head = try Repository.readHead(
+                headDirectory: headDirectory,
+                refsDirectory: refsDirectory
+            )
+            guard let parent = head.objectID, let reference = head.reference else {
+                throw TreeishError.malformedReference
+            }
+            let index = try Repository.readIndex(indexStore, store: store)
+            guard index.entries.allSatisfy({ $0.stage == 0 }) else {
+                throw TreeishError.recoveryRequired("revert conflicts remain unresolved")
+            }
+            let stored = try headDirectory.read(
+                ["MERGE_MSG"],
+                limit: 16 * 1024 * 1024
+            )
+            let identifier = try Repository.commitSequencerIndex(
+                index: index,
+                parent: parent,
+                reference: reference,
+                author: request.author,
+                committer: request.committer,
+                message: request.message ?? stored,
+                store: store,
+                headDirectory: headDirectory,
+                refsDirectory: refsDirectory,
+                reflogAction: "revert"
+            )
+            try Repository.clearRevertState(in: headDirectory)
+            return CommitResult(objectID: identifier, updatedReference: reference)
+        }
+    }
+
+    public func abortRevert() -> GitOperation<ObjectID> {
+        let store = objectStore
+        let indexStore = indexStore
+        let worktree = worktree
+        let headDirectory = gitDirectory
+        let refsDirectory = commonDirectory
+        let access = repositoryCapabilities.access
+        return GitOperation(phase: .reconciling) {
+            guard case .readWrite = access, let worktree else {
+                throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
+            }
+            let head = try Repository.readHead(
+                headDirectory: headDirectory,
+                refsDirectory: refsDirectory
+            )
+            guard let original = head.objectID else {
+                throw TreeishError.malformedReference
+            }
+            let record = try CommitRecord(
+                identifier: original.bytes,
+                object: store.read(identifier: original.bytes)
+            )
+            try Repository.replaceWorktree(
+                with: record.tree,
+                indexStore: indexStore,
+                worktree: worktree,
+                store: store
+            )
+            try Repository.clearRevertState(in: headDirectory)
+            return original
+        }
+    }
+
     public func rebase(_ request: RebaseRequest) -> GitOperation<RebaseResult> {
         let store = objectStore
         let indexStore = indexStore
@@ -6557,6 +6756,28 @@ public actor Repository {
                 try FileManager.default.removeItem(at: url)
             }
         }
+    }
+
+    private static func clearRevertState(in directory: RootDirectory) throws {
+        for name in ["REVERT_HEAD", "MERGE_MSG"] {
+            let url = try directory.url(for: [name], followFinalSymlink: false)
+            if FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
+        }
+    }
+
+    private static func defaultRevertMessage(
+        commit: ObjectID,
+        originalMessage: [UInt8]
+    ) -> [UInt8] {
+        let subject = originalMessage.split(separator: 0x0a, maxSplits: 1)
+            .first
+            .map(Array.init) ?? []
+        var message = Array("Revert \"".utf8)
+        message += subject
+        message += Array("\"\n\nThis reverts commit \(commit.description).\n".utf8)
+        return message
     }
 
     private static func runRebase(

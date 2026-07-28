@@ -574,6 +574,33 @@ public enum CherryPickResult: Sendable, Hashable, Codable {
     case conflicted([GitPath])
 }
 
+public struct RevertRequest: Sendable, Hashable {
+    public let commit: ObjectID
+    public let mainlineParentNumber: Int?
+    public let author: Signature
+    public let committer: Signature
+    public let message: [UInt8]?
+
+    public init(
+        commit: ObjectID,
+        mainlineParentNumber: Int? = nil,
+        author: Signature,
+        committer: Signature,
+        message: [UInt8]? = nil
+    ) {
+        self.commit = commit
+        self.mainlineParentNumber = mainlineParentNumber
+        self.author = author
+        self.committer = committer
+        self.message = message
+    }
+}
+
+public enum RevertResult: Sendable, Hashable, Codable {
+    case committed(ObjectID)
+    case conflicted([GitPath])
+}
+
 public struct RebaseRequest: Sendable, Hashable {
     public let onto: ObjectID
     public let commits: [ObjectID]

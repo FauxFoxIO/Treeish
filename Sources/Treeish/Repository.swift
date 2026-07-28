@@ -3749,6 +3749,277 @@ public actor Repository {
         }
     }
 
+    public func createStash(_ request: StashRequest) -> GitOperation<StashResult> {
+        let store = objectStore
+        let indexStore = indexStore
+        let worktree = worktree
+        let headDirectory = gitDirectory
+        let refsDirectory = commonDirectory
+        let limits = resourceLimits
+        let access = repositoryCapabilities.access
+        return GitOperation(phase: .updatingRefs) {
+            guard case .readWrite = access, let worktree else {
+                throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
+            }
+            let head = try Repository.readHead(
+                headDirectory: headDirectory,
+                refsDirectory: refsDirectory
+            )
+            guard let headID = head.objectID else {
+                throw TreeishError.malformedReference
+            }
+            let headRecord = try CommitRecord(
+                identifier: headID.bytes,
+                object: store.read(identifier: headID.bytes)
+            )
+            let index = try Repository.readIndex(indexStore, store: store)
+            guard index.entries.allSatisfy({ $0.stage == 0 }) else {
+                throw TreeishError.recoveryRequired(
+                    "stash cannot capture unresolved conflicts"
+                )
+            }
+            let indexTree = try Repository.writeTree(
+                items: index.entries.map {
+                    (
+                        components: $0.path.split(separator: 0x2f).map(Array.init),
+                        entry: $0
+                    )
+                },
+                store: store
+            )
+            let worktreeTree = try Repository.writeTrackedWorktreeTree(
+                index: index,
+                worktree: worktree,
+                commonDirectory: refsDirectory,
+                store: store
+            )
+            guard indexTree != headRecord.tree ||
+                    worktreeTree != headRecord.tree else {
+                throw TreeishError.recoveryRequired("nothing to stash")
+            }
+            let branch = head.reference.map {
+                $0.description.hasPrefix("refs/heads/")
+                    ? String($0.description.dropFirst("refs/heads/".count))
+                    : $0.description
+            } ?? "(no branch)"
+            let subject = String(
+                decoding: headRecord.message.split(
+                    separator: 0x0a,
+                    maxSplits: 1
+                ).first ?? [],
+                as: UTF8.self
+            )
+            let shortHead = String(headID.description.prefix(7))
+            let defaultMessage = "WIP on \(branch): \(shortHead) \(subject)"
+            let displayMessage = request.message.map {
+                String(decoding: $0, as: UTF8.self)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }.flatMap { $0.isEmpty ? nil : $0 } ?? defaultMessage
+            let indexMessage = Array(
+                "index on \(branch): \(shortHead) \(subject)\n".utf8
+            )
+            let indexCommit = GitObjectEncoder.commit(
+                treeHex: try ObjectID(bytes: indexTree).description,
+                parentHexes: [headID.description],
+                author: request.author.storageSignature,
+                committer: request.committer.storageSignature,
+                message: indexMessage
+            )
+            let indexCommitID = try ObjectID(
+                bytes: store.write(indexCommit)
+            )
+            let stashCommit = GitObjectEncoder.commit(
+                treeHex: try ObjectID(bytes: worktreeTree).description,
+                parentHexes: [
+                    headID.description,
+                    indexCommitID.description,
+                ],
+                author: request.author.storageSignature,
+                committer: request.committer.storageSignature,
+                message: Array("\(displayMessage)\n".utf8)
+            )
+            let stashID = try ObjectID(bytes: store.write(stashCommit))
+            let stashReference = try RefName("refs/stash")
+            let previous = try? Repository.readReference(
+                directory: refsDirectory,
+                name: stashReference
+            )
+            try Repository.publishReference(
+                directory: refsDirectory,
+                name: stashReference,
+                value: stashID,
+                expected: previous,
+                requireMissing: previous == nil,
+                reflog: ReflogMetadata(
+                    signature: request.committer,
+                    message: displayMessage
+                )
+            )
+            let currentPaths = Set(index.entries.map(\.path))
+            let headEntries = try Repository.flattenTree(
+                identifier: headRecord.tree,
+                prefix: [],
+                store: store
+            )
+            let affected = try Set(
+                currentPaths.union(headEntries.map(\.path)).map {
+                    try GitPath(bytes: $0)
+                }
+            )
+            try WorktreeTransaction.perform(
+                paths: affected,
+                gitDirectory: headDirectory,
+                commonDirectory: refsDirectory,
+                worktree: worktree,
+                maximumBytes: limits.maximumTransactionBytes
+            ) {
+                try Repository.replaceWorktree(
+                    with: headRecord.tree,
+                    indexStore: indexStore,
+                    worktree: worktree,
+                    store: store
+                )
+            }
+            return StashResult(
+                objectID: stashID,
+                previousStash: previous
+            )
+        }
+    }
+
+    public func stashes(limit: Int = 100) throws -> [StashEntry] {
+        let reference = try RefName("refs/stash")
+        do {
+            return try readReflog(
+                reference,
+                directory: commonDirectory,
+                limit: limit
+            ).enumerated().map { index, entry in
+                StashEntry(
+                    index: index,
+                    objectID: entry.current,
+                    message: entry.message
+                )
+            }
+        } catch RootDirectoryError.notFound {
+            return []
+        } catch TreeishError.referenceNotFound {
+            return []
+        }
+    }
+
+    public func applyStash(_ stash: ObjectID) -> GitOperation<StashApplyResult> {
+        let store = objectStore
+        let indexStore = indexStore
+        let worktree = worktree
+        let headDirectory = gitDirectory
+        let refsDirectory = commonDirectory
+        let limits = resourceLimits
+        let access = repositoryCapabilities.access
+        return GitOperation(phase: .reconciling) {
+            guard case .readWrite = access, let worktree,
+                  stash.algorithm == store.objectFormat else {
+                throw TreeishError.mutationDisabled(access.reason ?? .rootIsReadOnly)
+            }
+            let stashRecord = try CommitRecord(
+                identifier: stash.bytes,
+                object: store.read(identifier: stash.bytes)
+            )
+            guard stashRecord.parents.count >= 2 else {
+                throw TreeishError.recoveryRequired(
+                    "object is not a canonical stash commit"
+                )
+            }
+            let baseRecord = try CommitRecord(
+                identifier: stashRecord.parents[0],
+                object: store.read(identifier: stashRecord.parents[0])
+            )
+            let head = try Repository.readHead(
+                headDirectory: headDirectory,
+                refsDirectory: refsDirectory
+            )
+            guard let headID = head.objectID else {
+                throw TreeishError.malformedReference
+            }
+            let headRecord = try CommitRecord(
+                identifier: headID.bytes,
+                object: store.read(identifier: headID.bytes)
+            )
+            let currentIndex = try Repository.readIndex(
+                indexStore,
+                store: store
+            )
+            guard currentIndex.entries.allSatisfy({ $0.stage == 0 }),
+                  try Repository.worktreeStatus(
+                      index: currentIndex,
+                      worktree: worktree
+                  ).isEmpty else {
+                throw TreeishError.recoveryRequired(
+                    "stash apply requires a clean index and worktree"
+                )
+            }
+            let currentTree = try Repository.writeTree(
+                items: currentIndex.entries.map {
+                    (
+                        components: $0.path.split(separator: 0x2f).map(Array.init),
+                        entry: $0
+                    )
+                },
+                store: store
+            )
+            guard currentTree == headRecord.tree else {
+                throw TreeishError.recoveryRequired(
+                    "stash apply requires a clean index and worktree"
+                )
+            }
+            let base = Dictionary(uniqueKeysWithValues: try Repository.flattenTree(
+                identifier: baseRecord.tree,
+                prefix: [],
+                store: store
+            ).map { ($0.path, $0) })
+            let ours = Dictionary(uniqueKeysWithValues: try Repository.flattenTree(
+                identifier: headRecord.tree,
+                prefix: [],
+                store: store
+            ).map { ($0.path, $0) })
+            let theirs = Dictionary(uniqueKeysWithValues: try Repository.flattenTree(
+                identifier: stashRecord.tree,
+                prefix: [],
+                store: store
+            ).map { ($0.path, $0) })
+            let affected = try Set(
+                Set(base.keys).union(ours.keys).union(theirs.keys).map {
+                    try GitPath(bytes: $0)
+                }
+            )
+            return try WorktreeTransaction.perform(
+                paths: affected,
+                gitDirectory: headDirectory,
+                commonDirectory: refsDirectory,
+                worktree: worktree,
+                maximumBytes: limits.maximumTransactionBytes
+            ) {
+                let plan = try Repository.mergeTrees(
+                    base: base,
+                    ours: ours,
+                    theirs: theirs,
+                    worktree: worktree,
+                    store: store
+                )
+                if plan.conflicts.isEmpty {
+                    try indexStore.write(currentIndex)
+                    return .applied
+                }
+                try indexStore.write(GitIndex(
+                    version: currentIndex.version,
+                    objectFormat: currentIndex.objectFormat,
+                    entries: plan.entries
+                ))
+                return .conflicted(plan.conflicts)
+            }
+        }
+    }
+
     public func captureWorkspaceState() -> GitOperation<WorkspaceState> {
         let indexStore = indexStore
         let worktree = worktree
@@ -6454,6 +6725,71 @@ public actor Repository {
             }
             return result
         }
+    }
+
+    private static func writeTrackedWorktreeTree(
+        index: GitIndex,
+        worktree: RootDirectory,
+        commonDirectory: RootDirectory,
+        store: RepositoryObjectStore
+    ) throws -> [UInt8] {
+        let rules = try WorkingTreeRules(
+            worktree: worktree,
+            commonDirectory: commonDirectory
+        )
+        var entries: [GitIndexEntry] = []
+        entries.reserveCapacity(index.entries.count)
+        for entry in index.entries {
+            try Task.checkCancellation()
+            let path = try GitPath(bytes: entry.path)
+            if entry.mode == 0o160000 {
+                entries.append(entry)
+                continue
+            }
+            guard try worktree.exists(path.components) else {
+                continue
+            }
+            let url = try worktree.url(
+                for: path.components,
+                followFinalSymlink: false
+            )
+            let attributes = try FileManager.default.attributesOfItem(
+                atPath: url.path
+            )
+            let type = attributes[.type] as? FileAttributeType
+            guard type != .typeDirectory else {
+                throw TreeishError.worktreeCollision(path)
+            }
+            let raw = try worktreePayload(url: url)
+            let payload = type == .typeSymbolicLink
+                ? raw
+                : try rules.clean(raw, path: path)
+            let identifier = try store.write(
+                GitObject(type: .blob, payload: payload)
+            )
+            let permissions = (attributes[.posixPermissions] as? NSNumber)?
+                .uint16Value ?? 0o644
+            let mode: UInt32 = type == .typeSymbolicLink
+                ? 0o120000
+                : (permissions & 0o111 == 0 ? 0o100644 : 0o100755)
+            entries.append(try GitIndexEntry(
+                path: entry.path,
+                objectID: identifier,
+                mode: mode,
+                size: UInt32(min(payload.count, Int(UInt32.max))),
+                modificationSeconds: 0,
+                modificationNanoseconds: 0
+            ))
+        }
+        return try writeTree(
+            items: entries.map {
+                (
+                    components: $0.path.split(separator: 0x2f).map(Array.init),
+                    entry: $0
+                )
+            },
+            store: store
+        )
     }
 
     private static func diffTreeSnapshot(

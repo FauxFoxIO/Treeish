@@ -620,6 +620,49 @@ public enum RebaseResult: Sendable, Hashable, Codable {
     case conflicted(commit: ObjectID, paths: [GitPath])
 }
 
+public struct StashRequest: Sendable, Hashable {
+    public let author: Signature
+    public let committer: Signature
+    public let message: [UInt8]?
+
+    public init(
+        author: Signature,
+        committer: Signature,
+        message: [UInt8]? = nil
+    ) {
+        self.author = author
+        self.committer = committer
+        self.message = message
+    }
+}
+
+public struct StashResult: Sendable, Hashable, Codable {
+    public let objectID: ObjectID
+    public let previousStash: ObjectID?
+
+    public init(objectID: ObjectID, previousStash: ObjectID?) {
+        self.objectID = objectID
+        self.previousStash = previousStash
+    }
+}
+
+public struct StashEntry: Sendable, Hashable, Codable {
+    public let index: Int
+    public let objectID: ObjectID
+    public let message: String
+
+    public init(index: Int, objectID: ObjectID, message: String) {
+        self.index = index
+        self.objectID = objectID
+        self.message = message
+    }
+}
+
+public enum StashApplyResult: Sendable, Hashable, Codable {
+    case applied
+    case conflicted([GitPath])
+}
+
 public struct WorkspaceStateBlob: Sendable, Hashable, Codable {
     public let identifier: [UInt8]
     public let bytes: [UInt8]

@@ -48,6 +48,15 @@ and reports gitlinks as canonical subproject-commit content. An index with
 unresolved stages is not flattened into a misleading diff;
 ``Repository/conflicts()`` exposes its exact ancestor, ours, and theirs entries.
 
+``Repository/createStash(_:)`` writes Git's canonical working-tree and index
+commits, updates `refs/stash` with a standard reflog, and then cleans tracked
+changes through a recoverable worktree transaction. System Git can list and
+apply the resulting stash. ``Repository/applyStash(_:)`` accepts the same
+two-parent stash topology from either implementation, performs a three-way
+application onto a clean current workspace, and preserves conflict stages.
+This surface intentionally stashes tracked changes only; untracked and ignored
+files remain in place.
+
 ``Repository/checkIntegrity(_:)`` validates canonical loose and packed objects,
 commit/tree/tag connectivity and types, file or reftable references, and
 optional reflog roots without mutating the repository. It classifies

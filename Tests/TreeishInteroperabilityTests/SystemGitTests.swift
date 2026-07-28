@@ -2599,6 +2599,176 @@ func checkoutMovesOnlyHeadAndResetLogsResolvedHead(
     )
 }
 
+@Test(arguments: ObjectHashAlgorithm.allCases)
+func systemGitAppliesTreeishCanonicalStash(
+    objectFormat: ObjectHashAlgorithm
+) async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let stagedFile = directory.appendingPathComponent("staged.txt")
+    let unstagedFile = directory.appendingPathComponent("unstaged.txt")
+    try Data("base staged\n".utf8).write(to: stagedFile)
+    try Data("base unstaged\n".utf8).write(to: unstagedFile)
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.initialize(
+        in: root,
+        options: RepositoryInitialization(objectFormat: objectFormat)
+    )
+    _ = try await repository.stage(StageRequest(pathspecs: [
+        try GitPathspec("staged.txt"),
+        try GitPathspec("unstaged.txt"),
+    ])).value()
+    let signature = Signature(
+        name: "Treeish",
+        email: "treeish@example.com",
+        secondsSinceEpoch: 1_700_000_000,
+        timeZoneOffsetMinutes: 0
+    )
+    _ = try await repository.commit(CommitRequest(
+        tree: try await repository.writeIndexTree().value(),
+        author: signature,
+        committer: signature,
+        message: Array("base\n".utf8)
+    )).value()
+    try Data("staged change\n".utf8).write(to: stagedFile)
+    _ = try await repository.stage(
+        StageRequest(pathspecs: [try GitPathspec("staged.txt")])
+    ).value()
+    try Data("unstaged change\n".utf8).write(to: unstagedFile)
+
+    let stash = try await repository.createStash(StashRequest(
+        author: signature,
+        committer: signature
+    )).value()
+    #expect(try await repository.status().value().isClean)
+    #expect(try Data(contentsOf: stagedFile) == Data("base staged\n".utf8))
+    #expect(try Data(contentsOf: unstagedFile) == Data("base unstaged\n".utf8))
+    #expect(try await repository.stashes().first?.objectID == stash.objectID)
+
+    func git(_ arguments: [String]) throws -> (Int32, String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory.path] + arguments
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        return (
+            process.terminationStatus,
+            String(
+                decoding: output.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            )
+        )
+    }
+    let list = try git(["stash", "list", "--format=%H"])
+    #expect(list.0 == 0)
+    #expect(list.1.trimmingCharacters(in: .whitespacesAndNewlines) == stash.objectID.description)
+    #expect(try git(["stash", "apply"]).0 == 0)
+    #expect(try Data(contentsOf: stagedFile) == Data("staged change\n".utf8))
+    #expect(try Data(contentsOf: unstagedFile) == Data("unstaged change\n".utf8))
+    #expect(try git(["diff", "--cached", "--quiet"]).0 == 0)
+}
+
+@Test(arguments: [RefStorageFormat.files, .reftable])
+func treeishStashUsesSupportedReferenceStorage(
+    refStorage: RefStorageFormat
+) async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let file = directory.appendingPathComponent("file.txt")
+    try Data("base\n".utf8).write(to: file)
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.initialize(
+        in: root,
+        options: RepositoryInitialization(refStorage: refStorage)
+    )
+    let signature = Signature(
+        name: "Treeish",
+        email: "treeish@example.com",
+        secondsSinceEpoch: 1_700_000_000,
+        timeZoneOffsetMinutes: 0
+    )
+    _ = try await repository.stage(
+        StageRequest(pathspecs: [try GitPathspec("file.txt")])
+    ).value()
+    _ = try await repository.commit(CommitRequest(
+        tree: try await repository.writeIndexTree().value(),
+        author: signature,
+        committer: signature,
+        message: Array("base\n".utf8)
+    )).value()
+    try Data("stashed\n".utf8).write(to: file)
+    let stash = try await repository.createStash(
+        StashRequest(author: signature, committer: signature)
+    ).value()
+    #expect(
+        try await repository.resolveReference(
+            RefName("refs/stash")
+        ) == stash.objectID
+    )
+    #expect(try await repository.stashes().map(\.objectID) == [stash.objectID])
+}
+
+@Test func treeishAppliesSystemGitCanonicalStash() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let file = directory.appendingPathComponent("file.txt")
+    func git(_ arguments: [String]) throws -> (Int32, String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory.path] + arguments
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "GIT_AUTHOR_NAME": "System Git",
+            "GIT_AUTHOR_EMAIL": "git@example.com",
+            "GIT_COMMITTER_NAME": "System Git",
+            "GIT_COMMITTER_EMAIL": "git@example.com",
+        ], uniquingKeysWith: { _, new in new })
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        return (
+            process.terminationStatus,
+            String(
+                decoding: output.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            )
+        )
+    }
+    #expect(try git(["init", "-q"]).0 == 0)
+    try Data("base\n".utf8).write(to: file)
+    #expect(try git(["add", "file.txt"]).0 == 0)
+    #expect(try git(["commit", "-qm", "base"]).0 == 0)
+    try Data("stashed by git\n".utf8).write(to: file)
+    #expect(try git(["stash", "push", "-qm", "system stash"]).0 == 0)
+    let identifier = try ObjectID(
+        hex: git(["rev-parse", "refs/stash"]).1
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    )
+    let root = try await TreeishRoot.localDirectory(at: directory)
+    let repository = try await Treeish.open(
+        try await Treeish.discover(in: root),
+        roots: [root]
+    )
+    #expect(try await repository.stashes().first?.objectID == identifier)
+    let result = try await repository.applyStash(identifier).value()
+    #expect(result == .applied)
+    #expect(try Data(contentsOf: file) == Data("stashed by git\n".utf8))
+    let status = try await repository.status().value()
+    #expect(status.entries.count == 1)
+    #expect(status.entries[0].worktreeChange == .modified)
+    #expect(status.entries[0].indexChange == nil)
+}
+
 @Test func treeishStructuredDiffMatchesSystemGitTrackedChanges() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString)

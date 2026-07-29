@@ -11,6 +11,24 @@ let package = Package(
     products: [
         .library(name: "Treeish", targets: ["Treeish"]),
     ],
+    dependencies: [
+        .package(
+            url: "https://github.com/apple/swift-nio.git",
+            exact: "2.101.3"
+        ),
+        .package(
+            url: "https://github.com/apple/swift-nio-ssh.git",
+            exact: "0.14.1"
+        ),
+        .package(
+            url: "https://github.com/apple/swift-nio-transport-services.git",
+            exact: "1.28.0"
+        ),
+        .package(
+            url: "https://github.com/apple/swift-crypto.git",
+            exact: "4.5.1"
+        ),
+    ],
     targets: [
         .target(
             name: "TreeishCore",
@@ -63,6 +81,13 @@ let package = Package(
                 "TreeishIndex", "TreeishPacks", "TreeishProtocol",
                 "TreeishGraph", "TreeishDiff",
                 "TreeishHTTP",
+                .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "NIOSSH", package: "swift-nio-ssh"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(
+                    name: "NIOTransportServices",
+                    package: "swift-nio-transport-services"
+                ),
             ],
             swiftSettings: strictConcurrency
         ),

@@ -46,14 +46,14 @@ reference storage, root policy, and interrupted transactions.
 | `commit` | `Repository.commit` | CAS reference publication and optional host-backed signing |
 | `log` | `Repository.log` | Bounded commit traversal |
 | `show` | `readObject`, `log`, `listTree`, `diff` | Structured object/commit/tree/diff composition; no porcelain text renderer |
-| `branch` | ref listing/create/delete and upstream resolution | Local branches and tracking configuration |
+| `branch` | ref listing/create/delete/rename and upstream resolution | Local branches, atomic files/reftable rename, linked-worktree HEAD updates, and tracking configuration |
 | `switch`, `checkout` | `Repository.checkout` | Branch or detached exact-commit checkout |
 | `merge` | `merge`, `continueMerge`, `abortMerge` | Fast-forward, three-way, conflict stages, continuation, abort |
 | `rebase` | `rebase`, `continueRebase`, `abortRebase` | Caller-supplied ordered commit replay |
 | `cherry-pick` | `cherryPick`, continuation, abort | Single-commit apply with conflict state |
 | `revert` | `revert`, continuation, abort | Root, normal, and mainline-selected merge commits |
 | `reset` | `Repository.reset` | Soft, mixed, and hard |
-| `stash` | `createStash`, `stashes`, `applyStash` | Canonical tracked-change stash create/list/apply; untracked capture and drop/pop are not yet supported |
+| `stash` | `createStash`, `stashes`, `applyStash`, `deleteStash` | Canonical tracked and optional third-parent untracked capture, collision-safe apply, and structured deletion |
 | `fetch` | `Repository.fetch` | HTTPS/SSH, refspecs, prune, shallow, partial, quarantine |
 | `pull` | `Repository.pull` | Configured upstream fetch followed by fast-forward-only or three-way integration |
 | `push` | `Repository.push` | CAS updates, creates, deletes, atomic batches, push options |
@@ -86,7 +86,7 @@ reference storage, root policy, and interrupted transactions.
 | --- | --- |
 | Smart HTTP protocol v2 | Native |
 | Smart HTTP protocol v0/v1 advertisement fallback | Native |
-| Git-over-SSH | Native Git framing over a host-provided authenticated, host-verified session |
+| Git-over-SSH | Native NIOSSH upload-pack/receive-pack sessions; host-provided password/Ed25519 authentication and SHA-256 host-key acceptance |
 | GitHub App or personal access token | Ephemeral host-provided credential; never persisted by Treeish |
 | Basic and Bearer credentials | Ephemeral host-provided credential |
 | Credential helpers and global Git config | Not read |

@@ -83,6 +83,11 @@ typed result.
 - ``SSHGitSessionRequest``
 - ``SSHRemoteEndpoint``
 - ``SSHGitService``
+- ``NIOSSHGitTransport``
+- ``NIOSSHGitTransportConfiguration``
+- ``SSHAuthenticationProvider``
+- ``SSHHostKeyVerifier``
+- ``SSHHostKey``
 - ``FetchRequest``
 - ``PullRequest``
 - ``PushRequest``

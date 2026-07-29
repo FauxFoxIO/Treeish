@@ -3912,8 +3912,17 @@ public actor Repository {
                 commonDirectory: refsDirectory,
                 store: store
             )
+            let untracked = request.includeUntracked
+                ? try Repository.writeUntrackedWorktreeTree(
+                    index: index,
+                    worktree: worktree,
+                    commonDirectory: refsDirectory,
+                    store: store
+                )
+                : nil
             guard indexTree != headRecord.tree ||
-                    worktreeTree != headRecord.tree else {
+                    worktreeTree != headRecord.tree ||
+                    untracked?.paths.isEmpty == false else {
                 throw TreeishError.recoveryRequired("nothing to stash")
             }
             let branch = head.reference.map {
@@ -3947,12 +3956,22 @@ public actor Repository {
             let indexCommitID = try ObjectID(
                 bytes: store.write(indexCommit)
             )
+            let untrackedCommitID: ObjectID? = try untracked.map { capture in
+                let commit = GitObjectEncoder.commit(
+                    treeHex: try ObjectID(bytes: capture.tree).description,
+                    parentHexes: [],
+                    author: request.author.storageSignature,
+                    committer: request.committer.storageSignature,
+                    message: Array("untracked files on \(branch): \(shortHead) \(subject)\n".utf8)
+                )
+                return try ObjectID(bytes: store.write(commit))
+            }
             let stashCommit = GitObjectEncoder.commit(
                 treeHex: try ObjectID(bytes: worktreeTree).description,
                 parentHexes: [
                     headID.description,
                     indexCommitID.description,
-                ],
+                ] + (untrackedCommitID.map(\.description).map { [$0] } ?? []),
                 author: request.author.storageSignature,
                 committer: request.committer.storageSignature,
                 message: Array("\(displayMessage)\n".utf8)
@@ -3981,7 +4000,9 @@ public actor Repository {
                 store: store
             )
             let affected = try Set(
-                currentPaths.union(headEntries.map(\.path)).map {
+                currentPaths
+                    .union(headEntries.map(\.path))
+                    .union(untracked?.paths.map(\.bytes) ?? []).map {
                     try GitPath(bytes: $0)
                 }
             )
@@ -3998,6 +4019,17 @@ public actor Repository {
                     worktree: worktree,
                     store: store
                 )
+                for path in untracked?.paths ?? [] {
+                    let components = try path.components
+                    if try worktree.exists(components) {
+                        try FileManager.default.removeItem(
+                            at: worktree.url(
+                                for: components,
+                                followFinalSymlink: false
+                            )
+                        )
+                    }
+                }
             }
             return StashResult(
                 objectID: stashID,
@@ -4024,6 +4056,118 @@ public actor Repository {
             return []
         } catch TreeishError.referenceNotFound {
             return []
+        }
+    }
+
+    public func deleteStash(
+        _ request: StashDeletionRequest
+    ) -> GitOperation<StashDeletionResult> {
+        let directory = commonDirectory
+        let access = repositoryCapabilities.access
+        let limits = resourceLimits
+        return GitOperation(phase: .updatingRefs) {
+            guard case .readWrite = access, request.index >= 0 else {
+                throw TreeishError.mutationDisabled(
+                    access.reason ?? .rootIsReadOnly
+                )
+            }
+            let reference = try RefName("refs/stash")
+            let current = try Repository.readReference(
+                directory: directory,
+                name: reference
+            )
+            let storage = try Repository.referenceStorage(directory: directory)
+            let entries: [ReflogEntry]
+            if storage.format == .reftable {
+                entries = try ReftableStack(
+                    directory: directory,
+                    objectFormat: storage.objectFormat
+                ).reflog(reference)
+            } else {
+                let bytes = try directory.read(
+                    ["logs"] + reference.pathComponents,
+                    limit: limits.maximumConfigBytes
+                )
+                entries = try bytes.split(separator: 0x0a).reversed().map {
+                    try Repository.parseReflogLine(Array($0))
+                }
+            }
+            guard request.index < entries.count,
+                  entries[request.index].current
+                    == request.expectedObjectID else {
+                throw TreeishError.referenceChanged
+            }
+            var retained = entries
+            let deleted = retained.remove(at: request.index)
+            let newTop = retained.first?.current
+            if storage.format == .reftable {
+                try ReftableStack(
+                    directory: directory,
+                    objectFormat: storage.objectFormat
+                ).append([
+                    ReftableUpdate(
+                        name: reference,
+                        value: newTop.map {
+                            .direct($0, peeled: nil)
+                        } ?? .deletion,
+                        expected: .direct(current),
+                        reflog: nil,
+                        reflogDeletion: true
+                    ),
+                ])
+                for entry in retained.reversed() {
+                    try ReftableStack(
+                        directory: directory,
+                        objectFormat: storage.objectFormat
+                    ).append([
+                        ReftableUpdate(
+                            name: reference,
+                            value: newTop.map {
+                                .direct($0, peeled: nil)
+                            } ?? .deletion,
+                            expected: .any,
+                            reflog: ReflogMetadata(
+                                signature: entry.committer,
+                                message: entry.message
+                            ),
+                            reflogObjects: ReftableLogObjects(
+                                previous: entry.previous,
+                                current: entry.current
+                            )
+                        ),
+                    ])
+                }
+            } else {
+                let encoded = retained.reversed().flatMap {
+                    Array(
+                        "\($0.previous.description) \($0.current.description) \($0.committer.storageSignature.encoded)\t\($0.message.replacingOccurrences(of: "\n", with: " "))\n".utf8
+                    )
+                }
+                try directory.writeAtomically(
+                    encoded,
+                    to: ["logs"] + reference.pathComponents
+                )
+                if let newTop {
+                    try Repository.publishReference(
+                        directory: directory,
+                        name: reference,
+                        value: newTop,
+                        expected: current,
+                        requireMissing: false,
+                        reflog: nil
+                    )
+                } else {
+                    try Repository.removeReference(
+                        directory: directory,
+                        name: reference,
+                        expected: current
+                    )
+                }
+            }
+            return StashDeletionResult(
+                deletedObjectID: deleted.current,
+                newTop: newTop
+            )
         }
     }
 
@@ -4107,8 +4251,31 @@ public actor Repository {
                 prefix: [],
                 store: store
             ).map { ($0.path, $0) })
+            let untrackedEntries: [FlatTreeEntry]
+            if stashRecord.parents.count >= 3 {
+                let untrackedRecord = try CommitRecord(
+                    identifier: stashRecord.parents[2],
+                    object: store.read(identifier: stashRecord.parents[2])
+                )
+                untrackedEntries = try Repository.flattenTree(
+                    identifier: untrackedRecord.tree,
+                    prefix: [],
+                    store: store
+                )
+                for entry in untrackedEntries {
+                    let path = try GitPath(bytes: entry.path)
+                    guard !(try worktree.exists(path.components)) else {
+                        throw TreeishError.worktreeCollision(path)
+                    }
+                }
+            } else {
+                untrackedEntries = []
+            }
             let affected = try Set(
-                Set(base.keys).union(ours.keys).union(theirs.keys).map {
+                Set(base.keys)
+                    .union(ours.keys)
+                    .union(theirs.keys)
+                    .union(untrackedEntries.map(\.path)).map {
                     try GitPath(bytes: $0)
                 }
             )
@@ -4128,6 +4295,18 @@ public actor Repository {
                 )
                 if plan.conflicts.isEmpty {
                     try indexStore.write(currentIndex)
+                    if stashRecord.parents.count >= 3 {
+                        let untrackedRecord = try CommitRecord(
+                            identifier: stashRecord.parents[2],
+                            object: store.read(identifier: stashRecord.parents[2])
+                        )
+                        try Repository.materializeTree(
+                            identifier: untrackedRecord.tree,
+                            at: [],
+                            root: worktree,
+                            store: store
+                        )
+                    }
                     return .applied
                 }
                 try indexStore.write(GitIndex(
@@ -4939,6 +5118,130 @@ public actor Repository {
         reflog: ReflogMetadata? = nil
     ) -> GitOperation<RefUpdateResult> {
         createReference(namespace: "refs/heads", name: name, target: target, reflog: reflog)
+    }
+
+    public func renameBranch(
+        from oldName: String,
+        to newName: String
+    ) -> GitOperation<BranchRenameResult> {
+        let headDirectory = gitDirectory
+        let directory = commonDirectory
+        let access = repositoryCapabilities.access
+        return GitOperation(phase: .updatingRefs) {
+            guard case .readWrite = access else {
+                throw TreeishError.mutationDisabled(
+                    access.reason ?? .rootIsReadOnly
+                )
+            }
+            let oldReference = try RefName("refs/heads/\(oldName)")
+            let newReference = try RefName("refs/heads/\(newName)")
+            guard oldReference != newReference else {
+                throw TreeishError.referenceChanged
+            }
+            let target = try Repository.readReference(
+                directory: directory,
+                name: oldReference
+            )
+            guard (try? Repository.readReference(
+                directory: directory,
+                name: newReference
+            )) == nil else {
+                throw TreeishError.referenceChanged
+            }
+            let storage = try Repository.referenceStorage(directory: directory)
+            if storage.format == .reftable {
+                try ReftableStack(
+                    directory: directory,
+                    objectFormat: storage.objectFormat
+                ).append([
+                    ReftableUpdate(
+                        name: oldReference,
+                        value: .deletion,
+                        expected: .direct(target),
+                        reflog: nil
+                    ),
+                    ReftableUpdate(
+                        name: newReference,
+                        value: .direct(target, peeled: nil),
+                        expected: .missing,
+                        reflog: nil
+                    ),
+                ])
+            } else {
+                let oldPath = try oldReference.pathComponents
+                let newPath = try newReference.pathComponents
+                if try directory.exists(oldPath) {
+                    try directory.moveAtomically(
+                        from: oldPath,
+                        to: newPath
+                    )
+                } else {
+                    try Repository.publishReference(
+                        directory: directory,
+                        name: newReference,
+                        value: target,
+                        expected: nil,
+                        requireMissing: true,
+                        reflog: nil
+                    )
+                    try Repository.removeReference(
+                        directory: directory,
+                        name: oldReference,
+                        expected: target
+                    )
+                }
+                let oldLog = ["logs"] + (try oldReference.pathComponents)
+                let newLog = ["logs"] + (try newReference.pathComponents)
+                if try directory.exists(oldLog) {
+                    try directory.moveAtomically(from: oldLog, to: newLog)
+                }
+            }
+            var headDirectories = [headDirectory]
+            if try directory.exists(["worktrees"]) {
+                let url = try directory.url(for: ["worktrees"])
+                for identifier in try FileManager.default
+                    .contentsOfDirectory(atPath: url.path)
+                    .sorted()
+                where Repository.validWorktreeIdentifier(identifier) {
+                    headDirectories.append(
+                        try directory.childDirectory(["worktrees", identifier])
+                    )
+                }
+            }
+            var updated = 0
+            for candidate in headDirectories {
+                let head = try? Repository.readHead(
+                    headDirectory: candidate,
+                    refsDirectory: directory
+                )
+                guard head?.reference == oldReference else { continue }
+                if storage.format == .reftable {
+                    try ReftableStack(
+                        directory: candidate,
+                        objectFormat: storage.objectFormat
+                    ).append([
+                        ReftableUpdate(
+                            name: try RefName("HEAD"),
+                            value: .symbolic(newReference),
+                            expected: .any,
+                            reflog: nil
+                        ),
+                    ])
+                } else {
+                    try candidate.writeAtomically(
+                        Array("ref: \(newReference.description)\n".utf8),
+                        to: ["HEAD"]
+                    )
+                }
+                updated += 1
+            }
+            return BranchRenameResult(
+                previousName: oldReference,
+                currentName: newReference,
+                objectID: target,
+                updatedWorktreeCount: updated
+            )
+        }
     }
 
     public func createTag(
@@ -6922,6 +7225,67 @@ public actor Repository {
                 )
             },
             store: store
+        )
+    }
+
+    private static func writeUntrackedWorktreeTree(
+        index: GitIndex,
+        worktree: RootDirectory,
+        commonDirectory: RootDirectory,
+        store: RepositoryObjectStore
+    ) throws -> (tree: [UInt8], paths: [GitPath]) {
+        let tracked = Set(index.entries.filter { $0.stage == 0 }.map(\.path))
+        let rules = try WorkingTreeRules(
+            worktree: worktree,
+            commonDirectory: commonDirectory
+        )
+        let paths = try enumerateFiles(in: worktree)
+            .filter { !tracked.contains($0.bytes) && !rules.isIgnored($0) }
+            .sorted { $0.bytes.lexicographicallyPrecedes($1.bytes) }
+        var entries: [GitIndexEntry] = []
+        entries.reserveCapacity(paths.count)
+        for path in paths {
+            try Task.checkCancellation()
+            let url = try worktree.url(
+                for: path.components,
+                followFinalSymlink: false
+            )
+            let attributes = try FileManager.default.attributesOfItem(
+                atPath: url.path
+            )
+            let type = attributes[.type] as? FileAttributeType
+            let raw = try worktreePayload(url: url)
+            let payload = type == .typeSymbolicLink
+                ? raw
+                : try rules.clean(raw, path: path)
+            let identifier = try store.write(
+                GitObject(type: .blob, payload: payload)
+            )
+            let permissions = (attributes[.posixPermissions] as? NSNumber)?
+                .uint16Value ?? 0o644
+            let mode: UInt32 = type == .typeSymbolicLink
+                ? 0o120000
+                : (permissions & 0o111 == 0 ? 0o100644 : 0o100755)
+            entries.append(try GitIndexEntry(
+                path: path.bytes,
+                objectID: identifier,
+                mode: mode,
+                size: UInt32(min(payload.count, Int(UInt32.max))),
+                modificationSeconds: 0,
+                modificationNanoseconds: 0
+            ))
+        }
+        return (
+            try writeTree(
+                items: entries.map {
+                    (
+                        components: $0.path.split(separator: 0x2f).map(Array.init),
+                        entry: $0
+                    )
+                },
+                store: store
+            ),
+            paths
         )
     }
 

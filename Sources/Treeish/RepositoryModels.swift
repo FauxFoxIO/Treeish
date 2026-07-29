@@ -249,6 +249,25 @@ public struct RefUpdateResult: Sendable, Hashable, Codable {
     }
 }
 
+public struct BranchRenameResult: Sendable, Hashable, Codable {
+    public let previousName: RefName
+    public let currentName: RefName
+    public let objectID: ObjectID
+    public let updatedWorktreeCount: Int
+
+    public init(
+        previousName: RefName,
+        currentName: RefName,
+        objectID: ObjectID,
+        updatedWorktreeCount: Int
+    ) {
+        self.previousName = previousName
+        self.currentName = currentName
+        self.objectID = objectID
+        self.updatedWorktreeCount = updatedWorktreeCount
+    }
+}
+
 public struct ReferenceInfo: Sendable, Hashable, Codable {
     public let name: RefName
     public let objectID: ObjectID
@@ -624,15 +643,18 @@ public struct StashRequest: Sendable, Hashable {
     public let author: Signature
     public let committer: Signature
     public let message: [UInt8]?
+    public let includeUntracked: Bool
 
     public init(
         author: Signature,
         committer: Signature,
-        message: [UInt8]? = nil
+        message: [UInt8]? = nil,
+        includeUntracked: Bool = false
     ) {
         self.author = author
         self.committer = committer
         self.message = message
+        self.includeUntracked = includeUntracked
     }
 }
 
@@ -661,6 +683,26 @@ public struct StashEntry: Sendable, Hashable, Codable {
 public enum StashApplyResult: Sendable, Hashable, Codable {
     case applied
     case conflicted([GitPath])
+}
+
+public struct StashDeletionRequest: Sendable, Hashable, Codable {
+    public let index: Int
+    public let expectedObjectID: ObjectID
+
+    public init(index: Int, expectedObjectID: ObjectID) {
+        self.index = index
+        self.expectedObjectID = expectedObjectID
+    }
+}
+
+public struct StashDeletionResult: Sendable, Hashable, Codable {
+    public let deletedObjectID: ObjectID
+    public let newTop: ObjectID?
+
+    public init(deletedObjectID: ObjectID, newTop: ObjectID?) {
+        self.deletedObjectID = deletedObjectID
+        self.newTop = newTop
+    }
 }
 
 public struct WorkspaceStateBlob: Sendable, Hashable, Codable {

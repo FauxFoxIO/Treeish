@@ -237,12 +237,18 @@ let urlStyle = try RemoteURL(
 )
 ```
 
-SSH policy belongs to the embedding application. Supply an `SSHGitTransport`
-that opens an authenticated, host-verified session:
+SSH credentials and trust policy belong to the embedding application. The main
+Treeish product includes `NIOSSHGitTransport`, which owns the connection and
+Git service session while host-supplied providers decide authentication and
+host-key acceptance:
 
 ```swift
+let transport = NIOSSHGitTransport(
+    authenticationProvider: applicationAuthenticationProvider,
+    hostKeyVerifier: applicationHostKeyVerifier
+)
 let services = RepositoryServices(
-    sshTransport: applicationSSHTransport
+    sshTransport: transport
 )
 
 let repository = try await Treeish.clone(
@@ -315,14 +321,18 @@ decisions for the host app.
   text and refuse format-defining keys while a repository is open;
 - merge, cherry-pick, revert, rebase, continuation, exact conflict-stage
   inspection, operation-state protection, and abort;
-- canonical tracked-change stash create/list/apply interoperable with system
-  Git; and
+- canonical tracked and optional untracked stash create/list/apply/delete
+  interoperable with system Git, including safe untracked collision checks;
+- atomic local branch rename across files/reftable refs and linked-worktree
+  symbolic heads; and
 - unified patches, bundles, blob diffs, and binary-safe workspace snapshots.
 
 ### Networking
 
 - Git smart HTTPS with protocol v2 and protocol v0 fallback;
-- Git-over-SSH through an application-provided stateful session;
+- Git-over-SSH through native NIOSSH upload-pack and receive-pack sessions,
+  with host-provided password/Ed25519 authentication and SHA-256 host-key
+  verification policy;
 - GitHub token authentication and general Basic or Bearer credentials; and
 - validated pack publication before remote-tracking references move.
 
@@ -359,7 +369,9 @@ pack, index, graph, diff, protocol, HTTP, and filesystem concerns without
 forcing those implementation modules into an app’s dependency graph.
 
 The package contains Swift source only. Compression uses Apple’s system
-`Compression` framework, and production code never launches `git`.
+`Compression` framework. SSH uses SwiftNIO SSH 0.14.1 and NIO Transport
+Services 1.28.0; their transitive SwiftNIO and Swift Crypto dependencies are
+Apache-2.0 licensed. Production code never launches `git`.
 
 ## Contributing
 

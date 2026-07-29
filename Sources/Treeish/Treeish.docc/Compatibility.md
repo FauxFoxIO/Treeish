@@ -49,13 +49,13 @@ unresolved stages is not flattened into a misleading diff;
 ``Repository/conflicts()`` exposes its exact ancestor, ours, and theirs entries.
 
 ``Repository/createStash(_:)`` writes Git's canonical working-tree and index
-commits, updates `refs/stash` with a standard reflog, and then cleans tracked
-changes through a recoverable worktree transaction. System Git can list and
-apply the resulting stash. ``Repository/applyStash(_:)`` accepts the same
-two-parent stash topology from either implementation, performs a three-way
-application onto a clean current workspace, and preserves conflict stages.
-This surface intentionally stashes tracked changes only; untracked and ignored
-files remain in place.
+commits and, when requested, the interoperable third-parent untracked commit.
+It updates `refs/stash` with a standard reflog and cleans captured paths through
+a recoverable worktree transaction. ``Repository/applyStash(_:)`` accepts the
+same topology from Treeish or system Git, performs a three-way tracked
+application, restores untracked paths only after collision checks, and
+preserves conflict stages. ``Repository/deleteStash(_:)`` provides
+compare-and-swap structured deletion for files and reftable repositories.
 
 ``Repository/operationState()`` reports canonical merge, cherry-pick, revert,
 Treeish rebase, system-Git rebase, and sequencer state together with exact

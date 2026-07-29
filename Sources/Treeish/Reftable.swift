@@ -40,19 +40,22 @@ struct ReftableUpdate: Sendable, Hashable {
     let expected: ReftableExpectedValue
     let reflog: ReflogMetadata?
     let reflogObjects: ReftableLogObjects?
+    let reflogDeletion: Bool
 
     init(
         name: RefName,
         value: ReftableReferenceValue,
         expected: ReftableExpectedValue,
         reflog: ReflogMetadata?,
-        reflogObjects: ReftableLogObjects? = nil
+        reflogObjects: ReftableLogObjects? = nil,
+        reflogDeletion: Bool = false
     ) {
         self.name = name
         self.value = value
         self.expected = expected
         self.reflog = reflog
         self.reflogObjects = reflogObjects
+        self.reflogDeletion = reflogDeletion
     }
 }
 
@@ -108,9 +111,12 @@ struct ReftableStack: Sendable {
     }
 
     func reflog(_ name: RefName) throws -> [ReflogEntry] {
-        try reflogRecords()
-            .filter { $0.name == name }
-            .compactMap(\.entry)
+        var result: [ReflogEntry] = []
+        for record in try reflogRecords() where record.name == name {
+            guard let entry = record.entry else { break }
+            result.append(entry)
+        }
+        return result
     }
 
     func reflogRecords() throws -> [ReftableLogRecord] {
@@ -881,7 +887,7 @@ private struct ReftableWriter {
         setUInt24(refLength, in: &refBlock, at: 1)
         var output = header + refBlock
 
-        let logged = sorted.filter { $0.reflog != nil }
+        let logged = sorted.filter { $0.reflog != nil || $0.reflogDeletion }
         let logPosition: UInt64
         if logged.isEmpty {
             logPosition = 0
@@ -919,7 +925,9 @@ private struct ReftableWriter {
         var restarts: [Int] = []
         var prior: [UInt8] = []
         for (index, update) in updates.enumerated() {
-            guard let metadata = update.reflog else { continue }
+            guard update.reflog != nil || update.reflogDeletion else {
+                continue
+            }
             var key = update.name.bytes + [0]
             appendUInt64(UInt64.max - updateIndex, to: &key)
             let restart = index.isMultiple(of: 16)
@@ -927,8 +935,19 @@ private struct ReftableWriter {
             if restart { restarts.append(4 + body.count) }
             appendVarint(UInt64(prefix), to: &body)
             let suffix = key.dropFirst(prefix)
-            appendVarint((UInt64(suffix.count) << 3) | 1, to: &body)
+            appendVarint(
+                (UInt64(suffix.count) << 3)
+                    | (update.reflogDeletion ? 0 : 1),
+                to: &body
+            )
             body.append(contentsOf: suffix)
+            if update.reflogDeletion {
+                prior = key
+                continue
+            }
+            guard let metadata = update.reflog else {
+                throw ReftableError.invalidTable
+            }
             let zero = [UInt8](repeating: 0, count: objectFormat.byteCount)
             let old: [UInt8]
             let new: [UInt8]

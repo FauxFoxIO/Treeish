@@ -12,6 +12,7 @@ public enum RootDirectoryError: Error, Sendable, Equatable {
     case symbolicLinkNotAllowed
     case invalidRelativePath
     case atomicReplacementFailed
+    case exclusiveLockUnavailable
     case notFound
 }
 
@@ -169,6 +170,46 @@ public struct RootDirectory: Sendable {
             _ = temporary.withCString { unlinkat(parent.fd, $0, 0) }
             throw error
         }
+    }
+
+    /// Holds one filesystem-visible lock entry for the duration of a bounded
+    /// repository critical section. Callers own retry policy and recovery from
+    /// a lock left behind by a terminated process.
+    package func withExclusiveLock<Result>(
+        _ components: [String],
+        operation: () throws -> Result
+    ) throws -> Result {
+        guard let name = components.last,
+              components.allSatisfy(isValidComponent) else {
+            throw RootDirectoryError.invalidRelativePath
+        }
+        let parentComponents = Array(components.dropLast())
+        try createDirectory(parentComponents)
+        let parent = try openDirectory(parentComponents)
+        defer { if parent.owned { close(parent.fd) } }
+        let lockFD = name.withCString {
+            openat(
+                parent.fd,
+                $0,
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                0o644
+            )
+        }
+        guard lockFD >= 0 else {
+            if errno == EEXIST {
+                throw RootDirectoryError.exclusiveLockUnavailable
+            }
+            throw RootDirectoryError.atomicReplacementFailed
+        }
+        close(lockFD)
+        defer {
+            _ = name.withCString { unlinkat(parent.fd, $0, 0) }
+            _ = fsync(parent.fd)
+        }
+        guard fsync(parent.fd) == 0 else {
+            throw RootDirectoryError.atomicReplacementFailed
+        }
+        return try operation()
     }
 
     public func compareAndSwap(

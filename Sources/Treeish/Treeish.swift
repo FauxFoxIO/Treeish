@@ -428,9 +428,13 @@ public enum Treeish {
             throw TreeishError.repositoryNotFound
         }
         let gitURL = try root.directory.url(for: gitDirectory)
+        // `commondir` is relative to the linked worktree's administrative
+        // directory. Preserve directory-base semantics even when Foundation
+        // returns that existing directory URL without a trailing slash.
+        let commonBaseURL = URL(fileURLWithPath: gitURL.path, isDirectory: true)
         let commonURL = URL(
             fileURLWithPath: commonText,
-            relativeTo: gitURL
+            relativeTo: commonBaseURL
         ).standardizedFileURL
         let common = try root.directory.relativeComponents(for: commonURL)
         return RepositoryLocation(

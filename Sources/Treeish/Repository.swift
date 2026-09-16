@@ -1641,6 +1641,17 @@ public actor Repository {
                 for: destinationComponents,
                 followFinalSymlink: false
             )
+            if let branch = request.branch {
+                try Repository.publishReference(
+                    directory: common,
+                    name: branch,
+                    value: request.start,
+                    expected: nil,
+                    requireMissing: true,
+                    reflog: nil
+                )
+            }
+            do {
             if FileManager.default.fileExists(atPath: destinationURL.path) {
                 let contents = try FileManager.default.contentsOfDirectory(atPath: destinationURL.path)
                 guard contents.isEmpty else { throw TreeishError.invalidPath }
@@ -1687,14 +1698,6 @@ public actor Repository {
                     ),
                 ]
                 if let branch = request.branch {
-                    try Repository.publishReference(
-                        directory: common,
-                        name: branch,
-                        value: request.start,
-                        expected: nil,
-                        requireMissing: true,
-                        reflog: nil
-                    )
                     updates.append(ReftableUpdate(
                         name: try RefName("HEAD"),
                         value: .symbolic(branch),
@@ -1715,10 +1718,6 @@ public actor Repository {
                 ).append(updates)
             } else {
                 if let branch = request.branch {
-                    try common.writeAtomically(
-                        Array("\(request.start.description)\n".utf8),
-                        to: try branch.pathComponents
-                    )
                     try common.writeAtomically(
                         Array("ref: \(branch.description)\n".utf8),
                         to: administration + ["HEAD"]
@@ -1752,6 +1751,22 @@ public actor Repository {
                 path: request.destination,
                 head: request.start
             )
+            } catch {
+                if let branch = request.branch {
+                    do {
+                        try Repository.removeReference(
+                            directory: common,
+                            name: branch,
+                            expected: request.start
+                        )
+                    } catch {
+                        throw TreeishError.recoveryRequired(
+                            "linked worktree branch publication requires reconciliation"
+                        )
+                    }
+                }
+                throw error
+            }
         }
     }
 
@@ -5479,6 +5494,304 @@ public actor Repository {
         )
     }
 
+    // These narrow internal adapters keep checkpoint serialization in its own
+    // file without exposing repository storage implementation in the public API.
+    static func readWorkspaceCheckpointHead(
+        headDirectory: RootDirectory,
+        refsDirectory: RootDirectory
+    ) throws -> (reference: RefName?, objectID: ObjectID?) {
+        try readHead(
+            headDirectory: headDirectory,
+            refsDirectory: refsDirectory
+        )
+    }
+
+    static func readWorkspaceCheckpointIndex(
+        bytes: [UInt8]?,
+        store: RepositoryObjectStore
+    ) throws -> GitIndex {
+        let index: GitIndex
+        if let bytes {
+            index = try GitIndex.decode(bytes, objectFormat: store.objectFormat)
+        } else {
+            index = GitIndex(objectFormat: store.objectFormat)
+        }
+        return try expandSparseIndex(index, store: store)
+    }
+
+    static func workspaceCheckpointTrackedPaths(
+        head: ObjectID,
+        store: RepositoryObjectStore
+    ) throws -> Set<[UInt8]> {
+        let object = try store.read(identifier: head.bytes)
+        let commit = try CommitRecord(identifier: head.bytes, object: object)
+        return Set(try flattenTree(
+            identifier: commit.tree,
+            prefix: [],
+            store: store
+        ).map(\.path))
+    }
+
+    /// Checks that a worktree is still the clean generation admitted by its
+    /// caller before checkpoint installation replaces its private state.
+    static func validateWorkspaceCheckpointCleanDestination(
+        expectedGeneration: ObjectID,
+        ignoredFiles: GitWorkspaceCheckpointIgnoredFiles,
+        indexStore: GitIndexStore,
+        worktree: RootDirectory,
+        headDirectory: RootDirectory,
+        refsDirectory: RootDirectory,
+        store: RepositoryObjectStore
+    ) throws -> Set<GitPath> {
+        guard expectedGeneration.algorithm == store.objectFormat else {
+            throw GitWorkspaceCheckpointError.objectFormatMismatch
+        }
+        try ensureNoInProgressOperation(in: headDirectory)
+        let head = try readHead(
+            headDirectory: headDirectory,
+            refsDirectory: refsDirectory
+        )
+        guard head.objectID == expectedGeneration else {
+            throw GitWorkspaceCheckpointError.destinationGenerationMismatch(
+                expected: expectedGeneration,
+                actual: head.objectID
+            )
+        }
+        let index = try readIndex(indexStore, store: store)
+        guard index.entries.allSatisfy({
+            $0.stage == 0 && !$0.intentToAdd
+        }) else {
+            throw GitWorkspaceCheckpointError.destinationIsActive
+        }
+        let commit = try CommitRecord(
+            identifier: expectedGeneration.bytes,
+            object: store.read(identifier: expectedGeneration.bytes)
+        )
+        let treeEntries = try flattenTree(
+            identifier: commit.tree,
+            prefix: [],
+            store: store
+        )
+        let treeByPath = Dictionary(uniqueKeysWithValues: treeEntries.map {
+            ($0.path, $0)
+        })
+        guard index.entries.count == treeEntries.count,
+              index.entries.allSatisfy({ entry in
+                  guard let tree = treeByPath[entry.path] else { return false }
+                  return tree.objectID == entry.objectID && tree.mode == entry.mode
+              }),
+              try worktreeStatus(index: index, worktree: worktree).isEmpty
+        else {
+            throw GitWorkspaceCheckpointError.destinationIsActive
+        }
+        let expectedPaths = Set(try treeEntries.map {
+            try GitPath(bytes: $0.path)
+        })
+        let rules = try WorkingTreeRules(
+            worktree: worktree,
+            commonDirectory: refsDirectory
+        )
+        let presentPaths = try enumerateFiles(in: worktree)
+        let relevantPaths = presentPaths.filter {
+            expectedPaths.contains($0)
+                || ignoredFiles == .include
+                || !rules.isIgnored($0)
+        }
+        guard Set(relevantPaths) == expectedPaths else {
+            throw GitWorkspaceCheckpointError.destinationIsActive
+        }
+        for entry in index.entries {
+            let path = try GitPath(bytes: entry.path)
+            let url = try worktree.url(
+                for: path.components,
+                followFinalSymlink: false
+            )
+            let attributes = try FileManager.default.attributesOfItem(
+                atPath: url.path
+            )
+            let type = attributes[.type] as? FileAttributeType
+            if entry.mode == 0o120000 {
+                guard type == .typeSymbolicLink else {
+                    throw GitWorkspaceCheckpointError.destinationIsActive
+                }
+            } else {
+                let permissions = (attributes[.posixPermissions] as? NSNumber)?
+                    .uint16Value ?? 0
+                guard type == .typeRegular,
+                      (entry.mode == 0o100755) == (permissions & 0o111 != 0)
+                else {
+                    throw GitWorkspaceCheckpointError.destinationIsActive
+                }
+            }
+        }
+        let root = try worktree.url(for: [])
+        if let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: []
+        ) {
+            for case let value as URL in enumerator {
+                if value.lastPathComponent == ".git" {
+                    enumerator.skipDescendants()
+                    continue
+                }
+                let attributes = try FileManager.default.attributesOfItem(
+                    atPath: value.path
+                )
+                guard attributes[.type] as? FileAttributeType == .typeDirectory
+                else {
+                    continue
+                }
+                let path = try GitPath(
+                    worktree.relativeComponents(for: value).joined(separator: "/")
+                )
+                let prefix = path.bytes + [0x2f]
+                guard expectedPaths.contains(where: {
+                    $0.bytes.starts(with: prefix)
+                }) || (ignoredFiles == .exclude && rules.isIgnored(path)) else {
+                    throw GitWorkspaceCheckpointError.destinationIsActive
+                }
+            }
+        }
+        return expectedPaths
+    }
+
+    static func ensureNoWorkspaceCheckpointOperation(
+        in headDirectory: RootDirectory
+    ) throws {
+        try ensureNoInProgressOperation(in: headDirectory)
+    }
+
+    static func workspaceCheckpointReferenceObject(
+        _ reference: RefName,
+        in directory: RootDirectory
+    ) throws -> ObjectID? {
+        do {
+            return try readReference(directory: directory, name: reference)
+        } catch TreeishError.referenceNotFound {
+            return nil
+        } catch RootDirectoryError.notFound {
+            return nil
+        }
+    }
+
+    static func attachWorkspaceCheckpointHead(
+        headDirectory: RootDirectory,
+        refsDirectory: RootDirectory,
+        reference: RefName,
+        expectedObjectID: ObjectID
+    ) throws {
+        let deadline = Date().addingTimeInterval(5)
+        while true {
+            do {
+                return try refsDirectory.withExclusiveLock(
+                    ["treeish-worktree-head-attachment.lock"]
+                ) {
+                    try ensureNoInProgressOperation(in: headDirectory)
+                    let current = try readHead(
+                        headDirectory: headDirectory,
+                        refsDirectory: refsDirectory
+                    )
+                    guard current.reference == nil,
+                          current.objectID == expectedObjectID,
+                          try readReference(
+                            directory: refsDirectory,
+                            name: reference
+                          ) == expectedObjectID else {
+                        throw TreeishError.referenceChanged
+                    }
+                    try ensureReferenceIsNotCheckedOut(
+                        reference,
+                        excluding: headDirectory,
+                        refsDirectory: refsDirectory
+                    )
+                    try publishCheckoutHead(
+                        headDirectory: headDirectory,
+                        refsDirectory: refsDirectory,
+                        reference: reference,
+                        value: expectedObjectID,
+                        reflog: nil
+                    )
+                    let attached = try readHead(
+                        headDirectory: headDirectory,
+                        refsDirectory: refsDirectory
+                    )
+                    guard attached.reference == reference,
+                          attached.objectID == expectedObjectID else {
+                        throw TreeishError.recoveryRequired(
+                            "workspace HEAD attachment could not be verified"
+                        )
+                    }
+                }
+            } catch RootDirectoryError.exclusiveLockUnavailable {
+                guard !Task.isCancelled else { throw CancellationError() }
+                guard Date() < deadline else {
+                    throw TreeishError.recoveryRequired(
+                        "workspace HEAD attachment lock is unavailable"
+                    )
+                }
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+        }
+    }
+
+    private static func ensureReferenceIsNotCheckedOut(
+        _ reference: RefName,
+        excluding headDirectory: RootDirectory,
+        refsDirectory: RootDirectory
+    ) throws {
+        if refsDirectory.identity != headDirectory.identity,
+           try readHead(
+               headDirectory: refsDirectory,
+               refsDirectory: refsDirectory
+           ).reference == reference {
+            throw TreeishError.referenceAlreadyCheckedOut(reference)
+        }
+        guard try refsDirectory.exists(["worktrees"]) else { return }
+        let directory = try refsDirectory.url(for: ["worktrees"])
+        for identifier in try FileManager.default
+            .contentsOfDirectory(atPath: directory.path)
+            .sorted()
+        where validWorktreeIdentifier(identifier) {
+            let candidate = try refsDirectory.childDirectory([
+                "worktrees", identifier,
+            ])
+            guard candidate.identity != headDirectory.identity else { continue }
+            if try readHead(
+                headDirectory: candidate,
+                refsDirectory: refsDirectory
+            ).reference == reference {
+                throw TreeishError.referenceAlreadyCheckedOut(reference)
+            }
+        }
+    }
+
+    static func readWorkspaceCheckpointPayload(url: URL) throws -> [UInt8] {
+        try worktreePayload(url: url)
+    }
+
+    static func publishWorkspaceCheckpointPack(
+        _ objects: [PackObject],
+        objectFormat: ObjectHashAlgorithm,
+        in directory: RootDirectory
+    ) throws {
+        try publishPack(objects, objectFormat: objectFormat, in: directory)
+    }
+
+    func workspaceCheckpointContext() -> WorkspaceCheckpointRepositoryContext {
+        WorkspaceCheckpointRepositoryContext(
+            root: root,
+            gitDirectory: gitDirectory,
+            commonDirectory: commonDirectory,
+            objectStore: objectStore,
+            indexStore: indexStore,
+            worktree: worktree,
+            access: repositoryCapabilities.access,
+            mutationReason: repositoryCapabilities.access.reason,
+            resourceLimits: resourceLimits
+        )
+    }
+
     private func resolveReference(
         _ name: RefName,
         visited: Set<RefName>
@@ -6536,10 +6849,24 @@ public actor Repository {
         in directory: RootDirectory,
         promisor: Bool = false
     ) throws {
-        let canonical = try PackWriter.write(
+        try publishPack(
             objects.map {
                 try PackObject(identifier: $0.identifier, object: $0.object)
             },
+            objectFormat: objectFormat,
+            in: directory,
+            promisor: promisor
+        )
+    }
+
+    private static func publishPack(
+        _ objects: [PackObject],
+        objectFormat: ObjectHashAlgorithm,
+        in directory: RootDirectory,
+        promisor: Bool = false
+    ) throws {
+        let canonical = try PackWriter.write(
+            objects,
             objectFormat: objectFormat
         )
         let checksum = canonical.checksum.map { String(format: "%02x", $0) }.joined()
@@ -7622,6 +7949,13 @@ public actor Repository {
         store: RepositoryObjectStore
     ) throws -> GitIndex {
         let index = try indexStore.read()
+        return try expandSparseIndex(index, store: store)
+    }
+
+    private static func expandSparseIndex(
+        _ index: GitIndex,
+        store: RepositoryObjectStore
+    ) throws -> GitIndex {
         guard index.isSparse else {
             return index
         }

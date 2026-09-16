@@ -1238,10 +1238,22 @@ func systemGitRecognizesTreeishLinkedWorktree(
             message: Array("linked worktree\n".utf8)
         )
     ).value()
+    let mainReference = commit.updatedReference
+    await #expect(throws: TreeishError.referenceChanged) {
+        _ = try await repository.createLinkedWorktree(
+            WorktreeRequest(
+                destination: try GitPath("occupied-branch"),
+                start: commit.objectID,
+                branch: mainReference
+            )
+        ).value()
+    }
+    let workerReference = try RefName("refs/heads/worker")
     let linked = try await repository.createLinkedWorktree(
         WorktreeRequest(
             destination: try GitPath("worker"),
-            start: commit.objectID
+            start: commit.objectID,
+            branch: workerReference
         )
     ).value()
 
@@ -1275,6 +1287,64 @@ func systemGitRecognizesTreeishLinkedWorktree(
         ),
         roots: [root]
     )
+    #expect(try await linkedRepository.snapshot().headReference == workerReference)
+    let other = try await repository.createLinkedWorktree(
+        WorktreeRequest(
+            destination: try GitPath("other-worker"),
+            start: commit.objectID
+        )
+    ).value()
+    let otherRepository = try await Treeish.open(
+        try await Treeish.discover(
+            in: root,
+            from: try GitPath("other-worker")
+        ),
+        roots: [root]
+    )
+    await #expect(throws: TreeishError.referenceAlreadyCheckedOut(workerReference)) {
+        _ = try await otherRepository.attachWorkspaceCheckpointHead(
+            reference: workerReference,
+            expectedObjectID: commit.objectID
+        ).value()
+    }
+    let detach = Process()
+    detach.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+    detach.arguments = [
+        "-C", parent.appendingPathComponent("worker").path,
+        "switch", "--detach",
+    ]
+    detach.standardOutput = Pipe()
+    detach.standardError = Pipe()
+    try detach.run()
+    detach.waitUntilExit()
+    #expect(detach.terminationStatus == 0)
+
+    let firstTask = Task {
+        let operation = await linkedRepository.attachWorkspaceCheckpointHead(
+            reference: workerReference,
+            expectedObjectID: commit.objectID
+        )
+        try await operation.value()
+    }
+    let secondTask = Task {
+        let operation = await otherRepository.attachWorkspaceCheckpointHead(
+            reference: workerReference,
+            expectedObjectID: commit.objectID
+        )
+        try await operation.value()
+    }
+    let firstResult = await firstTask.result
+    let secondResult = await secondTask.result
+    let results = [firstResult, secondResult]
+    #expect(results.filter {
+        if case .success = $0 { return true }
+        return false
+    }.count == 1)
+    #expect(results.filter {
+        guard case let .failure(error) = $0,
+              let treeishError = error as? TreeishError else { return false }
+        return treeishError == .referenceAlreadyCheckedOut(workerReference)
+    }.count == 1)
     let linkedStatus = try await linkedRepository.status().value()
     #expect(
         !linkedStatus.entries.contains {
@@ -1308,8 +1378,11 @@ func systemGitRecognizesTreeishLinkedWorktree(
         identifier: linked.identifier,
         reason: "active agent"
     ).value()
-    #expect(try await repository.listLinkedWorktrees().value().first?.lockedReason == "active agent")
+    #expect(try await repository.listLinkedWorktrees().value().first {
+        $0.identifier == linked.identifier
+    }?.lockedReason == "active agent")
     _ = try await repository.unlockLinkedWorktree(identifier: linked.identifier).value()
+    _ = try await repository.removeLinkedWorktree(identifier: other.identifier).value()
     #expect(try await repository.removeLinkedWorktree(identifier: linked.identifier).value() == linked.path)
     #expect(!FileManager.default.fileExists(atPath: parent.appendingPathComponent("worker").path))
 }

@@ -12,6 +12,7 @@ public enum TreeishError: Error, Sendable, Equatable {
     case mutationDisabled(CapabilityReason)
     case referenceNotFound
     case referenceChanged
+    case referenceAlreadyCheckedOut(RefName)
     case symbolicReferenceLoop
     case malformedReference
     case remoteTransportUnavailable(GitRemoteTransport)
